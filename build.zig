@@ -417,21 +417,24 @@ pub fn build(b: *std.Build) void {
         native_build_step.dependOn(&native_install.step);
 
         // `package` — install + .app bundle with manifest-driven Info.plist.
-        const pkg_name = b.fmt("{s}.app", .{"MerNative"});
-        const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}),
+        // Read identity/version from mer.app.zon at build time.
+        const app_zon = @import("mer.app.zon");
+        const pkg_name = b.fmt("{s}.app", .{app_zon.display_name});
+        const plist_xml = b.fmt(
             \\<?xml version="1.0" encoding="UTF-8"?>
             \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
             \\<plist version="1.0">
             \\<dict>
             \\  <key>CFBundleExecutable</key>    <string>mernative</string>
-            \\  <key>CFBundleIdentifier</key>    <string>com.merjs.desktop</string>
-            \\  <key>CFBundleName</key>          <string>MerJS</string>
-            \\  <key>CFBundleVersion</key>       <string>0.2.6</string>
+            \\  <key>CFBundleIdentifier</key>    <string>{s}</string>
+            \\  <key>CFBundleName</key>          <string>{s}</string>
+            \\  <key>CFBundleVersion</key>       <string>{s}</string>
             \\  <key>NSHighResolutionCapable</key><true/>
             \\  <key>NSPrincipalClass</key>      <string>NSApplication</string>
             \\</dict>
             \\</plist>
-        );
+        , .{ app_zon.id, app_zon.display_name, app_zon.version });
+        const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}), plist_xml);
         const pkg_bin = b.addInstallFile(
             native_exe.getEmittedBin(),
             b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}),
