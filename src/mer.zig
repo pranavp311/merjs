@@ -204,3 +204,6 @@ pub const Config = @import("server.zig").Config;
 pub const ServerReady = @import("server.zig").ServerReady;
 pub const Watcher = @import("watcher.zig").Watcher;
 pub const runPrerender = @import("prerender.zig").run;
+
+// ── native shell (mer native / mer package) ────────────────────────────────
+pub const native = @import("native/mer.zig");
