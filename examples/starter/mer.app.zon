@@ -1,0 +1,24 @@
+// mer.app.zon — native app manifest (scaffolded by `mer add native`).
+//
+// Consumed comptime by native/main.zig. Edit window size/title, server mode,
+// and permissions here. See docs/native.md for the full schema.
+.{
+    .id = "com.example.my-app",
+    .name = "my-app",
+    .display_name = "My App",
+    .version = "0.1.0",
+    .web_engine = "system",
+    .server = .{
+        .mode = "dev", // "dev" (hot reload) | "embedded" (prod)
+        .host = "127.0.0.1",
+        .port = 0, // 0 = ephemeral; shell reads back via ServerReady
+    },
+    .capabilities = .{ "webview", "js_bridge" },
+    .permissions = .{ "window", "clipboard", "dialog" },
+    .security = .{
+        .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
+    },
+    .windows = .{
+        .{ .label = "main", .title = "My App", .width = 1024, .height = 720 },
+    },
+}

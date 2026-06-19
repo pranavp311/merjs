@@ -397,4 +397,72 @@ pub fn build(b: *std.Build) void {
         desktop_step.dependOn(&bundle_bin.step);
         desktop_step.dependOn(&bundle_plist.step);
     }
+
+    // ── `zig build native` — native shell (dev: builds + runs) ─────────────
+    //     `zig build native-build` — install only (prod)
+    //     `zig build package` — install + .app bundle with manifest Info.plist
+    if (target.result.os.tag == .macos) {
+        const native_mod = b.createModule(.{
+            .root_source_file = b.path("src/native/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        native_mod.addImport("mer", mer_mod);
+        native_mod.addImport("runtime", runtime_mod);
+        const manifest_mod = b.createModule(.{
+            .root_source_file = b.path("mer.app.zon"),
+        });
+        native_mod.addImport("manifest", manifest_mod);
+        helpers.addDirModules(b, native_mod, mer_mod, "examples/site/app", "app", site_extras);
+        helpers.addDirModules(b, native_mod, mer_mod, "examples/site/api", "api", &.{});
+        helpers.addRoutesModule(b, native_mod, mer_mod, "src/generated/routes.zig", "examples/site/app", "examples/site/api", site_extras);
+        native_mod.linkFramework("AppKit", .{});
+        native_mod.linkFramework("WebKit", .{});
+        native_mod.linkFramework("Foundation", .{});
+        native_mod.link_libc = true;
+
+        const native_exe = b.addExecutable(.{ .name = "mernative", .root_module = native_mod });
+        const native_install = b.addInstallArtifact(native_exe, .{});
+
+        // `native` — run step (dev). `zig build native -- --dev`
+        const run_native = b.addRunArtifact(native_exe);
+        run_native.step.dependOn(&native_install.step);
+        if (b.args) |args| run_native.addArgs(args);
+        const native_step = b.step("native", "Run the native shell (dev: hot reload + WebView)");
+        native_step.dependOn(&run_native.step);
+
+        // `native-build` — install only (prod).
+        const native_build_step = b.step("native-build", "Build the native shell binary (prod, no run)");
+        native_build_step.dependOn(&native_install.step);
+
+        // `package` — install + .app bundle with manifest-driven Info.plist.
+        const pkg_name = b.fmt("{s}.app", .{"MerNative"});
+        const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}),
+            \\<?xml version="1.0" encoding="UTF-8"?>
+            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            \\<plist version="1.0">
+            \\<dict>
+            \\  <key>CFBundleExecutable</key>    <string>mernative</string>
+            \\  <key>CFBundleIdentifier</key>    <string>com.merjs.desktop</string>
+            \\  <key>CFBundleName</key>          <string>MerJS</string>
+            \\  <key>CFBundleVersion</key>       <string>0.2.6</string>
+            \\  <key>NSHighResolutionCapable</key><true/>
+            \\  <key>NSPrincipalClass</key>      <string>NSApplication</string>
+            \\</dict>
+            \\</plist>
+        );
+        const pkg_bin = b.addInstallFile(
+            native_exe.getEmittedBin(),
+            b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}),
+        );
+        pkg_bin.step.dependOn(&native_install.step);
+        const pkg_plist = b.addInstallDirectory(.{
+            .source_dir = plist.getDirectory(),
+            .install_dir = .prefix,
+            .install_subdir = "",
+        });
+        const package_step = b.step("package", "Package the native app as a .app bundle (macOS)");
+        package_step.dependOn(&pkg_bin.step);
+        package_step.dependOn(&pkg_plist.step);
+    }
 }

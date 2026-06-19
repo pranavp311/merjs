@@ -1,0 +1,24 @@
+// mer.app.zon — native app manifest for the merjs framework's own desktop app.
+//
+// Consumed comptime by src/native/main.zig via the `manifest` module wired in
+// build.zig. Drives window size/title, server binding, and (P2) bridge perms.
+.{
+    .id = "com.merjs.desktop",
+    .name = "merjs",
+    .display_name = "MerJS",
+    .version = "0.2.6",
+    .web_engine = "system",
+    .server = .{
+        .mode = "dev", // "dev" (hot reload) | "embedded" (prod)
+        .host = "127.0.0.1",
+        .port = 0, // 0 = ephemeral; shell reads back via ServerReady
+    },
+    .capabilities = .{ "webview", "js_bridge" },
+    .permissions = .{ "window", "clipboard", "dialog" },
+    .security = .{
+        .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
+    },
+    .windows = .{
+        .{ .label = "main", .title = "MerJS", .width = 1280, .height = 820 },
+    },
+}

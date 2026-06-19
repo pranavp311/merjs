@@ -88,6 +88,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "native")) {
+        // mer native          → dev: hot reload + WebView
+        // mer native build    → prod binary (no run)
+        if (args.len >= 3 and std.mem.eql(u8, args[2], "build")) {
+            try cmdNativeBuild(alloc);
+        } else {
+            try cmdNative(alloc, args[2..]);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "package")) {
+        try cmdPackage(alloc);
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "add")) {
         if (args.len < 3) {
             print("mer: missing feature name\n\n  usage: mer add <feature>\n  features: css, wasm, worker, ui [component]\n\n", .{});
@@ -710,6 +726,144 @@ fn cmdDev(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     _ = try child.wait(runtime.io);
 }
 
+// -- native ------------------------------------------------------------------
+const starter_mer_app_zon = @embedFile("examples/starter/mer.app.zon");
+const starter_native_main = @embedFile("examples/starter/native/main.zig");
+
+fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
+    std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
+        print("mer: no build.zig found — are you in a merjs project?\n", .{});
+        std.process.exit(1);
+    };
+    std.Io.Dir.cwd().access(runtime.io, "mer.app.zon", .{}) catch {
+        print("mer: no mer.app.zon found — run `mer add native` first.\n", .{});
+        std.process.exit(1);
+    };
+
+    print("mer: running codegen...\n", .{});
+    {
+        const result = try std.process.run(alloc, runtime.io, .{
+            .argv = &.{ "zig", "build", "codegen" },
+        });
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        const exited = result.term == .exited;
+        if (!exited or result.term.exited != 0) {
+            print("mer: codegen failed:\n{s}", .{result.stderr});
+            std.process.exit(1);
+        }
+    }
+
+    print("mer: launching native window (dev)...\n", .{});
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    try argv.appendSlice(alloc, &.{ "zig", "build", "native", "--", "--dev" });
+    for (extra_args) |arg| try argv.append(alloc, arg);
+
+    var child = try std.process.spawn(runtime.io, .{
+        .argv = argv.items,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    _ = try child.wait(runtime.io);
+}
+
+fn cmdNativeBuild(_: std.mem.Allocator) !void {
+    std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
+        print("mer: no build.zig found — are you in a merjs project?\n", .{});
+        std.process.exit(1);
+    };
+    print("mer: building native shell (prod)...\n", .{});
+    var child = try std.process.spawn(runtime.io, .{
+        .argv = &.{ "zig", "build", "native-build", "-Doptimize=ReleaseSmall" },
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(runtime.io);
+    const exited = term == .exited;
+    if (!exited or term.exited != 0) {
+        print("mer: native build failed\n", .{});
+        std.process.exit(1);
+    }
+    print("mer: native binary built → zig-out/bin/mernative\n", .{});
+}
+
+fn cmdPackage(_: std.mem.Allocator) !void {
+    std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
+        print("mer: no build.zig found — are you in a merjs project?\n", .{});
+        std.process.exit(1);
+    };
+    if (builtin.os.tag != .macos) {
+        print("mer: package currently supports macOS only (Linux/Windows planned)\n", .{});
+        std.process.exit(1);
+    }
+    print("mer: packaging native app...\n", .{});
+    var child = try std.process.spawn(runtime.io, .{
+        .argv = &.{ "zig", "build", "package", "-Doptimize=ReleaseSmall" },
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(runtime.io);
+    const exited = term == .exited;
+    if (!exited or term.exited != 0) {
+        print("mer: package failed\n", .{});
+        std.process.exit(1);
+    }
+    print("mer: packaged → zig-out/MerNative.app\n", .{});
+    print("    open zig-out/MerNative.app\n", .{});
+}
+
+fn cmdAddNative(_: std.mem.Allocator) !void {
+    print("\n🪟 mer add native — scaffolding native shell\n\n", .{});
+
+    // mer.app.zon
+    const has_zon = if (std.Io.Dir.cwd().access(runtime.io, "mer.app.zon", .{})) true else |_| false;
+    if (has_zon) {
+        print("  mer.app.zon already exists — skipping\n", .{});
+    } else {
+        try writeScaffoldFile(std.Io.Dir.cwd(), "mer.app.zon", starter_mer_app_zon);
+        print("  ✓ mer.app.zon\n", .{});
+    }
+
+    // native/main.zig
+    const has_main = if (std.Io.Dir.cwd().access(runtime.io, "native/main.zig", .{})) true else |_| false;
+    if (has_main) {
+        print("  native/main.zig already exists — skipping\n", .{});
+    } else {
+        _ = std.Io.Dir.cwd().createDirPathOpen(runtime.io, "native", .{}) catch {};
+        try writeScaffoldFile(std.Io.Dir.cwd(), "native/main.zig", starter_native_main);
+        print("  ✓ native/main.zig\n", .{});
+    }
+
+    const build_snippet =
+        \\    // ── native shell (mer native / mer package) ─────────────────────
+        \\    const native_mod = b.createModule(.{
+        \\        .root_source_file = b.path("native/main.zig"),
+        \\        .target = target,
+        \\        .optimize = optimize,
+        \\    });
+        \\    native_mod.addImport("mer", mer_mod);
+        \\    const manifest_mod = b.createModule(.{ .root_source_file = b.path("mer.app.zon") });
+        \\    native_mod.addImport("manifest", manifest_mod);
+        \\    addRoutesModule(b, native_mod, mer_mod);
+        \\    if (@import("builtin").os.tag == .macos) {
+        \\        native_mod.linkFramework("AppKit", .{});
+        \\        native_mod.linkFramework("WebKit", .{});
+        \\        native_mod.linkFramework("Foundation", .{});
+        \\        native_mod.link_libc = true;
+        \\        const native_exe = b.addExecutable(.{ .name = "mernative", .root_module = native_mod });
+        \\        b.installArtifact(native_exe);
+        \\        const run_native = b.addRunArtifact(native_exe);
+        \\        if (b.args) |args| run_native.addArgs(args);
+        \\        b.step("native", "Run native shell (dev)").dependOn(&run_native.step);
+        \\    }
+    ;
+    print("\n  Next: add this to build.zig (inside pub fn build):\n\n{s}\n", .{build_snippet});
+    print("  Then: mer native          # launch the native window\n", .{});
+    print("        mer native build    # prod binary\n", .{});
+    print("        mer package         # .app bundle\n\n", .{});
+}
+
 // -- build -------------------------------------------------------------------
 fn cmdBuild(_: std.mem.Allocator) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
@@ -782,8 +936,10 @@ fn cmdAdd(alloc: std.mem.Allocator, feature: []const u8, args: []const []const u
         } else {
             try cmdAddUiAll();
         }
+    } else if (std.mem.eql(u8, feature, "native")) {
+        try cmdAddNative(alloc);
     } else {
-        print("mer: unknown feature '{s}'\n\n  available: css, wasm, worker, ui\n\n", .{feature});
+        print("mer: unknown feature '{s}'\n\n  available: css, wasm, worker, ui, native\n\n", .{feature});
         std.process.exit(1);
     }
 }
@@ -965,7 +1121,10 @@ fn printUsage() void {
     print("    mer init <name>      scaffold a new project\n", .{});
     print("    mer dev [--port N]   codegen + dev server with hot reload\n", .{});
     print("    mer build            production build (ReleaseSmall + prerender)\n", .{});
-    print("    mer add <feature>    add optional features (css, wasm, worker, ui [component])\n", .{});
+    print("    mer add <feature>    add optional features (css, wasm, worker, ui, native)\n", .{});
+    print("    mer native           launch a native window against the dev server\n", .{});
+    print("    mer native build     build the native shell binary (prod)\n", .{});
+    print("    mer package          bundle the native app as a .app (macOS)\n", .{});
     print("    mer update           update merjs to latest version\n", .{});
     print("    mer --version        print version\n", .{});
     print("\n  https://github.com/justrach/merjs\n\n", .{});
