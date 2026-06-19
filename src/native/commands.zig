@@ -1,9 +1,21 @@
-// commands.zig — reference bridge command handlers (P2).
+// commands.zig — reference bridge command handlers.
 //
-// Planned handlers: dialog.openFile, clipboard.write, window.setTitle.
-// Each is opt-in via the manifest's bridge.commands[] and permission-gated.
+// Handlers live in bridge.zig's `registry` and are invoked via
+// bridge.dispatch(). Each is permission-gated by the manifest's
+// `permissions` list. Add new commands by extending the registry.
 
 const std = @import("std");
 const bridge = @import("bridge.zig");
 
-// P2: pub fn openFile(ctx: *bridge.Ctx, args: OpenFileArgs) !bridge.Json { ... }
+// Re-export the handler signatures so consumer code can register its own.
+pub const Ctx = bridge.Ctx;
+pub const HandlerFn = bridge.HandlerFn;
+pub const HandlerResult = bridge.HandlerResult;
+
+// v0.2.6 ships: mer.ping, mer.echo (always allowed), and dialog.openFile /
+// clipboard.write stubs (permission-gated, return HandlerError until the
+// platform NSOpenPanel / NSPasteboard wiring lands post-v0.2.6).
+//
+// To add a command in app code:
+//   1. write a HandlerFn
+//   2. add it to bridge.registry (or a consumer-side registry, post-v0.2.6)

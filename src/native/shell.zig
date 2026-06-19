@@ -15,6 +15,7 @@ const std = @import("std");
 const mer = @import("mer");
 const runtime = @import("runtime");
 const manifest_mod = @import("manifest.zig");
+const bridge = @import("bridge.zig");
 const builtin = @import("builtin");
 
 const log = std.log.scoped(.native);
@@ -91,9 +92,17 @@ pub fn run(
     var url_buf: [128]u8 = undefined;
     const url_z = try std.fmt.bufPrintZ(&url_buf, "http://{s}:{d}/", .{ app_manifest.host, port });
 
+    // Bridge context (heap-allocated; outlives the blocking event loop). The
+    // ObjC IMP reaches it via the macos backend's g_bridge_ctx global.
+    const bctx = try allocator.create(bridge.Ctx);
+    bctx.* = .{
+        .allocator = allocator,
+        .permissions = app_manifest.permissions,
+    };
+
     // Hand off to the platform backend (blocks on the event loop).
     switch (builtin.os.tag) {
-        .macos => @import("macos.zig").openWindow(url_z.ptr, app_manifest.window),
+        .macos => @import("macos.zig").openWindow(url_z.ptr, app_manifest.window, bctx),
         else => {
             log.err("native shell not yet implemented for {s}", .{@tagName(builtin.os.tag)});
             return error.UnsupportedPlatform;
