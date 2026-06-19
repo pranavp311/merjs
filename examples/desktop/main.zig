@@ -93,7 +93,7 @@ fn runServer(ctx: *ServerCtx) void {
     }, &router, null);
     srv.listen() catch |err| {
         std.log.err("server listen failed: {}", .{err});
-        ctx.ready.event.set(); // unblock main thread even on failure
+        ctx.ready.set(); // unblock main thread even on failure
     };
 }
 
@@ -111,7 +111,7 @@ pub fn main() !void {
     thread.detach();
 
     // Block until server is bound and ready (#51)
-    ctx.ready.event.wait();
+    ctx.ready.wait();
     const port = ctx.ready.port;
     if (port == 0) return error.ServerFailed;
     std.log.info("merjs server ready on port {d}", .{port});
