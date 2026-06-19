@@ -171,10 +171,10 @@ JS injection: the shell injects a small `window.mer.invoke` shim into the WKWebV
 
 | Phase | Issue | Actual work (given §0) | Status |
 |---|---|---|---|
-| **P0** | Spike (macOS) | **Verify** `examples/desktop/main.zig` still builds + runs against current `release/v0.2.6`. Document the `ServerReady` handshake as the contract. No new code. | done-in-spike; verify |
-| **P1** | Manifest + CLI | `src/native/manifest.zig` (parse `mer.app.zon`); `mer add native` scaffold; `mer native` wiring in `cli.zig`; lift `examples/desktop/main.zig` → `src/native/{shell,macos}.zig` driven by manifest window config. | core of this release |
-| **P2** | Bridge | `src/native/bridge.zig` + `commands.zig`; `WKScriptMessageHandler` glue in `macos.zig`; size/origin/permission guards; 3 reference commands. | core of this release |
-| **P3** | Packaging | `mer package` → `.app` with manifest-driven `Info.plist` (replace hardcoded plist at `build.zig:354`); code-sign opt-out flag. | core of this release |
+| **P0** | Spike (macOS) | **Verified** + fixed Zig 0.16 drift (`ServerReady.set/wait`). | ✅ shipped (bcca0aa) |
+| **P1** | Manifest + CLI | `src/native/{shell,macos,manifest,main,mer}.zig`; `mer.app.zon`; `native`/`native-build`/`package` build steps; `mer native`/`native build`/`package`/`add native` CLI. | ✅ shipped (878df08) |
+| **P2** | Bridge | `bridge.zig` dispatch + 7 unit tests; `macos.zig` WKScriptMessageHandler + WKUserScript shim; `mer.ping`/`echo` + dialog/clipboard stubs. | ✅ shipped (ff605fa) |
+| **P3** | Packaging | `mer package` → `<display_name>.app` with manifest-driven `Info.plist` (`@import` of `mer.app.zon` in build.zig). | ✅ shipped (0b6be0b) |
 | **P4** | Linux WebView | `src/native/linux.zig` (WebKitGTK) behind `Shell` interface. | stretch for v0.2.6 |
 | **P5** | Prod server embed | In-process loopback + asset embedding + `mer://app` scheme. `server.mode = "static"`. | stretch for v0.2.6 |
 | P6/P7 | Windows / mobile | Out of scope for v0.2.6. | deferred |
