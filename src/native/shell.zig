@@ -63,15 +63,18 @@ pub fn run(
     var watcher: ?mer.Watcher = null;
     var watcher_ref: ?*mer.Watcher = null;
     if (app_manifest.dev) {
-        watcher = mer.Watcher.init(allocator, "app");
+        watcher = mer.Watcher.init(allocator, app_manifest.watch_dir);
         watcher_ref = &watcher.?;
         const wt = try std.Thread.spawn(.{}, mer.Watcher.run, .{&watcher.?});
         wt.detach();
-        log.info("hot reload active — watching app/", .{});
+        log.info("hot reload active — watching {s}/", .{app_manifest.watch_dir});
     }
     defer if (watcher) |*w| w.deinit();
 
     // Spawn HTTP server on a background thread (AppKit requires the main thread).
+    // The server/watcher are detached for this macOS-first shell. Closing the
+    // last window terminates the process through AppKit; cooperative shutdown
+    // can replace this once Server.listen has a stop signal.
     const ctx = try allocator.create(ServerCtx);
     ctx.* = .{
         .allocator = allocator,

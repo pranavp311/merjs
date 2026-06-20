@@ -12,6 +12,7 @@
         .mode = "dev", // "dev" (hot reload) | "embedded" (prod)
         .host = "127.0.0.1",
         .port = 0, // 0 = ephemeral; shell reads back via ServerReady
+        .watch_dir = "examples/site/app",
     },
     .capabilities = .{ "webview", "js_bridge" },
     .permissions = .{ "window", "clipboard", "dialog" },
