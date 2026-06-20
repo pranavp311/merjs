@@ -1,7 +1,7 @@
 # Plan: `mer native` — ship a merjs app as a native desktop/mobile app
 
-**Target release:** `release/v0.2.6`
-**Feature branch:** `feat/mer-native` (based off `release/v0.2.6`)
+**Target release:** `release/v0.2.53`
+**Feature branch:** `feat/mer-native` (based off `release/v0.2.53`)
 **Fork:** https://github.com/pranavp311/merjs
 **Issue:** the zero-native model — a Zig shell hosting a system WebView over the merjs loopback server, with a `window.mer.invoke()` JS↔Zig bridge. No Electron, no Chromium, no Node.
 
@@ -37,13 +37,13 @@ Rationale from the code:
 We will **study** zero-native's `src/bridge/root.zig`, `src/primitives/app_manifest/root.zig`, and `src/tooling/{package,manifest}.zig` as design references (their command/permission/origin model is good and the issue already mirrors it), but write merjs-native code under `src/native/`.
 
 ### Q2: `system` WebView vs bundled Chromium/CEF?
-**Decision: system-only for v0.2.6.** CEF is explicitly deferred. `web_engine = "chromium"` is a manifest value we *parse* but reject with a clear error for now.
+**Decision: system-only for v0.2.53.** CEF is explicitly deferred. `web_engine = "chromium"` is a manifest value we *parse* but reject with a clear error for now.
 
 ### Q3: Bridge auth model — per-command permissions vs capability allowlist?
 **Decision: per-command permissions in the manifest**, mirroring zero-native's `bridge.commands[]` (each command declares `permissions` + `origins`). This is more precise than a global capability allowlist and matches `dispatch.zig`'s per-route shape. A command with no matching registration is rejected (deny-by-default).
 
 ### Q4: Prod = live SSR (embedded server) vs static export?
-**Decision: `server.mode` switch in the manifest, as the issue proposes.** v0.2.6 ships `embedded` (in-process loopback server, the proven path). `static` (serve a prerendered `dist/` over `mer://app` custom scheme) is a stretch goal; we stub the manifest field and implement only if P5 lands cleanly.
+**Decision: `server.mode` switch in the manifest, as the issue proposes.** v0.2.53 ships `embedded` (in-process loopback server, the proven path). `static` (serve a prerendered `dist/` over `mer://app` custom scheme) is a stretch goal; we stub the manifest field and implement only if P5 lands cleanly.
 
 ---
 
@@ -112,7 +112,7 @@ native/shell  (WKWebView)                  same shell, statically linked
     .name = "my-app",
     .display_name = "My App",
     .version = "0.1.0",
-    .web_engine = "system",                 // "system" (v0.2.6) | "chromium" (rejected w/ error)
+    .web_engine = "system",                 // "system" (v0.2.53) | "chromium" (rejected w/ error)
     .server = .{
         .mode = "embedded",                 // "embedded" (prod) | "dev" (attach to mer dev)
         .host = "127.0.0.1",
@@ -175,11 +175,11 @@ JS injection: the shell injects a small `window.mer.invoke` shim into the WKWebV
 | **P1** | Manifest + CLI | `src/native/{shell,macos,manifest,main,mer}.zig`; `mer.app.zon`; `native`/`native-build`/`package` build steps; `mer native`/`native build`/`package`/`add native` CLI. | ✅ shipped (878df08) |
 | **P2** | Bridge | `bridge.zig` dispatch + 7 unit tests; `macos.zig` WKScriptMessageHandler + WKUserScript shim; `mer.ping`/`echo` + dialog/clipboard stubs. | ✅ shipped (ff605fa) |
 | **P3** | Packaging | `mer package` → `<display_name>.app` with manifest-driven `Info.plist` (`@import` of `mer.app.zon` in build.zig). | ✅ shipped (0b6be0b) |
-| **P4** | Linux WebView | `src/native/linux.zig` (WebKitGTK) behind `Shell` interface. | stretch for v0.2.6 |
-| **P5** | Prod server embed | In-process loopback + asset embedding + `mer://app` scheme. `server.mode = "static"`. | stretch for v0.2.6 |
-| P6/P7 | Windows / mobile | Out of scope for v0.2.6. | deferred |
+| **P4** | Linux WebView | `src/native/linux.zig` (WebKitGTK) behind `Shell` interface. | stretch for v0.2.53 |
+| **P5** | Prod server embed | In-process loopback + asset embedding + `mer://app` scheme. `server.mode = "static"`. | stretch for v0.2.53 |
+| P6/P7 | Windows / mobile | Out of scope for v0.2.53. | deferred |
 
-**v0.2.6 ships P0 (verified) + P1 + P2 + P3 on macOS.** P4/P5 are stretch and gated on time.
+**v0.2.53 ships P0 (verified) + P1 + P2 + P3 on macOS.** P4/P5 are stretch and gated on time.
 
 ---
 
@@ -208,14 +208,14 @@ The server (`src/server.zig`), router, dispatch, and watcher are **untouched** �
 ## 8. Risks
 
 - **`WKScriptMessageHandler` ObjC glue** is the one genuinely new interop piece (the spike only does `loadRequest`, not JS→Zig callbacks). Mitigation: same extern-`objc_msgSend` pattern proven in `spike.zig`; register a delegate class with `objc_allocateClassPair` + `class_addMethod`. Low risk, but it's the thing to spike first in P2.
-- **Zig 0.16 `std.Io` API drift** between the spike (#50/#53 era) and `release/v0.2.6` — `Server.listen` already uses `std.Io.net.IpAddress` / `addr.listen(io, ...)` so the spike's `mer.Server.init` calls should still match, but P0 verification catches any drift.
+- **Zig 0.16 `std.Io` API drift** between the spike (#50/#53 era) and `release/v0.2.53` — `Server.listen` already uses `std.Io.net.IpAddress` / `addr.listen(io, ...)` so the spike's `mer.Server.init` calls should still match, but P0 verification catches any drift.
 - **Bundle signing** — out of scope; `mer package` produces a locally-runnable `.app`, explicitly not App Store distributable (matches the existing `examples/desktop/README.md` "Status" caveats).
 
 ---
 
 ## 9. Verification checklist (per phase)
 
-- [ ] P0: `zig build desktop` on `release/v0.2.6` opens a window loading the site from `127.0.0.1:<ephemeral>`.
+- [ ] P0: `zig build desktop` on `release/v0.2.53` opens a window loading the site from `127.0.0.1:<ephemeral>`.
 - [ ] P1: `mer add native` in a fresh `mer init` project creates `mer.app.zon` + `native/`; `mer native` opens a window sized/titled from the manifest.
 - [ ] P2: a page calling `window.mer.invoke("dialog.openFile")` returns a path; an unpermitted command returns `PermissionDenied`; an oversized payload is rejected; a non-loopback origin is rejected.
 - [ ] P3: `mer package` emits `<Name>.app` whose `Info.plist` reflects `id`/`display_name`/`version` from `mer.app.zon`; `open <Name>.app` boots without a terminal.

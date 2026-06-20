@@ -16,6 +16,10 @@ pub const WindowConfig = struct {
     height: u32 = 720,
 };
 
+pub const SecurityConfig = struct {
+    allowed_origins: []const []const u8 = &.{ "http://127.0.0.1", "http://localhost" },
+};
+
 /// Resolved manifest. Built comptime from the imported .zon struct.
 pub const Manifest = struct {
     id: []const u8,
@@ -29,6 +33,7 @@ pub const Manifest = struct {
     dev: bool,
     window: WindowConfig,
     permissions: []const []const u8,
+    security: SecurityConfig = .{},
 };
 
 /// Extract a `Manifest` from an imported .zon struct, applying defaults for
@@ -54,6 +59,17 @@ pub fn fromZon(comptime zon: anytype) Manifest {
     // permissions[] is optional.
     const perms: []const []const u8 = if (@hasField(T, "permissions")) &zon.permissions else &.{};
 
+    const security: SecurityConfig = if (@hasField(T, "security")) blk: {
+        const SecurityT = @TypeOf(zon.security);
+        if (@hasField(SecurityT, "navigation")) {
+            const NavigationT = @TypeOf(zon.security.navigation);
+            if (@hasField(NavigationT, "allowed_origins")) {
+                break :blk .{ .allowed_origins = &zon.security.navigation.allowed_origins };
+            }
+        }
+        break :blk .{};
+    } else .{};
+
     return .{
         .id = zon.id,
         .name = zon.name,
@@ -66,6 +82,7 @@ pub fn fromZon(comptime zon: anytype) Manifest {
         .dev = std.mem.eql(u8, server_mode, "dev"),
         .window = window,
         .permissions = perms,
+        .security = security,
     };
 }
 
@@ -74,4 +91,23 @@ pub fn hasCapability(manifest: Manifest, cap: []const u8) bool {
     _ = manifest;
     _ = cap;
     return false; // capabilities[] parsing lands with the bridge (P2).
+}
+
+test "fromZon parses allowed origins" {
+    const zon = .{
+        .id = "com.example.test",
+        .name = "test",
+        .display_name = "Test",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .security = .{
+            .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
+        },
+        .windows = .{
+            .{ .label = "main", .title = "Test", .width = 800, .height = 600 },
+        },
+    };
+    const parsed = fromZon(zon);
+    try std.testing.expectEqual(@as(usize, 2), parsed.security.allowed_origins.len);
+    try std.testing.expectEqualStrings("mer://app", parsed.security.allowed_origins[1]);
 }

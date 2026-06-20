@@ -90,6 +90,10 @@ fn sendBoolv(recv: Id, s: Sel, a: BOOL) void {
     const F = *const fn (Id, Sel, BOOL) callconv(.c) void;
     @as(F, @ptrCast(&objc_msgSend))(recv, s, a);
 }
+fn send1Bool(recv: Id, s: Sel, a: Id) bool {
+    const F = *const fn (Id, Sel, Id) callconv(.c) BOOL;
+    return @as(F, @ptrCast(&objc_msgSend))(recv, s, a) != NO;
+}
 fn sendWindowInit(recv: Id, s: Sel, rect: CGRect, style: NSUInteger, backing: NSUInteger, defer_: BOOL) Id {
     const F = *const fn (Id, Sel, CGRect, NSUInteger, NSUInteger, BOOL) callconv(.c) Id;
     return @as(F, @ptrCast(&objc_msgSend))(recv, s, rect, style, backing, defer_);
@@ -103,9 +107,10 @@ fn sendUserScriptInit(recv: Id, s: Sel, source: Id, time: NSUInteger, main: BOOL
     return @as(F, @ptrCast(&objc_msgSend))(recv, s, source, time, main);
 }
 
-// ── Bridge globals (single-window app; v0.2.6) ──────────────────────────────
+// ── Bridge globals (single-window app) ──────────────────────────────────────
 var g_webview: Id = null;
 var g_bridge_ctx: ?*bridge.Ctx = null;
+var g_app_delegate: Id = null;
 
 /// The `window.mer` shim injected at document start. Provides:
 ///   window.mer.invoke(cmd, args) -> Promise
@@ -117,7 +122,7 @@ const mer_shim: [*:0]const u8 =
     "window.mer={" ++
     "invoke:function(c,a){return new Promise(function(r,j){" ++
     "var id=++idc;cb[id]={r:r,j:j};" ++
-    "try{window.webkit.messageHandlers.merInvoke.postMessage(JSON.stringify({cmd:c,args:a||null,id:id}));}" ++
+    "try{var p=JSON.stringify({cmd:c,args:a||null,id:id});if(p.length>65536){delete cb[id];j('PayloadTooLarge');return;}window.webkit.messageHandlers.merInvoke.postMessage(p);}" ++
     "catch(e){delete cb[id];j('BridgeUnavailable');}" ++
     "});}," ++
     "_resolve:function(id,ok,v){var h=cb[id];if(!h)return;delete cb[id];if(ok)h.r(v);else h.j(v);}" ++
@@ -135,18 +140,41 @@ fn merInvokeIMP(self: Id, _cmd: Sel, ucc: Id, message: Id) callconv(.c) void {
     const ctx = g_bridge_ctx orelse return;
 
     const body = send(message, sel("body")) orelse return;
+    if (!send1Bool(body, sel("isKindOfClass:"), cls("NSString"))) {
+        const js = bridge.rejectFromPayload(ctx, "", "ParseError") catch return;
+        defer ctx.allocator.free(js);
+        evalJs(ctx, wv, js);
+        return;
+    }
     const cstr = sendPtr(body, sel("UTF8String"));
     const payload = std.mem.span(cstr);
 
+    if (currentWebViewUrl(wv)) |url| {
+        if (!bridge.isOriginAllowed(ctx, url)) {
+            const js = bridge.rejectFromPayload(ctx, payload, "OriginNotAllowed") catch return;
+            defer ctx.allocator.free(js);
+            evalJs(ctx, wv, js);
+            return;
+        }
+    }
+
     const js = bridge.dispatch(ctx, payload) catch return;
     defer ctx.allocator.free(js);
+    evalJs(ctx, wv, js);
+}
 
-    // evaluateJavaScript: needs a NUL-terminated NSString.
+fn evalJs(ctx: *bridge.Ctx, webview: Id, js: []const u8) void {
     const js_z = ctx.allocator.dupeZ(u8, js) catch return;
     defer ctx.allocator.free(js_z);
     const ns_js = sendStr(cls("NSString"), sel("stringWithUTF8String:"), js_z.ptr);
-    // completionHandler = nil.
-    send2v(wv, sel("evaluateJavaScript:completionHandler:"), ns_js, null);
+    send2v(webview, sel("evaluateJavaScript:completionHandler:"), ns_js, null);
+}
+
+fn currentWebViewUrl(webview: Id) ?[]const u8 {
+    const url = send(webview, sel("URL")) orelse return null;
+    const abs = send(url, sel("absoluteString")) orelse return null;
+    const cstr = sendPtr(abs, sel("UTF8String"));
+    return std.mem.span(cstr);
 }
 
 /// Allocate the MerInvokeHandler delegate class (NSObject + one instance method).
@@ -162,6 +190,28 @@ fn createMerHandlerClass() Id {
         sel("userContentController:didReceiveScriptMessage:"),
         @ptrCast(&merInvokeIMP),
         "v@:@@",
+    );
+    objc_registerClassPair(new_class);
+    return new_class;
+}
+
+fn appShouldTerminateAfterLastWindowClosed(self: Id, _cmd: Sel, app: Id) callconv(.c) BOOL {
+    _ = self;
+    _ = _cmd;
+    _ = app;
+    return YES;
+}
+
+fn createAppDelegateClass() Id {
+    if (cls("MerAppDelegate")) |existing| return existing;
+    const nsobject = cls("NSObject") orelse return null;
+    const new_class = objc_allocateClassPair(nsobject, "MerAppDelegate", 0);
+    if (new_class == null) return null;
+    _ = class_addMethod(
+        new_class,
+        sel("applicationShouldTerminateAfterLastWindowClosed:"),
+        @ptrCast(&appShouldTerminateAfterLastWindowClosed),
+        "c@:@",
     );
     objc_registerClassPair(new_class);
     return new_class;
@@ -205,6 +255,10 @@ fn setupBridge(webview: Id, ctx: *bridge.Ctx) void {
 pub fn openWindow(url_z: [*:0]const u8, win: manifest.WindowConfig, ctx: ?*bridge.Ctx) void {
     const app = send(cls("NSApplication"), sel("sharedApplication"));
     sendIntv(app, sel("setActivationPolicy:"), NSApplicationActivationPolicyRegular);
+    if (createAppDelegateClass()) |delegate_class| {
+        g_app_delegate = send(send(delegate_class, sel("alloc")), sel("init"));
+        send1v(app, sel("setDelegate:"), g_app_delegate);
+    }
 
     const frame = CGRect{
         .origin = .{ .x = 0, .y = 0 },

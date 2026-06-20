@@ -12,10 +12,10 @@ pub const Ctx = bridge.Ctx;
 pub const HandlerFn = bridge.HandlerFn;
 pub const HandlerResult = bridge.HandlerResult;
 
-// v0.2.6 ships: mer.ping, mer.echo (always allowed), and dialog.openFile /
+// This release ships: mer.ping, mer.echo (always allowed), and dialog.openFile /
 // clipboard.write stubs (permission-gated, return HandlerError until the
-// platform NSOpenPanel / NSPasteboard wiring lands post-v0.2.6).
+// platform NSOpenPanel / NSPasteboard wiring lands after this release).
 //
 // To add a command in app code:
 //   1. write a HandlerFn
-//   2. add it to bridge.registry (or a consumer-side registry, post-v0.2.6)
+//   2. add it to bridge.registry (or a consumer-side registry, later)

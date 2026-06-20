@@ -645,6 +645,19 @@ test "build_zig_template uses local codegen entrypoint" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "merjs_dep.path(\"tools/codegen.zig\")") == null);
 }
 
+test "native build snippet exposes all CLI-required steps" {
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-build\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package\",") != null);
+}
+
+test "native build snippet uses target OS and codegen dependency" {
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "target.result.os.tag == .macos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_exe.step.dependOn(&run_codegen.step);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_mod.addImport(\"runtime\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "@import(\"builtin\").os.tag") == null);
+}
+
 // NOTE: These tests are disabled in Zig 0.16 because std.testing.tmpDir
 // uses the old std.testing.io API which is incompatible with std.Io.
 // The functionality is tested via integration tests in build.zig.
@@ -730,6 +743,76 @@ fn cmdDev(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
 const starter_mer_app_zon = @embedFile("examples/starter/mer.app.zon");
 const starter_native_main = @embedFile("examples/starter/native/main.zig");
 
+const native_build_snippet =
+    \\    // ── native shell (mer native / mer package) ─────────────────────
+    \\    const native_mod = b.createModule(.{
+    \\        .root_source_file = b.path("native/main.zig"),
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\    });
+    \\    native_mod.addImport("mer", mer_mod);
+    \\    native_mod.addImport("runtime", merjs_dep.module("runtime"));
+    \\    const manifest_mod = b.createModule(.{ .root_source_file = b.path("mer.app.zon") });
+    \\    native_mod.addImport("manifest", manifest_mod);
+    \\    addRoutesModule(b, native_mod, mer_mod);
+    \\    if (target.result.os.tag == .macos) {
+    \\        native_mod.linkFramework("AppKit", .{});
+    \\        native_mod.linkFramework("WebKit", .{});
+    \\        native_mod.linkFramework("Foundation", .{});
+    \\        native_mod.link_libc = true;
+    \\        const native_exe = b.addExecutable(.{ .name = "mernative", .root_module = native_mod });
+    \\        native_exe.step.dependOn(&run_codegen.step);
+    \\        const native_install = b.addInstallArtifact(native_exe, .{});
+    \\        const run_native = b.addRunArtifact(native_exe);
+    \\        run_native.step.dependOn(&native_install.step);
+    \\        if (b.args) |args| run_native.addArgs(args);
+    \\        b.step("native", "Run native shell (dev)").dependOn(&run_native.step);
+    \\        b.step("native-build", "Build native shell binary").dependOn(&native_install.step);
+    \\
+    \\        const app_zon = @import("mer.app.zon");
+    \\        const pkg_name = b.fmt("{s}.app", .{app_zon.display_name});
+    \\        const plist_xml = b.fmt(
+    \\            \\<?xml version="1.0" encoding="UTF-8"?>
+    \\            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    \\            \\<plist version="1.0"><dict>
+    \\            \\  <key>CFBundleExecutable</key><string>mernative</string>
+    \\            \\  <key>CFBundleIdentifier</key><string>{s}</string>
+    \\            \\  <key>CFBundleName</key><string>{s}</string>
+    \\            \\  <key>CFBundleVersion</key><string>{s}</string>
+    \\            \\  <key>NSHighResolutionCapable</key><true/>
+    \\            \\  <key>NSPrincipalClass</key><string>NSApplication</string>
+    \\            \\</dict></plist>
+    \\        , .{ app_zon.id, app_zon.display_name, app_zon.version });
+    \\        const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}), plist_xml);
+    \\        const pkg_bin = b.addInstallFile(native_exe.getEmittedBin(), b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}));
+    \\        pkg_bin.step.dependOn(&native_install.step);
+    \\        const pkg_plist = b.addInstallDirectory(.{
+    \\            .source_dir = plist.getDirectory(),
+    \\            .install_dir = .prefix,
+    \\            .install_subdir = "",
+    \\        });
+    \\        const package_step = b.step("package", "Package native app as a .app bundle");
+    \\        package_step.dependOn(&pkg_bin.step);
+    \\        package_step.dependOn(&pkg_plist.step);
+    \\    }
+;
+
+fn readZonStringField(alloc: std.mem.Allocator, field: []const u8) !?[]u8 {
+    const content = std.Io.Dir.cwd().readFileAlloc(runtime.io, "mer.app.zon", alloc, .limited(64 * 1024)) catch return null;
+    defer alloc.free(content);
+
+    const needle = try std.fmt.allocPrint(alloc, ".{s}", .{field});
+    defer alloc.free(needle);
+    const idx = std.mem.indexOf(u8, content, needle) orelse return null;
+    const after_field = content[idx + needle.len ..];
+    const eq = std.mem.indexOfScalar(u8, after_field, '=') orelse return null;
+    const after_eq = std.mem.trim(u8, after_field[eq + 1 ..], " \t\r\n");
+    if (after_eq.len == 0 or after_eq[0] != '"') return null;
+    const value_start: usize = 1;
+    const value_end = std.mem.indexOfScalarPos(u8, after_eq, value_start, '"') orelse return null;
+    return try alloc.dupe(u8, after_eq[value_start..value_end]);
+}
+
 fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
@@ -765,7 +848,12 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    _ = try child.wait(runtime.io);
+    const term = try child.wait(runtime.io);
+    const exited = term == .exited;
+    if (!exited or term.exited != 0) {
+        print("mer: native run failed\n", .{});
+        std.process.exit(1);
+    }
 }
 
 fn cmdNativeBuild(_: std.mem.Allocator) !void {
@@ -773,6 +861,10 @@ fn cmdNativeBuild(_: std.mem.Allocator) !void {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
     };
+    if (builtin.os.tag != .macos) {
+        print("mer: native build currently supports macOS only (Linux/Windows planned)\n", .{});
+        std.process.exit(1);
+    }
     print("mer: building native shell (prod)...\n", .{});
     var child = try std.process.spawn(runtime.io, .{
         .argv = &.{ "zig", "build", "native-build", "-Doptimize=ReleaseSmall" },
@@ -788,7 +880,7 @@ fn cmdNativeBuild(_: std.mem.Allocator) !void {
     print("mer: native binary built → zig-out/bin/mernative\n", .{});
 }
 
-fn cmdPackage(_: std.mem.Allocator) !void {
+fn cmdPackage(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
@@ -809,8 +901,14 @@ fn cmdPackage(_: std.mem.Allocator) !void {
         print("mer: package failed\n", .{});
         std.process.exit(1);
     }
-    print("mer: packaged → zig-out/MerNative.app\n", .{});
-    print("    open zig-out/MerNative.app\n", .{});
+    if (try readZonStringField(alloc, "display_name")) |display_name| {
+        defer alloc.free(display_name);
+        print("mer: packaged → zig-out/{s}.app\n", .{display_name});
+        print("    open zig-out/{s}.app\n", .{display_name});
+    } else {
+        print("mer: packaged → zig-out/<Display>.app\n", .{});
+        print("    open zig-out/<Display>.app\n", .{});
+    }
 }
 
 fn cmdAddNative(_: std.mem.Allocator) !void {
@@ -835,30 +933,7 @@ fn cmdAddNative(_: std.mem.Allocator) !void {
         print("  ✓ native/main.zig\n", .{});
     }
 
-    const build_snippet =
-        \\    // ── native shell (mer native / mer package) ─────────────────────
-        \\    const native_mod = b.createModule(.{
-        \\        .root_source_file = b.path("native/main.zig"),
-        \\        .target = target,
-        \\        .optimize = optimize,
-        \\    });
-        \\    native_mod.addImport("mer", mer_mod);
-        \\    const manifest_mod = b.createModule(.{ .root_source_file = b.path("mer.app.zon") });
-        \\    native_mod.addImport("manifest", manifest_mod);
-        \\    addRoutesModule(b, native_mod, mer_mod);
-        \\    if (@import("builtin").os.tag == .macos) {
-        \\        native_mod.linkFramework("AppKit", .{});
-        \\        native_mod.linkFramework("WebKit", .{});
-        \\        native_mod.linkFramework("Foundation", .{});
-        \\        native_mod.link_libc = true;
-        \\        const native_exe = b.addExecutable(.{ .name = "mernative", .root_module = native_mod });
-        \\        b.installArtifact(native_exe);
-        \\        const run_native = b.addRunArtifact(native_exe);
-        \\        if (b.args) |args| run_native.addArgs(args);
-        \\        b.step("native", "Run native shell (dev)").dependOn(&run_native.step);
-        \\    }
-    ;
-    print("\n  Next: add this to build.zig (inside pub fn build):\n\n{s}\n", .{build_snippet});
+    print("\n  Next: add this to build.zig (inside pub fn build):\n\n{s}\n", .{native_build_snippet});
     print("  Then: mer native          # launch the native window\n", .{});
     print("        mer native build    # prod binary\n", .{});
     print("        mer package         # .app bundle\n\n", .{});

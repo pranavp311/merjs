@@ -10,7 +10,7 @@ model — an unusually clean fit for merjs because the framework *already owns*
 the HTTP server, routing, SSR, and hot-reload transport. The shell only adds
 the WebView + window + bridge + packaging layer.
 
-> v0.2.6 ships macOS. Linux (WebKitGTK) and Windows (WebView2) are planned.
+> v0.2.53 ships macOS. Linux (WebKitGTK) and Windows (WebView2) are planned.
 
 ---
 
@@ -75,7 +75,7 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
     .name = "my-app",
     .display_name = "My App",         // → CFBundleName + .app bundle name
     .version = "0.1.0",               // → CFBundleVersion
-    .web_engine = "system",           // "system" (v0.2.6) | "chromium" (unsupported)
+    .web_engine = "system",           // "system" (v0.2.53) | "chromium" (unsupported)
     .server = .{
         .mode = "dev",                // "dev" (hot reload) | "embedded" (prod)
         .host = "127.0.0.1",
@@ -121,8 +121,8 @@ Each call is:
 |---|---|---|
 | `mer.ping` | _(none)_ | Returns `{ "pong": true }`. Round-trip smoke test. |
 | `mer.echo` | _(none)_ | Returns `{ "echo": true }`. |
-| `dialog.openFile` | `dialog` | Stub (returns `HandlerError`); NSOpenPanel wiring lands post-v0.2.6. |
-| `clipboard.write` | `clipboard` | Stub; NSPasteboard wiring lands post-v0.2.6. |
+| `dialog.openFile` | `dialog` | Stub (returns `HandlerError`); NSOpenPanel wiring lands after v0.2.53. |
+| `clipboard.write` | `clipboard` | Stub; NSPasteboard wiring lands after v0.2.53. |
 
 ### Adding a command
 
@@ -143,9 +143,8 @@ pub const registry = [_]Command{
 ### Security model
 
 The native shell only ever loads `http://127.0.0.1:<port>`, so the origin is
-trusted loopback by construction. For v0.2.6 the **size + permission guards**
-are the security boundary. Dynamic origin extraction from the WKScriptMessage
-frame is a planned hardening step.
+trusted loopback by construction. The bridge also checks the WebView's current
+URL against `security.navigation.allowed_origins` before dispatching commands.
 
 ---
 
@@ -160,13 +159,13 @@ frame is a planned hardening step.
 
 ---
 
-## Limitations (v0.2.6)
+## Limitations (v0.2.53)
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned.
 - `dialog` / `clipboard` commands are stubs (return `HandlerError`).
 - No code signing / notarization.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.
 - `server.mode = "static"` (fully static export over `mer://app`) is a stretch
-  goal; v0.2.6 runs the embedded loopback server in both dev and prod.
+  goal; v0.2.53 runs the embedded loopback server in both dev and prod.
 
 See `plans/mer-native.md` for the full design and phased roadmap.

@@ -16,8 +16,7 @@
 //
 // Origin note: the native shell only ever loads http://127.0.0.1:<port>, so the
 // origin is trusted loopback by construction. Dynamic origin extraction from
-// the WKScriptMessage frame is a future hardening step; for v0.2.6 the size +
-// permission guards are the security boundary.
+// the WKScriptMessage frame is checked by the macOS backend before dispatch.
 
 const std = @import("std");
 
@@ -28,6 +27,7 @@ pub const max_payload_bytes: usize = 64 * 1024;
 pub const Ctx = struct {
     allocator: std.mem.Allocator,
     permissions: []const []const u8,
+    allowed_origins: []const []const u8 = &.{},
 };
 
 /// A JSON value returned by a bridge handler (an owned string of JSON).
@@ -74,13 +74,13 @@ fn ping(_: *Ctx, _: std.json.Value) HandlerResult {
 }
 
 fn echo(_: *Ctx, _: std.json.Value) HandlerResult {
-    // v0.2.6: static ack. Dynamic arg reflection (re-stringify args) needs a
+    // This release: static ack. Dynamic arg reflection (re-stringify args) needs a
     // JSON writer; the round-trip itself is proven by mer.ping.
     return .{ .ok = "{\"echo\":true}" };
 }
 
 fn dialogOpenFile(_: *Ctx, _: std.json.Value) HandlerResult {
-    // NSOpenPanel wiring lands post-v0.2.6; surface a clear error.
+    // NSOpenPanel wiring lands after this release; surface a clear error.
     return .{ .err = error.HandlerError };
 }
 
@@ -94,6 +94,13 @@ pub fn hasPermission(ctx: *Ctx, perm: []const u8) bool {
     if (perm.len == 0) return true;
     for (ctx.permissions) |p| {
         if (std.mem.eql(u8, p, perm)) return true;
+    }
+    return false;
+}
+
+pub fn isOriginAllowed(ctx: *Ctx, url: []const u8) bool {
+    for (ctx.allowed_origins) |origin| {
+        if (std.mem.startsWith(u8, url, origin)) return true;
     }
     return false;
 }
@@ -127,21 +134,28 @@ pub fn dispatch(ctx: *Ctx, payload: []const u8) BridgeError![]u8 {
             const res = cmd.handler(ctx, env.args);
             switch (res) {
                 .ok => |json| return resolveStr(alloc, env.id, true, json),
-                .err => |e| return resolveStr(alloc, env.id, false, try quoteStr(alloc, @errorName(e))),
+                .err => |e| return resolveError(alloc, env.id, @errorName(e)),
             }
         }
     }
-    return resolveStr(alloc, env.id, false, try quoteStr(alloc, "UnknownCommand"));
+    return resolveError(alloc, env.id, "UnknownCommand");
 }
 
-/// Wrap a bare string as a JSON string literal (for error names).
-fn quoteStr(alloc: std.mem.Allocator, s: []const u8) BridgeError![]const u8 {
-    return std.fmt.allocPrint(alloc, "\"{s}\"", .{s}) catch error.OutOfMemory;
+pub fn rejectFromPayload(ctx: *Ctx, payload: []const u8, name: []const u8) BridgeError![]u8 {
+    var parsed = std.json.parseFromSlice(Envelope, ctx.allocator, payload, .{}) catch {
+        return resolveError(ctx.allocator, 0, name);
+    };
+    defer parsed.deinit();
+    return resolveError(ctx.allocator, parsed.value.id, name);
 }
 
 /// Format `window.mer._resolve(<id>,<ok>,<json>);` into an owned string.
 fn resolveStr(alloc: std.mem.Allocator, id: i64, ok: bool, json: []const u8) BridgeError![]u8 {
     return std.fmt.allocPrint(alloc, "window.mer._resolve({d},{s},{s});", .{ id, if (ok) "true" else "false", json }) catch error.OutOfMemory;
+}
+
+fn resolveError(alloc: std.mem.Allocator, id: i64, name: []const u8) BridgeError![]u8 {
+    return std.fmt.allocPrint(alloc, "window.mer._resolve({d},false,\"{s}\");", .{ id, name }) catch error.OutOfMemory;
 }
 
 // ── tests (standalone: bridge.zig only imports std) ─────────────────────────
@@ -212,4 +226,24 @@ test "dispatch: malformed json yields ParseError" {
 test "hasPermission: empty perm always allowed" {
     var ctx = newCtx(testing.allocator, &.{});
     try testing.expect(hasPermission(&ctx, ""));
+}
+
+test "isOriginAllowed: allows configured URL prefixes only" {
+    var ctx = Ctx{
+        .allocator = testing.allocator,
+        .permissions = &.{},
+        .allowed_origins = &.{ "http://127.0.0.1", "mer://app" },
+    };
+    try testing.expect(isOriginAllowed(&ctx, "http://127.0.0.1:3000/"));
+    try testing.expect(isOriginAllowed(&ctx, "mer://app/index.html"));
+    try testing.expect(!isOriginAllowed(&ctx, "https://example.com/"));
+}
+
+test "rejectFromPayload preserves caller id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{});
+    const js = try rejectFromPayload(&ctx, "{\"cmd\":\"mer.ping\",\"id\":42}", "OriginNotAllowed");
+    try testing.expectEqualStrings("window.mer._resolve(42,false,\"OriginNotAllowed\");", js);
 }

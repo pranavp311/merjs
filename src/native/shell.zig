@@ -55,7 +55,7 @@ pub fn run(
     defer runtime.deinit();
 
     if (!std.mem.eql(u8, app_manifest.web_engine, "system")) {
-        log.err("web_engine='{s}' is not supported in v0.2.6 (use \"system\")", .{app_manifest.web_engine});
+        log.err("web_engine='{s}' is not supported in this release (use \"system\")", .{app_manifest.web_engine});
         return error.UnsupportedWebEngine;
     }
 
@@ -98,6 +98,7 @@ pub fn run(
     bctx.* = .{
         .allocator = allocator,
         .permissions = app_manifest.permissions,
+        .allowed_origins = app_manifest.security.allowed_origins,
     };
 
     // Hand off to the platform backend (blocks on the event loop).

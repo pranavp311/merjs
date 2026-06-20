@@ -215,7 +215,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     // Run inline tests in individual framework source files.
-    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/mercss-jit.zig", "src/native/bridge.zig" }) |src_path| {
+    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/mercss-jit.zig", "src/native/bridge.zig", "src/native/manifest.zig" }) |src_path| {
         const file_test_mod = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
@@ -422,6 +422,7 @@ pub fn build(b: *std.Build) void {
         native_mod.link_libc = true;
 
         const native_exe = b.addExecutable(.{ .name = "mernative", .root_module = native_mod });
+        native_exe.step.dependOn(&run_codegen.step);
         const native_install = b.addInstallArtifact(native_exe, .{});
 
         // `native` — run step (dev). `zig build native -- --dev`
