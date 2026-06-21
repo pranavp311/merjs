@@ -31,6 +31,9 @@ pub const Manifest = struct {
     host: []const u8,
     port: u16,
     watch_dir: []const u8,
+    /// Directory to serve static files from (e.g. "dist" for a built SPA).
+    /// null = serve from public/ (merjs default).
+    static_dir: ?[]const u8,
     dev: bool,
     window: WindowConfig,
     permissions: []const []const u8,
@@ -48,6 +51,7 @@ pub fn fromZon(comptime zon: anytype) Manifest {
     const host = if (has_server) zon.server.host else "127.0.0.1";
     const port: u16 = if (has_server) zon.server.port else 0;
     const watch_dir = if (has_server and @hasField(@TypeOf(zon.server), "watch_dir")) zon.server.watch_dir else "app";
+    const static_dir: ?[]const u8 = if (has_server and @hasField(@TypeOf(zon.server), "static_dir")) zon.server.static_dir else null;
 
     // First window drives the shell. windows[] is required.
     const win = zon.windows[0];
@@ -84,6 +88,7 @@ pub fn fromZon(comptime zon: anytype) Manifest {
         .host = host,
         .port = port,
         .watch_dir = watch_dir,
+        .static_dir = static_dir,
         .dev = std.mem.eql(u8, server_mode, "dev"),
         .window = window,
         .permissions = perms,

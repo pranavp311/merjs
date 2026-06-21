@@ -27,6 +27,8 @@ const ServerCtx = struct {
     manifest: manifest_mod.Manifest,
     ready: mer.ServerReady = .{},
     watcher: ?*mer.Watcher = null,
+    static_dir: ?[]const u8 = null,
+    raw_handler: ?*const mer.RawHandler = null,
 };
 
 fn runServer(ctx: *ServerCtx) void {
@@ -35,12 +37,21 @@ fn runServer(ctx: *ServerCtx) void {
         .port = ctx.manifest.port,
         .dev = ctx.manifest.dev,
         .ready = &ctx.ready,
+        .static_dir = ctx.static_dir,
+        .raw_handler = ctx.raw_handler,
     }, ctx.router, if (ctx.manifest.dev) ctx.watcher else null);
     srv.listen() catch |err| {
         log.err("server listen failed: {}", .{err});
         ctx.ready.set(); // unblock the main thread even on failure
     };
 }
+
+/// Options for `run`. Pass `.{}` for defaults (no raw handler).
+pub const RunOpts = struct {
+    /// Optional raw-request handler (e.g. SSE /events). Receives the live
+    /// request so it can hold the connection open. See mer.RawHandler.
+    raw_handler: ?*const mer.RawHandler = null,
+};
 
 /// Run the native shell. Blocks until the window is closed.
 ///
@@ -49,6 +60,7 @@ pub fn run(
     allocator: std.mem.Allocator,
     app_manifest: manifest_mod.Manifest,
     router: *const mer.Router,
+    opts: RunOpts,
 ) !void {
     // std.Io runtime must be initialized before Server.listen touches runtime.io.
     try runtime.init(allocator);
@@ -81,6 +93,8 @@ pub fn run(
         .router = router,
         .manifest = app_manifest,
         .watcher = watcher_ref,
+        .static_dir = app_manifest.static_dir,
+        .raw_handler = opts.raw_handler,
     };
     const thread = try std.Thread.spawn(.{}, runServer, .{ctx});
     thread.detach();

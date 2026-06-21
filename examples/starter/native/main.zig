@@ -38,5 +38,5 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer router.deinit();
 
     log.info("mer native — {s} v{s} ({s})", .{ app_manifest.display_name, app_manifest.version, app_manifest.server_mode });
-    try native.Shell.run(allocator, app_manifest, &router);
+    try native.Shell.run(allocator, app_manifest, &router, .{});
 }
