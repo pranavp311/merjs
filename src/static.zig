@@ -79,16 +79,31 @@ fn putCache(rel: []const u8, body: []const u8, ct: mer.ContentType) void {
 
 /// Attempt to serve `url_path` from the public/ directory.
 /// Returns `{}` if served, `null` if the file was not found.
+/// Options for static serving.
+pub const ServeOpts = struct {
+    /// Directory to serve from (default "public"). Set to "dist" for a built SPA.
+    dir: []const u8 = "public",
+    /// When true, "/" serves index.html and unknown paths fall back to it
+    /// (SPA history-fallback mode). Use for Vite/React builds with client routing.
+    spa: bool = false,
+};
+
 pub fn tryServe(
     alloc: std.mem.Allocator,
     std_req: *std.http.Server.Request,
     url_path: []const u8,
     io: std.Io,
+    opts: ServeOpts,
 ) ?void {
     if (std.mem.indexOf(u8, url_path, "..") != null) return null;
 
     const rel = if (url_path.len > 0 and url_path[0] == '/') url_path[1..] else url_path;
-    if (rel.len == 0) return null;
+
+    // "/" or empty → index.html.
+    if (rel.len == 0) {
+        if (opts.spa) return serveIndex(alloc, std_req, opts.dir, io);
+        return null;
+    }
 
     // Try cache first.
     if (getCached(rel)) |entry| {
@@ -96,10 +111,12 @@ pub fn tryServe(
     }
 
     // Cache miss — read from disk.
-    const fs_path = std.fmt.allocPrint(alloc, "public/{s}", .{rel}) catch return null;
+    const fs_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.dir, rel }) catch return null;
     defer alloc.free(fs_path);
     const body = std.Io.Dir.cwd().readFileAlloc(io, fs_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
         if (err != error.FileNotFound) log.err("read {s}: {}", .{ fs_path, err });
+        // SPA fallback: unknown path → index.html (client-side route).
+        if (opts.spa) return serveIndex(alloc, std_req, opts.dir, io);
         return null;
     };
     defer alloc.free(body);
@@ -110,6 +127,28 @@ pub fn tryServe(
     putCache(rel, body, ct);
 
     return sendStatic(std_req, body, ct);
+}
+
+/// Serve <dir>/index.html (SPA shell). Cached under the key "<dir>/index.html".
+fn serveIndex(
+    alloc: std.mem.Allocator,
+    std_req: *std.http.Server.Request,
+    dir: []const u8,
+    io: std.Io,
+) ?void {
+    const cache_key = if (std.mem.eql(u8, dir, "public")) "index.html" else dir;
+    if (getCached(cache_key)) |entry| {
+        return sendStatic(std_req, entry.body, entry.ct);
+    }
+    const fs_path = std.fmt.allocPrint(alloc, "{s}/index.html", .{dir}) catch return null;
+    defer alloc.free(fs_path);
+    const body = std.Io.Dir.cwd().readFileAlloc(io, fs_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
+        if (err != error.FileNotFound) log.err("read {s}: {}", .{ fs_path, err });
+        return null;
+    };
+    defer alloc.free(body);
+    putCache(cache_key, body, .html);
+    return sendStatic(std_req, body, .html);
 }
 
 fn sendStatic(std_req: *std.http.Server.Request, body: []const u8, ct: mer.ContentType) ?void {

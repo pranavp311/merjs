@@ -65,6 +65,24 @@ pub const Config = struct {
     kuri_port: u16 = 9222,
     /// If non-null, listen() sets .port to the actual bound port then signals .event.
     ready: ?*ServerReady = null,
+    /// Static-file root directory (default "public"). Set to "dist" to serve a
+    /// Vite/SSG build. When set, index.html is served at "/" and unknown paths
+    /// fall back to index.html (SPA history fallback).
+    static_dir: ?[]const u8 = null,
+    /// Optional raw-handler hook, checked before routing/static. Use this to
+    /// register long-lived endpoints that must own the connection (e.g. SSE)
+    /// which normal API routes (returning a single `mer.Response`) cannot do.
+    /// Return `true` if the request was fully handled; `false` to fall through.
+    raw_handler: ?*const RawHandler = null,
+};
+
+/// Raw request handler: receives the live `std.http.Server.Request` so it can
+/// call `respondStreaming` and hold the connection open (SSE, websockets).
+/// `alloc` is a per-connection arena; `io` is the runtime I/O instance.
+/// Return `true` if handled (no further processing), `false` to fall through.
+pub const RawHandler = struct {
+    ctx: *anyopaque,
+    callback: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, std_req: *std.http.Server.Request, io: std.Io) bool,
 };
 
 pub const Server = struct {
@@ -133,6 +151,8 @@ pub const Server = struct {
                 .allocator = self.allocator,
                 .dev = self.config.dev,
                 .verbose = self.config.verbose,
+                .static_dir = self.config.static_dir,
+                .raw_handler = self.config.raw_handler,
             };
             // 0.16: Thread.Pool removed; spawn a detached thread per connection.
             const t = std.Thread.spawn(.{}, handleConn, .{ctx}) catch {
@@ -154,6 +174,8 @@ const ConnCtx = struct {
     allocator: std.mem.Allocator,
     dev: bool,
     verbose: bool,
+    static_dir: ?[]const u8,
+    raw_handler: ?*const RawHandler,
 };
 
 fn handleConn(ctx: *ConnCtx) void {
@@ -182,7 +204,7 @@ fn handleConn(ctx: *ConnCtx) void {
         _request_start_ns = nanoTimestamp();
         _ttfb_ns = 0;
         const start = _request_start_ns;
-        serveRequest(alloc, &std_req, ctx.router, ctx.watcher, ctx.kuri, ctx.dev, ctx.verbose, ctx.io) catch |err| {
+        serveRequest(alloc, &std_req, ctx.router, ctx.watcher, ctx.kuri, ctx.dev, ctx.verbose, ctx.io, ctx.static_dir, ctx.raw_handler) catch |err| {
             log.err("serveRequest: {}", .{err});
             if (ctx.dev) {
                 dev_mod.sendErrorOverlay(&std_req, std_req.head.target, err, mer.version) catch {};
@@ -228,6 +250,8 @@ fn serveRequest(
     dev: bool,
     verbose: bool,
     io: std.Io,
+    static_dir: ?[]const u8,
+    raw_handler: ?*const RawHandler,
 ) !void {
     _ = verbose;
     const raw_target = std_req.head.target;
@@ -241,6 +265,12 @@ fn serveRequest(
         if (q + 1 < raw_target.len) raw_target[q + 1 ..] else ""
     else
         "";
+
+    // Raw handler hook (checked first) — lets apps register long-lived
+    // endpoints (SSE, websockets) that must own the connection.
+    if (raw_handler) |rh| {
+        if (rh.callback(rh.ctx, alloc, std_req, io)) return;
+    }
 
     // SSE hot-reload endpoint.
     if (dev and std.mem.eql(u8, path, "/_mer/events")) {
@@ -271,8 +301,13 @@ fn serveRequest(
         }
     }
 
-    // Static files from public/.
-    if (static.tryServe(alloc, std_req, path, io)) |_| return;
+    // Static files: from public/ by default, or a configured dir (e.g. dist/)
+    // with SPA history fallback when static_dir is set.
+    if (static.tryServe(alloc, std_req, path, io, if (static_dir) |d|
+        .{ .dir = d, .spa = true }
+    else
+        .{}
+    )) |_| return;
 
     // Pre-rendered pages from dist/ (SSG).
     if (!dev) {

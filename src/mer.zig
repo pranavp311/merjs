@@ -205,6 +205,7 @@ pub const StreamLayoutFn = @import("router.zig").StreamLayoutFn;
 pub const Server = @import("server.zig").Server;
 pub const Config = @import("server.zig").Config;
 pub const ServerReady = @import("server.zig").ServerReady;
+pub const RawHandler = @import("server.zig").RawHandler;
 pub const Watcher = @import("watcher.zig").Watcher;
 pub const runPrerender = @import("prerender.zig").run;
 
