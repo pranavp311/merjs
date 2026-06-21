@@ -301,17 +301,23 @@ fn serveRequest(
         }
     }
 
-    // Static files: from public/ by default, or a configured dir (e.g. dist/)
-    // with SPA history fallback when static_dir is set.
-    if (static.tryServe(alloc, std_req, path, io, if (static_dir) |d|
-        .{ .dir = d, .spa = true }
-    else
-        .{}
-    )) |_| return;
+    // If a route matches this path, dispatch it BEFORE static/SPA fallback —
+    // otherwise an SPA history-fallback (static_dir set) would serve index.html
+    // for /api/* paths and shadow the backend routes.
+    const has_route = router.findRoute(path) != null;
+    if (!has_route) {
+        // Static files: from public/ by default, or a configured dir (e.g. dist/)
+        // with SPA history fallback when static_dir is set.
+        if (static.tryServe(alloc, std_req, path, io, if (static_dir) |d|
+            .{ .dir = d, .spa = true }
+        else
+            .{}
+        )) |_| return;
 
-    // Pre-rendered pages from dist/ (SSG).
-    if (!dev) {
-        if (tryServePrerendered(alloc, std_req, path, io)) |_| return;
+        // Pre-rendered pages from dist/ (SSG).
+        if (!dev) {
+            if (tryServePrerendered(alloc, std_req, path, io)) |_| return;
+        }
     }
 
     // ── Build Request ──────────────────────────────────────────────────────
