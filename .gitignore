@@ -58,3 +58,13 @@ app.main/
 public/style.css
 *.o
 --version
+
+# Harness artifacts (local agent session/trace — not PR evidence)
+# The trajectory archive (harness.trajectory.jsonl) IS committed as audit trail;
+# these sibling artifacts are local-only:
+harness.trace.jsonl
+session-*.session.json
+.graff/
+.harness/
+PR100_NATIVE_HANDOFF.md
+codedb.snapshot
