@@ -45,6 +45,7 @@ const NSApplicationActivationPolicyRegular: NSInteger = 0;
 const YES: BOOL = 1;
 const NO: BOOL = 0;
 const WKUserScriptInjectionTimeAtDocumentStart: NSUInteger = 0;
+const NSUTF8StringEncoding: NSUInteger = 4;
 
 fn cls(name: [*:0]const u8) Id {
     return objc_getClass(name);
@@ -93,6 +94,10 @@ fn sendInt(recv: Id, s: Sel) NSInteger {
 fn sendIntv(recv: Id, s: Sel, a: NSInteger) void {
     const F = *const fn (Id, Sel, NSInteger) callconv(.c) void;
     @as(F, @ptrCast(&objc_msgSend))(recv, s, a);
+}
+fn sendUnsigned1(recv: Id, s: Sel, a: NSUInteger) NSUInteger {
+    const F = *const fn (Id, Sel, NSUInteger) callconv(.c) NSUInteger;
+    return @as(F, @ptrCast(&objc_msgSend))(recv, s, a);
 }
 fn sendBoolv(recv: Id, s: Sel, a: BOOL) void {
     const F = *const fn (Id, Sel, BOOL) callconv(.c) void;
@@ -206,8 +211,23 @@ fn merInvokeIMP(self: Id, _cmd: Sel, ucc: Id, message: Id) callconv(.c) void {
         evalJs(ctx, wv, js);
         return;
     }
+    const byte_len = sendUnsigned1(body, sel("lengthOfBytesUsingEncoding:"), NSUTF8StringEncoding);
     const cstr = sendPtr(body, sel("UTF8String"));
     const payload = std.mem.span(cstr);
+    if (byte_len > bridge.max_payload_bytes) {
+        const js = bridge.rejectFromPayload(ctx, "", "PayloadTooLarge") catch return;
+        defer ctx.allocator.free(js);
+        evalJs(ctx, wv, js);
+        return;
+    }
+    if (payload.len != byte_len) {
+        // A directly-posted NSString can contain embedded NUL bytes. Do not let
+        // UTF8String/std.mem.span truncate the message before dispatch checks.
+        const js = bridge.rejectFromPayload(ctx, payload, "ParseError") catch return;
+        defer ctx.allocator.free(js);
+        evalJs(ctx, wv, js);
+        return;
+    }
 
     var origin_buf: [512]u8 = undefined;
     const origin = messageFrameOrigin(message, &origin_buf) orelse {

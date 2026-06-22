@@ -247,6 +247,10 @@ pub fn isOriginAllowed(ctx: *Ctx, url: []const u8) bool {
         const allowed = parseOrigin(origin) orelse continue;
         if (!std.ascii.eqlIgnoreCase(actual.scheme, allowed.scheme)) continue;
         if (!std.ascii.eqlIgnoreCase(actual.host, allowed.host)) continue;
+        // Browser origins are scheme+host+port. A portless manifest entry (for
+        // example `http://127.0.0.1`) intentionally does not wildcard every
+        // loopback port; shell.zig prepends the exact runtime origin after the
+        // server binds its ephemeral port.
         if (allowed.port) |allowed_port| {
             if (actual.port == null or !std.mem.eql(u8, actual.port.?, allowed_port)) continue;
         } else if (actual.port != null) {
@@ -408,16 +412,17 @@ test "hasPermission: empty perm always allowed" {
     try testing.expect(hasPermission(&ctx, ""));
 }
 
-test "isOriginAllowed: matches scheme and host, not string prefixes" {
+test "isOriginAllowed: matches scheme host and port, not string prefixes" {
     var ctx = Ctx{
         .allocator = testing.allocator,
         .permissions = &.{},
-        .allowed_origins = &.{ "http://127.0.0.1", "mer://app", "http://localhost:3000" },
+        .allowed_origins = &.{ "http://127.0.0.1", "http://127.0.0.1:49152", "mer://app", "http://localhost:3000" },
     };
-    try testing.expect(!isOriginAllowed(&ctx, "http://127.0.0.1:49152/"));
+    try testing.expect(isOriginAllowed(&ctx, "http://127.0.0.1:49152/"));
     try testing.expect(isOriginAllowed(&ctx, "http://127.0.0.1/"));
     try testing.expect(isOriginAllowed(&ctx, "mer://app/index.html"));
     try testing.expect(isOriginAllowed(&ctx, "http://localhost:3000/"));
+    try testing.expect(!isOriginAllowed(&ctx, "http://127.0.0.1:31337/"));
     try testing.expect(!isOriginAllowed(&ctx, "http://127.0.0.1.evil.example/"));
     try testing.expect(!isOriginAllowed(&ctx, "mer://app.evil/index.html"));
     try testing.expect(!isOriginAllowed(&ctx, "http://localhost:3001/"));

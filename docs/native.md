@@ -129,6 +129,7 @@ Each call is:
 | `open.external` | `open` | Opens `{ url }` (or raw string) with `NSWorkspace.openURL`; returns `null`. |
 | `open.path` | `open` | Opens `{ path }` (or raw string) with the default handler/Finder; returns `null`. |
 | `window.setTitle` | `window` | Sets the current key window title from `{ title }` (or raw string); returns `null`. |
+| `window.close` | `window` | Closes the current key window (`performClose:`); returns `null`. |
 
 ### Custom commands
 
@@ -140,10 +141,12 @@ rather than editing merjs internals as an extension mechanism.
 
 The native shell currently loads the app over an embedded loopback URL such as
 `http://127.0.0.1:<port>/`. Before dispatching bridge commands, the macOS
-backend checks the WebView's current top-level URL against
-`security.navigation.allowed_origins`. Full per-frame origin extraction from
-`WKScriptMessage.frameInfo.securityOrigin` and per-command origin policy are
-hardening follow-ups; PR #100 uses top-level permissions plus global origins.
+backend checks the `WKScriptMessage` frame origin against
+`security.navigation.allowed_origins`. `shell.zig` prepends the exact runtime
+origin after the server binds its ephemeral port, so portless manifest entries
+(for example `http://127.0.0.1`) do **not** wildcard every local server port.
+Per-command origin policy is still a hardening follow-up; PR #100 uses top-level
+permissions plus global origins.
 
 ---
 

@@ -40,7 +40,9 @@ We will **study** zero-native's `src/bridge/root.zig`, `src/primitives/app_manif
 **Decision: system-only for v0.2.53.** CEF is explicitly deferred. `web_engine = "chromium"` is a manifest value we *parse* but reject with a clear error for now.
 
 ### Q3: Bridge auth model — per-command permissions vs capability allowlist?
-**Decision: per-command permissions in the manifest**, mirroring zero-native's `bridge.commands[]` (each command declares `permissions` + `origins`). This is more precise than a global capability allowlist and matches `dispatch.zig`'s per-route shape. A command with no matching registration is rejected (deny-by-default).
+**Decision for v0.2.53: built-in command registry + top-level permissions + global allowed origins.**
+
+The original issue proposed zero-native-style `bridge.commands[]` per-command declarations. PR #100 deliberately keeps the mergeable surface smaller: each built-in command has a static permission class in `src/native/bridge.zig`, the app grants permission classes in top-level `permissions`, and the macOS backend checks the calling `WKScriptMessage` frame origin against global `security.navigation.allowed_origins` plus the exact runtime loopback origin inserted by `shell.zig` after the ephemeral port binds. Per-command manifest allowlists remain a hardening/extension follow-up.
 
 ### Q4: Prod = live SSR (embedded server) vs static export?
 **Decision: `server.mode` switch in the manifest, as the issue proposes.** v0.2.53 ships `embedded` (in-process loopback server, the proven path). `static` (serve a prerendered `dist/` over `mer://app` custom scheme) is a stretch goal; we stub the manifest field and implement only if P5 lands cleanly.
@@ -119,24 +121,17 @@ native/shell  (WKWebView)                  same shell, statically linked
         .port = 0,                           // 0 = ephemeral; shell reads back via ServerReady
     },
     .capabilities = .{ "webview", "js_bridge" },
-    .permissions = .{ "window", "clipboard", "dialog" },
+    .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
         .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
     },
     .windows = .{
         .{ .label = "main", .title = "My App", .width = 1024, .height = 720 },
     },
-    .bridge = .{
-        .commands = .{
-            .{ .name = "dialog.openFile", .permissions = .{ "dialog" }, .origins = .{ "http://127.0.0.1" } },
-            .{ .name = "clipboard.write", .permissions = .{ "clipboard" }, .origins = .{ "http://127.0.0.1" } },
-            .{ .name = "window.setTitle", .permissions = .{ "window" }, .origins = .{ "http://127.0.0.1" } },
-        },
-    },
 }
 ```
 
-Parsed at comptime via `@import("mer.app.zon")` in the generated `native/main.zig`, so manifest values (window size, title, bundle id) flow into the build with zero runtime parsing.
+Parsed at comptime via `@import("mer.app.zon")` in the generated `native/main.zig`, so manifest values (window size, title, bundle id) flow into the build with zero runtime parsing. `bridge.commands[]` is not active policy in PR #100; command exposure is the static built-in registry gated by top-level permission classes and global allowed origins.
 
 ---
 
@@ -145,23 +140,24 @@ Parsed at comptime via `@import("mer.app.zon")` in the generated `native/main.zi
 Client → Zig, mirroring zero-native's `window.zero.invoke`:
 
 ```js
-const path = await window.mer.invoke("dialog.openFile", { filters: ["*.md"] });
-```
-
-```zig
-// native/commands.zig — registered handlers, opt-in only
-pub fn openFile(ctx: *mer.native.Ctx, args: OpenFileArgs) !mer.native.Json {
-    if (!ctx.hasPermission(.dialog)) return error.PermissionDenied;
-    // ...call platform dialog API via the same extern-ObjC interop...
-}
+const path = await window.mer.invoke("dialog.openFile", { title: "Choose a file" });
+const dir = await window.mer.invoke("dialog.pickDirectory", { title: "Open project" });
+await window.mer.invoke("clipboard.write", { text: "hello" });
+const text = await window.mer.invoke("clipboard.read");
+await window.mer.invoke("open.external", { url: "https://example.com" });
+await window.mer.invoke("open.path", { path: "/tmp" });
+await window.mer.invoke("window.setTitle", { title: "My App" });
+await window.mer.invoke("window.close");
 ```
 
 Bridge contract (`src/native/bridge.zig`):
-1. **Size limit:** reject payloads > 64 KB (zero-native does the same; keeps the ObjC string bridge bounded).
-2. **Origin check:** the calling frame's origin must be in the command's `.origins` allowlist. Default allow `http://127.0.0.1` (loopback) and `mer://app`.
-3. **Permission check:** `ctx.hasPermission` against the command's `.permissions` and the manifest's top-level `.permissions`.
+1. **Size limit:** reject payloads > 64 KB (and reject embedded-NUL NSString bodies before truncation can bypass the check).
+2. **Origin check:** the calling `WKScriptMessage` frame origin must be globally allowed; `shell.zig` prepends the exact runtime loopback origin after `port=0` binds.
+3. **Permission check:** the command's static permission class (for example `dialog`, `clipboard`, `open`, `window`) must appear in the manifest's top-level `.permissions`.
 4. **Dispatch:** command name → handler via a comptime-built registry (same shape as `Router.exact_map` in `dispatch.zig`).
 5. **Deny-by-default:** unknown command name → `error.UnknownCommand`.
+
+App-level custom command registries and per-command manifest allowlists are deferred; consumers should use the built-ins above for PR #100.
 
 JS injection: the shell injects a small `window.mer.invoke` shim into the WKWebView via `WKUserScript` (added to the `WKUserContentController` on the `WKWebViewConfiguration` that `examples/desktop/main.zig` already allocates). The shim posts to a registered message handler; the Zig side receives it through `WKScriptMessageHandler` (new ObjC glue — the one piece the spike doesn't have yet).
 
@@ -173,7 +169,7 @@ JS injection: the shell injects a small `window.mer.invoke` shim into the WKWebV
 |---|---|---|---|
 | **P0** | Spike (macOS) | **Verified** + fixed Zig 0.16 drift (`ServerReady.set/wait`). | ✅ shipped (bcca0aa) |
 | **P1** | Manifest + CLI | `src/native/{shell,macos,manifest,main,mer}.zig`; `mer.app.zon`; `native`/`native-build`/`package` build steps; `mer native`/`native build`/`package`/`add native` CLI. | ✅ shipped (878df08) |
-| **P2** | Bridge | `bridge.zig` dispatch + 7 unit tests; `macos.zig` WKScriptMessageHandler + WKUserScript shim; `mer.ping`/`echo` + dialog/clipboard stubs. | ✅ shipped (ff605fa) |
+| **P2** | Bridge | `bridge.zig` dispatch + unit tests; `macos.zig` WKScriptMessageHandler + WKUserScript shim; built-ins for ping/echo, clipboard read/write, file/directory dialogs, open URL/path, window title/close. | ✅ shipped (ff605fa plus follow-ups) |
 | **P3** | Packaging | `mer package` → `<display_name>.app` with manifest-driven `Info.plist` (`@import` of `mer.app.zon` in build.zig). | ✅ shipped (0b6be0b) |
 | **P4** | Linux WebView | `src/native/linux.zig` (WebKitGTK) behind `Shell` interface. | stretch for v0.2.53 |
 | **P5** | Prod server embed | In-process loopback + asset embedding + `mer://app` scheme. `server.mode = "static"`. | stretch for v0.2.53 |
@@ -217,5 +213,5 @@ The server (`src/server.zig`), router, dispatch, and watcher are **untouched** �
 
 - [ ] P0: `zig build desktop` on `release/v0.2.53` opens a window loading the site from `127.0.0.1:<ephemeral>`.
 - [ ] P1: `mer add native` in a fresh `mer init` project creates `mer.app.zon` + `native/`; `mer native` opens a window sized/titled from the manifest.
-- [ ] P2: a page calling `window.mer.invoke("dialog.openFile")` returns a path; an unpermitted command returns `PermissionDenied`; an oversized payload is rejected; a non-loopback origin is rejected.
+- [ ] P2: a page calling the built-in commands returns expected values (`dialog.openFile`/`dialog.pickDirectory` path-or-null, clipboard string/null, open/window null); an unpermitted command returns `PermissionDenied`; oversized or embedded-NUL payloads are rejected; a non-allowed frame origin is rejected.
 - [ ] P3: `mer package` emits `<Name>.app` whose `Info.plist` reflects `id`/`display_name`/`version` from `mer.app.zon`; `open <Name>.app` boots without a terminal.
