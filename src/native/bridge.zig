@@ -173,7 +173,7 @@ fn jsonString(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     var jw: std.json.Stringify = .{ .writer = &out.writer };
     try jw.write(value);
-    return out.written();
+    return out.toOwnedSlice();
 }
 
 /// True if `perm` is granted by the manifest's permissions list. Empty perm
@@ -372,6 +372,21 @@ test "dispatch: malformed json yields ParseError" {
     var ctx = newCtx(alloc, &.{});
     const js = try dispatch(&ctx, "not json");
     try testing.expectEqualStrings("window.mer._resolve(0,false,\"ParseError\");", js);
+}
+
+test "jsonString returns an owned exact slice" {
+    const json = try jsonString(testing.allocator, "clipboard text");
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("\"clipboard text\"", json);
+}
+
+test "dispatch: clipboard read owned result is freeable" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var ctx = newCtx(testing.allocator, &.{"clipboard"});
+    const js = try dispatch(&ctx, "{\"cmd\":\"clipboard.read\",\"args\":null,\"id\":9}");
+    defer testing.allocator.free(js);
+    try testing.expect(std.mem.startsWith(u8, js, "window.mer._resolve(9,true,"));
 }
 
 test "hasPermission: empty perm always allowed" {

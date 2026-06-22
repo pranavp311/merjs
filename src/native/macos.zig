@@ -74,6 +74,10 @@ fn send2v(recv: Id, s: Sel, a1: Id, a2: Id) void {
     const F = *const fn (Id, Sel, Id, Id) callconv(.c) void;
     @as(F, @ptrCast(&objc_msgSend))(recv, s, a1, a2);
 }
+fn sendMenuItemInit(recv: Id, s: Sel, title: Id, action: Sel, key: Id) Id {
+    const F = *const fn (Id, Sel, Id, Sel, Id) callconv(.c) Id;
+    return @as(F, @ptrCast(&objc_msgSend))(recv, s, title, action, key);
+}
 fn sendStr(recv: Id, s: Sel, str: [*:0]const u8) Id {
     const F = *const fn (Id, Sel, [*:0]const u8) callconv(.c) Id;
     return @as(F, @ptrCast(&objc_msgSend))(recv, s, str);
@@ -109,6 +113,52 @@ fn sendWebViewInit(recv: Id, s: Sel, frame: CGRect, config: Id) Id {
 fn sendUserScriptInit(recv: Id, s: Sel, source: Id, time: NSUInteger, main: BOOL) Id {
     const F = *const fn (Id, Sel, Id, NSUInteger, BOOL) callconv(.c) Id;
     return @as(F, @ptrCast(&objc_msgSend))(recv, s, source, time, main);
+}
+
+fn nsStringZ(value: [*:0]const u8) Id {
+    return sendStr(cls("NSString"), sel("stringWithUTF8String:"), value);
+}
+
+fn menuItem(title: [*:0]const u8, action_name: ?[*:0]const u8, key: [*:0]const u8) Id {
+    return sendMenuItemInit(
+        send(cls("NSMenuItem"), sel("alloc")),
+        sel("initWithTitle:action:keyEquivalent:"),
+        nsStringZ(title),
+        if (action_name) |name| sel(name) else null,
+        nsStringZ(key),
+    );
+}
+
+fn addMenuItem(menu: Id, title: [*:0]const u8, action_name: ?[*:0]const u8, key: [*:0]const u8) void {
+    send1v(menu, sel("addItem:"), menuItem(title, action_name, key));
+}
+
+fn addSeparator(menu: Id) void {
+    send1v(menu, sel("addItem:"), send(cls("NSMenuItem"), sel("separatorItem")));
+}
+
+fn installMainMenu(app: Id, app_title: [*:0]const u8) void {
+    const main_menu = send(send(cls("NSMenu"), sel("alloc")), sel("init"));
+
+    const app_menu_item = menuItem("", null, "");
+    send1v(main_menu, sel("addItem:"), app_menu_item);
+    const app_menu = send1(send(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), nsStringZ(app_title));
+    addMenuItem(app_menu, "Quit", "terminate:", "q");
+    send2v(main_menu, sel("setSubmenu:forItem:"), app_menu, app_menu_item);
+
+    const edit_menu_item = menuItem("Edit", null, "");
+    send1v(main_menu, sel("addItem:"), edit_menu_item);
+    const edit_menu = send1(send(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), nsStringZ("Edit"));
+    addMenuItem(edit_menu, "Undo", "undo:", "z");
+    addMenuItem(edit_menu, "Redo", "redo:", "Z");
+    addSeparator(edit_menu);
+    addMenuItem(edit_menu, "Cut", "cut:", "x");
+    addMenuItem(edit_menu, "Copy", "copy:", "c");
+    addMenuItem(edit_menu, "Paste", "paste:", "v");
+    addMenuItem(edit_menu, "Select All", "selectAll:", "a");
+    send2v(main_menu, sel("setSubmenu:forItem:"), edit_menu, edit_menu_item);
+
+    send1v(app, sel("setMainMenu:"), main_menu);
 }
 
 // ── Bridge globals (single-window app) ──────────────────────────────────────
@@ -272,6 +322,9 @@ fn setupBridge(webview: Id, ctx: *bridge.Ctx) void {
 pub fn openWindow(url_z: [*:0]const u8, win: manifest.WindowConfig, ctx: ?*bridge.Ctx) void {
     const app = send(cls("NSApplication"), sel("sharedApplication"));
     sendIntv(app, sel("setActivationPolicy:"), NSApplicationActivationPolicyRegular);
+    var app_title_buf: [256]u8 = undefined;
+    const app_title_z = std.fmt.bufPrintZ(&app_title_buf, "{s}", .{win.title}) catch "merjs";
+    installMainMenu(app, app_title_z.ptr);
     if (createAppDelegateClass()) |delegate_class| {
         g_app_delegate = send(send(delegate_class, sel("alloc")), sel("init"));
         send1v(app, sel("setDelegate:"), g_app_delegate);
@@ -294,7 +347,7 @@ pub fn openWindow(url_z: [*:0]const u8, win: manifest.WindowConfig, ctx: ?*bridg
 
     var title_buf: [256]u8 = undefined;
     const title_z = std.fmt.bufPrintZ(&title_buf, "{s}", .{win.title}) catch "merjs";
-    const title = sendStr(cls("NSString"), sel("stringWithUTF8String:"), title_z.ptr);
+    const title = nsStringZ(title_z.ptr);
     send1v(window, sel("setTitle:"), title);
 
     // WKWebView with a configuration we can reach for the bridge.
