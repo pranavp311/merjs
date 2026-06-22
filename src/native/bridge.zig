@@ -79,6 +79,7 @@ pub const registry = [_]Command{
     .{ .name = "open.external", .permission = "open", .handler = openExternal },
     .{ .name = "open.path", .permission = "open", .handler = openPath },
     .{ .name = "window.setTitle", .permission = "window", .handler = windowSetTitle },
+    .{ .name = "window.close", .permission = "window", .handler = windowClose },
 };
 
 fn ping(_: *Ctx, _: std.json.Value) HandlerResult {
@@ -160,6 +161,12 @@ fn windowSetTitle(_: *Ctx, args: std.json.Value) HandlerResult {
     if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
     const title = argString(args, "title") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
     macos_commands.setWindowTitle(title) catch return .{ .err = error.HandlerError };
+    return .{ .ok = "null" };
+}
+
+fn windowClose(_: *Ctx, _: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    macos_commands.closeWindow() catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 

@@ -146,6 +146,12 @@ fn installMainMenu(app: Id, app_title: [*:0]const u8) void {
     addMenuItem(app_menu, "Quit", "terminate:", "q");
     send2v(main_menu, sel("setSubmenu:forItem:"), app_menu, app_menu_item);
 
+    const file_menu_item = menuItem("File", null, "");
+    send1v(main_menu, sel("addItem:"), file_menu_item);
+    const file_menu = send1(send(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), nsStringZ("File"));
+    addMenuItem(file_menu, "Close Window", "performClose:", "w");
+    send2v(main_menu, sel("setSubmenu:forItem:"), file_menu, file_menu_item);
+
     const edit_menu_item = menuItem("Edit", null, "");
     send1v(main_menu, sel("addItem:"), edit_menu_item);
     const edit_menu = send1(send(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), nsStringZ("Edit"));

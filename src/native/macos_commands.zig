@@ -136,3 +136,9 @@ pub fn setWindowTitle(title: []const u8) !void {
     const window = send(app, sel("keyWindow")) orelse return error.HandlerError;
     send1v(window, sel("setTitle:"), try nsString(title));
 }
+
+pub fn closeWindow() !void {
+    const app = send(cls("NSApplication"), sel("sharedApplication")) orelse return error.HandlerError;
+    const window = send(app, sel("keyWindow")) orelse return error.HandlerError;
+    _ = send1(window, sel("performClose:"), null);
+}
