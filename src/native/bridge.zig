@@ -114,6 +114,7 @@ fn dialogPickDirectory(ctx: *Ctx, args: std.json.Value) HandlerResult {
         .title = title,
         .can_choose_files = false,
         .can_choose_directories = true,
+        .can_create_directories = argBool(args, "canCreateDirectories") orelse false,
     }) catch return .{ .err = error.HandlerError };
     const json = if (result) |path| blk: {
         defer ctx.allocator.free(path);
@@ -174,6 +175,12 @@ fn argString(args: std.json.Value, key: []const u8) ?[]const u8 {
     if (args != .object) return null;
     const value = args.object.get(key) orelse return null;
     return if (value == .string) value.string else null;
+}
+
+fn argBool(args: std.json.Value, key: []const u8) ?bool {
+    if (args != .object) return null;
+    const value = args.object.get(key) orelse return null;
+    return if (value == .bool) value.bool else null;
 }
 
 fn jsonString(alloc: std.mem.Allocator, value: []const u8) ![]u8 {

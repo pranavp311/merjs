@@ -103,12 +103,14 @@ pub const OpenPanelOptions = struct {
     title: []const u8,
     can_choose_files: bool,
     can_choose_directories: bool,
+    can_create_directories: bool = false,
 };
 
 pub fn openPanel(alloc: std.mem.Allocator, options: OpenPanelOptions) !?[]const u8 {
     const panel = send(cls("NSOpenPanel"), sel("openPanel")) orelse return error.HandlerError;
     sendBoolv(panel, sel("setCanChooseFiles:"), if (options.can_choose_files) YES else NO);
     sendBoolv(panel, sel("setCanChooseDirectories:"), if (options.can_choose_directories) YES else NO);
+    sendBoolv(panel, sel("setCanCreateDirectories:"), if (options.can_create_directories) YES else NO);
     sendBoolv(panel, sel("setAllowsMultipleSelection:"), NO);
     send1v(panel, sel("setTitle:"), try nsString(options.title));
 
