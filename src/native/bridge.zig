@@ -48,7 +48,11 @@ pub const BridgeError = error{
 
 /// Result of a handler invocation.
 pub const HandlerResult = union(enum) {
+    /// Borrowed/static JSON payload; dispatch does not free it.
     ok: Json,
+    /// Owned JSON payload allocated with ctx.allocator; dispatch frees it after
+    /// copying it into the JS resolve string.
+    ok_owned: []u8,
     err: BridgeError,
 };
 
@@ -95,8 +99,11 @@ fn dialogOpenFile(ctx: *Ctx, args: std.json.Value) HandlerResult {
         .can_choose_files = true,
         .can_choose_directories = false,
     }) catch return .{ .err = error.HandlerError };
-    const json = if (result) |path| jsonString(ctx.allocator, path) catch return .{ .err = error.OutOfMemory } else "null";
-    return .{ .ok = json };
+    const json = if (result) |path| blk: {
+        defer ctx.allocator.free(path);
+        break :blk jsonString(ctx.allocator, path) catch return .{ .err = error.OutOfMemory };
+    } else return .{ .ok = "null" };
+    return .{ .ok_owned = json };
 }
 
 fn dialogPickDirectory(ctx: *Ctx, args: std.json.Value) HandlerResult {
@@ -107,15 +114,18 @@ fn dialogPickDirectory(ctx: *Ctx, args: std.json.Value) HandlerResult {
         .can_choose_files = false,
         .can_choose_directories = true,
     }) catch return .{ .err = error.HandlerError };
-    const json = if (result) |path| jsonString(ctx.allocator, path) catch return .{ .err = error.OutOfMemory } else "null";
-    return .{ .ok = json };
+    const json = if (result) |path| blk: {
+        defer ctx.allocator.free(path);
+        break :blk jsonString(ctx.allocator, path) catch return .{ .err = error.OutOfMemory };
+    } else return .{ .ok = "null" };
+    return .{ .ok_owned = json };
 }
 
 fn clipboardRead(ctx: *Ctx, _: std.json.Value) HandlerResult {
     if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
     const text = macos_commands.clipboardRead() catch return .{ .err = error.HandlerError };
     const json = jsonString(ctx.allocator, text) catch return .{ .err = error.OutOfMemory };
-    return .{ .ok = json };
+    return .{ .ok_owned = json };
 }
 
 fn clipboardWrite(_: *Ctx, args: std.json.Value) HandlerResult {
@@ -176,9 +186,59 @@ pub fn hasPermission(ctx: *Ctx, perm: []const u8) bool {
     return false;
 }
 
+const ParsedOrigin = struct {
+    scheme: []const u8,
+    host: []const u8,
+    port: ?[]const u8,
+};
+
+fn parseOrigin(value: []const u8) ?ParsedOrigin {
+    const scheme_end = std.mem.indexOf(u8, value, "://") orelse return null;
+    const scheme = value[0..scheme_end];
+    if (scheme.len == 0) return null;
+
+    const authority_start = scheme_end + 3;
+    const authority_end = blk: {
+        var i: usize = authority_start;
+        while (i < value.len) : (i += 1) {
+            switch (value[i]) {
+                '/', '?', '#' => break :blk i,
+                else => {},
+            }
+        }
+        break :blk value.len;
+    };
+    var authority = value[authority_start..authority_end];
+    if (authority.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+
+    if (authority.len > 0 and authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+        const host = authority[0 .. close + 1];
+        const rest = authority[close + 1 ..];
+        const port = if (rest.len == 0) null else if (rest[0] == ':' and rest.len > 1) rest[1..] else return null;
+        return .{ .scheme = scheme, .host = host, .port = port };
+    }
+
+    const colon = std.mem.indexOfScalar(u8, authority, ':');
+    const host = if (colon) |c| authority[0..c] else authority;
+    if (host.len == 0) return null;
+    const port = if (colon) |c| if (c + 1 < authority.len) authority[c + 1 ..] else return null else null;
+    return .{ .scheme = scheme, .host = host, .port = port };
+}
+
 pub fn isOriginAllowed(ctx: *Ctx, url: []const u8) bool {
+    const actual = parseOrigin(url) orelse return false;
     for (ctx.allowed_origins) |origin| {
-        if (std.mem.startsWith(u8, url, origin)) return true;
+        const allowed = parseOrigin(origin) orelse continue;
+        if (!std.ascii.eqlIgnoreCase(actual.scheme, allowed.scheme)) continue;
+        if (!std.ascii.eqlIgnoreCase(actual.host, allowed.host)) continue;
+        if (allowed.port) |allowed_port| {
+            if (actual.port == null or !std.mem.eql(u8, actual.port.?, allowed_port)) continue;
+        } else if (actual.port != null) {
+            continue;
+        }
+        return true;
     }
     return false;
 }
@@ -212,6 +272,10 @@ pub fn dispatch(ctx: *Ctx, payload: []const u8) BridgeError![]u8 {
             const res = cmd.handler(ctx, env.args);
             switch (res) {
                 .ok => |json| return resolveStr(alloc, env.id, true, json),
+                .ok_owned => |json| {
+                    defer alloc.free(json);
+                    return resolveStr(alloc, env.id, true, json);
+                },
                 .err => |e| return resolveError(alloc, env.id, @errorName(e)),
             }
         }
@@ -315,14 +379,19 @@ test "hasPermission: empty perm always allowed" {
     try testing.expect(hasPermission(&ctx, ""));
 }
 
-test "isOriginAllowed: allows configured URL prefixes only" {
+test "isOriginAllowed: matches scheme and host, not string prefixes" {
     var ctx = Ctx{
         .allocator = testing.allocator,
         .permissions = &.{},
-        .allowed_origins = &.{ "http://127.0.0.1", "mer://app" },
+        .allowed_origins = &.{ "http://127.0.0.1", "mer://app", "http://localhost:3000" },
     };
-    try testing.expect(isOriginAllowed(&ctx, "http://127.0.0.1:3000/"));
+    try testing.expect(!isOriginAllowed(&ctx, "http://127.0.0.1:49152/"));
+    try testing.expect(isOriginAllowed(&ctx, "http://127.0.0.1/"));
     try testing.expect(isOriginAllowed(&ctx, "mer://app/index.html"));
+    try testing.expect(isOriginAllowed(&ctx, "http://localhost:3000/"));
+    try testing.expect(!isOriginAllowed(&ctx, "http://127.0.0.1.evil.example/"));
+    try testing.expect(!isOriginAllowed(&ctx, "mer://app.evil/index.html"));
+    try testing.expect(!isOriginAllowed(&ctx, "http://localhost:3001/"));
     try testing.expect(!isOriginAllowed(&ctx, "https://example.com/"));
 }
 

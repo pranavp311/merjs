@@ -301,22 +301,26 @@ fn serveRequest(
         }
     }
 
-    // If a route matches this path, dispatch it BEFORE static/SPA fallback —
-    // otherwise an SPA history-fallback (static_dir set) would serve index.html
-    // for /api/* paths and shadow the backend routes.
+    // Static files are checked before routes so real assets (e.g. /favicon.ico)
+    // are not swallowed by broad dynamic routes. SPA history fallback is handled
+    // later, after route lookup, so it cannot shadow API/page routes.
+    if (static_dir) |d| {
+        if (std.mem.eql(u8, path, "/")) {
+            if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
+        } else if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = false })) |_| return;
+    } else if (static.tryServe(alloc, std_req, path, io, .{})) |_| return;
+
+    // Pre-rendered pages from dist/ (SSG) should win in production even when a
+    // registered route exists for the path.
+    if (!dev) {
+        if (tryServePrerendered(alloc, std_req, path, io)) |_| return;
+    }
+
     const has_route = router.findRoute(path) != null;
     if (!has_route) {
-        // Static files: from public/ by default, or a configured dir (e.g. dist/)
-        // with SPA history fallback when static_dir is set.
-        if (static.tryServe(alloc, std_req, path, io, if (static_dir) |d|
-            .{ .dir = d, .spa = true }
-        else
-            .{}
-        )) |_| return;
-
-        // Pre-rendered pages from dist/ (SSG).
-        if (!dev) {
-            if (tryServePrerendered(alloc, std_req, path, io)) |_| return;
+        // SPA history fallback only after proving no backend route matches.
+        if (static_dir) |d| {
+            if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
         }
     }
 
@@ -514,6 +518,8 @@ fn tryServePrerendered(
     url_path: []const u8,
     io: std.Io,
 ) ?void {
+    if (std.mem.indexOf(u8, url_path, "..") != null) return null;
+
     const fs_path = if (std.mem.eql(u8, url_path, "/"))
         std.fmt.allocPrint(alloc, "dist/index.html", .{}) catch return null
     else blk: {
@@ -525,14 +531,16 @@ fn tryServePrerendered(
     const file_content = std.Io.Dir.cwd().readFileAlloc(io, fs_path, alloc, .limited(10 * 1024 * 1024)) catch return null;
     const body = file_content;
 
+    const fixed = [1]std.http.Header{
+        .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    } ++ security_headers;
+
     var header_buf: [512]u8 = undefined;
     var bw = std_req.respondStreaming(&header_buf, .{
         .content_length = body.len,
         .respond_options = .{
             .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-            },
+            .extra_headers = &fixed,
         },
     }) catch return null;
     bw.writer.writeAll(body) catch return null;

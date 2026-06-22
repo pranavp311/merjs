@@ -82,6 +82,10 @@ fn sendPtr(recv: Id, s: Sel) [*:0]const u8 {
     const F = *const fn (Id, Sel) callconv(.c) [*:0]const u8;
     return @as(F, @ptrCast(&objc_msgSend))(recv, s);
 }
+fn sendInt(recv: Id, s: Sel) NSInteger {
+    const F = *const fn (Id, Sel) callconv(.c) NSInteger;
+    return @as(F, @ptrCast(&objc_msgSend))(recv, s);
+}
 fn sendIntv(recv: Id, s: Sel, a: NSInteger) void {
     const F = *const fn (Id, Sel, NSInteger) callconv(.c) void;
     @as(F, @ptrCast(&objc_msgSend))(recv, s, a);
@@ -149,13 +153,18 @@ fn merInvokeIMP(self: Id, _cmd: Sel, ucc: Id, message: Id) callconv(.c) void {
     const cstr = sendPtr(body, sel("UTF8String"));
     const payload = std.mem.span(cstr);
 
-    if (currentWebViewUrl(wv)) |url| {
-        if (!bridge.isOriginAllowed(ctx, url)) {
-            const js = bridge.rejectFromPayload(ctx, payload, "OriginNotAllowed") catch return;
-            defer ctx.allocator.free(js);
-            evalJs(ctx, wv, js);
-            return;
-        }
+    var origin_buf: [512]u8 = undefined;
+    const origin = messageFrameOrigin(message, &origin_buf) orelse {
+        const js = bridge.rejectFromPayload(ctx, payload, "OriginNotAllowed") catch return;
+        defer ctx.allocator.free(js);
+        evalJs(ctx, wv, js);
+        return;
+    };
+    if (!bridge.isOriginAllowed(ctx, origin)) {
+        const js = bridge.rejectFromPayload(ctx, payload, "OriginNotAllowed") catch return;
+        defer ctx.allocator.free(js);
+        evalJs(ctx, wv, js);
+        return;
     }
 
     const js = bridge.dispatch(ctx, payload) catch return;
@@ -170,11 +179,19 @@ fn evalJs(ctx: *bridge.Ctx, webview: Id, js: []const u8) void {
     send2v(webview, sel("evaluateJavaScript:completionHandler:"), ns_js, null);
 }
 
-fn currentWebViewUrl(webview: Id) ?[]const u8 {
-    const url = send(webview, sel("URL")) orelse return null;
-    const abs = send(url, sel("absoluteString")) orelse return null;
-    const cstr = sendPtr(abs, sel("UTF8String"));
-    return std.mem.span(cstr);
+fn messageFrameOrigin(message: Id, buf: *[512]u8) ?[]const u8 {
+    const frame_info = send(message, sel("frameInfo")) orelse return null;
+    const security_origin = send(frame_info, sel("securityOrigin")) orelse return null;
+    const proto_obj = send(security_origin, sel("protocol")) orelse return null;
+    const host_obj = send(security_origin, sel("host")) orelse return null;
+    const proto = std.mem.span(sendPtr(proto_obj, sel("UTF8String")));
+    const host = std.mem.span(sendPtr(host_obj, sel("UTF8String")));
+    if (proto.len == 0 or host.len == 0) return null;
+    const port = sendInt(security_origin, sel("port"));
+    if (port > 0) {
+        return std.fmt.bufPrint(buf, "{s}://{s}:{d}", .{ proto, host, port }) catch null;
+    }
+    return std.fmt.bufPrint(buf, "{s}://{s}", .{ proto, host }) catch null;
 }
 
 /// Allocate the MerInvokeHandler delegate class (NSObject + one instance method).

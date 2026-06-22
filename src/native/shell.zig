@@ -62,6 +62,11 @@ pub fn run(
     router: *const mer.Router,
     opts: RunOpts,
 ) !void {
+    if (builtin.os.tag != .macos) {
+        log.err("native shell not yet implemented for {s}", .{@tagName(builtin.os.tag)});
+        return error.UnsupportedPlatform;
+    }
+
     // std.Io runtime must be initialized before Server.listen touches runtime.io.
     try runtime.init(allocator);
     defer runtime.deinit();
@@ -109,21 +114,23 @@ pub fn run(
     var url_buf: [128]u8 = undefined;
     const url_z = try std.fmt.bufPrintZ(&url_buf, "http://{s}:{d}/", .{ app_manifest.host, port });
 
+    const runtime_origin = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ app_manifest.host, port });
+    const allowed_origins = try allocator.alloc([]const u8, app_manifest.security.allowed_origins.len + 1);
+    allowed_origins[0] = runtime_origin;
+    @memcpy(allowed_origins[1..], app_manifest.security.allowed_origins);
+
     // Bridge context (heap-allocated; outlives the blocking event loop). The
     // ObjC IMP reaches it via the macos backend's g_bridge_ctx global.
     const bctx = try allocator.create(bridge.Ctx);
     bctx.* = .{
         .allocator = allocator,
         .permissions = app_manifest.permissions,
-        .allowed_origins = app_manifest.security.allowed_origins,
+        .allowed_origins = allowed_origins,
     };
 
     // Hand off to the platform backend (blocks on the event loop).
     switch (builtin.os.tag) {
-        .macos => @import("macos.zig").openWindow(url_z.ptr, app_manifest.window, bctx),
-        else => {
-            log.err("native shell not yet implemented for {s}", .{@tagName(builtin.os.tag)});
-            return error.UnsupportedPlatform;
-        },
+        .macos => return @import("macos.zig").openWindow(url_z.ptr, app_manifest.window, bctx),
+        else => unreachable, // guarded before any side effects above
     }
 }

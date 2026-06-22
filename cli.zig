@@ -169,13 +169,15 @@ const build_zig_template =
     \\    b.installArtifact(exe);
     \\
     \\    // zig build codegen
+    \\    const codegen_mod = b.createModule(.{
+    \\        .root_source_file = b.path("tools/codegen.zig"),
+    \\        .target = b.graph.host,
+    \\        .optimize = .Debug,
+    \\    });
+    \\    codegen_mod.addImport("runtime", merjs_dep.module("runtime"));
     \\    const codegen_exe = b.addExecutable(.{
     \\        .name = "codegen",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("tools/codegen.zig"),
-    \\            .target = b.graph.host,
-    \\            .optimize = .Debug,
-    \\        }),
+    \\        .root_module = codegen_mod,
     \\    });
     \\    const run_codegen = b.addRunArtifact(codegen_exe);
     \\    run_codegen.setCwd(b.path("."));
@@ -408,6 +410,7 @@ fn writeBuildZigZon(dir: std.Io.Dir, alloc: std.mem.Allocator, name: []const u8)
     try file.writeStreamingAll(runtime.io, "        \"app\",\n");
     try file.writeStreamingAll(runtime.io, "        \"api\",\n");
     try file.writeStreamingAll(runtime.io, "        \"public\",\n");
+    try file.writeStreamingAll(runtime.io, "        \"tools\",\n");
     try file.writeStreamingAll(runtime.io, "    },\n");
     try file.writeStreamingAll(runtime.io, "}\n");
 }
@@ -572,7 +575,8 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
             \\.zig-cache/
             \\src/generated/*
             \\!src/generated/.gitkeep
-            \\tools/
+            \\tools/*
+            \\!tools/codegen.zig
             \\dist/
             \\.env
             \\
@@ -642,6 +646,7 @@ test "build_zig_template exposes a starter test step" {
 
 test "build_zig_template uses local codegen entrypoint" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "b.path(\"tools/codegen.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "codegen_mod.addImport(\"runtime\", merjs_dep.module(\"runtime\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "merjs_dep.path(\"tools/codegen.zig\")") == null);
 }
 

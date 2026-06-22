@@ -55,18 +55,18 @@ pub fn initCache(alloc: std.mem.Allocator) void {
     cache_init_done = true;
 }
 
-fn getCached(rel: []const u8) ?CacheEntry {
+fn getCached(key: []const u8) ?CacheEntry {
     if (!cache_init_done) return null;
     cache_mu.lock();
     defer cache_mu.unlock();
-    return cache.get(rel);
+    return cache.get(key);
 }
 
-fn putCache(rel: []const u8, body: []const u8, ct: mer.ContentType) void {
+fn putCache(key_src: []const u8, body: []const u8, ct: mer.ContentType) void {
     if (!cache_init_done) return;
     cache_mu.lock();
     defer cache_mu.unlock();
-    const key = cache_alloc.dupe(u8, rel) catch return;
+    const key = cache_alloc.dupe(u8, key_src) catch return;
     const owned_body = cache_alloc.dupe(u8, body) catch {
         cache_alloc.free(key);
         return;
@@ -105,14 +105,16 @@ pub fn tryServe(
         return null;
     }
 
+    const cache_key = std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.dir, rel }) catch return null;
+    defer alloc.free(cache_key);
+
     // Try cache first.
-    if (getCached(rel)) |entry| {
+    if (getCached(cache_key)) |entry| {
         return sendStatic(std_req, entry.body, entry.ct);
     }
 
     // Cache miss — read from disk.
-    const fs_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.dir, rel }) catch return null;
-    defer alloc.free(fs_path);
+    const fs_path = cache_key;
     const body = std.Io.Dir.cwd().readFileAlloc(io, fs_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
         if (err != error.FileNotFound) log.err("read {s}: {}", .{ fs_path, err });
         // SPA fallback: unknown path → index.html (client-side route).
@@ -124,7 +126,7 @@ pub fn tryServe(
     const ct = mimeForPath(rel);
 
     // Cache for future requests.
-    putCache(rel, body, ct);
+    putCache(cache_key, body, ct);
 
     return sendStatic(std_req, body, ct);
 }
@@ -136,12 +138,12 @@ fn serveIndex(
     dir: []const u8,
     io: std.Io,
 ) ?void {
-    const cache_key = if (std.mem.eql(u8, dir, "public")) "index.html" else dir;
+    const cache_key = std.fmt.allocPrint(alloc, "{s}/index.html", .{dir}) catch return null;
+    defer alloc.free(cache_key);
     if (getCached(cache_key)) |entry| {
         return sendStatic(std_req, entry.body, entry.ct);
     }
-    const fs_path = std.fmt.allocPrint(alloc, "{s}/index.html", .{dir}) catch return null;
-    defer alloc.free(fs_path);
+    const fs_path = cache_key;
     const body = std.Io.Dir.cwd().readFileAlloc(io, fs_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
         if (err != error.FileNotFound) log.err("read {s}: {}", .{ fs_path, err });
         return null;
