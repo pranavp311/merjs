@@ -15,7 +15,7 @@
         .watch_dir = "examples/site/app",
     },
     .capabilities = .{ "webview", "js_bridge" },
-    .permissions = .{ "window", "clipboard", "dialog" },
+    .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
         .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
     },

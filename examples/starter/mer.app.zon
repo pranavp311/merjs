@@ -14,7 +14,7 @@
         .port = 0, // 0 = ephemeral; shell reads back via ServerReady
     },
     .capabilities = .{ "webview", "js_bridge" },
-    .permissions = .{ "window", "clipboard", "dialog" },
+    .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
         .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
     },

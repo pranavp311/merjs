@@ -19,6 +19,8 @@
 // the WKScriptMessage frame is checked by the macOS backend before dispatch.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const macos_commands = if (builtin.os.tag == .macos) @import("macos_commands.zig") else struct {};
 
 /// Maximum inbound bridge payload size (keeps the ObjC string bridge bounded).
 pub const max_payload_bytes: usize = 64 * 1024;
@@ -66,7 +68,13 @@ pub const registry = [_]Command{
     .{ .name = "mer.ping", .permission = "", .handler = ping },
     .{ .name = "mer.echo", .permission = "", .handler = echo },
     .{ .name = "dialog.openFile", .permission = "dialog", .handler = dialogOpenFile },
+    .{ .name = "dialog.pickDirectory", .permission = "dialog", .handler = dialogPickDirectory },
+    .{ .name = "dialog.openDirectory", .permission = "dialog", .handler = dialogPickDirectory },
+    .{ .name = "clipboard.read", .permission = "clipboard", .handler = clipboardRead },
     .{ .name = "clipboard.write", .permission = "clipboard", .handler = clipboardWrite },
+    .{ .name = "open.external", .permission = "open", .handler = openExternal },
+    .{ .name = "open.path", .permission = "open", .handler = openPath },
+    .{ .name = "window.setTitle", .permission = "window", .handler = windowSetTitle },
 };
 
 fn ping(_: *Ctx, _: std.json.Value) HandlerResult {
@@ -79,13 +87,83 @@ fn echo(_: *Ctx, _: std.json.Value) HandlerResult {
     return .{ .ok = "{\"echo\":true}" };
 }
 
-fn dialogOpenFile(_: *Ctx, _: std.json.Value) HandlerResult {
-    // NSOpenPanel wiring lands after this release; surface a clear error.
-    return .{ .err = error.HandlerError };
+fn dialogOpenFile(ctx: *Ctx, args: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const title = argString(args, "title") orelse "Choose a file";
+    const result = macos_commands.openPanel(ctx.allocator, .{
+        .title = title,
+        .can_choose_files = true,
+        .can_choose_directories = false,
+    }) catch return .{ .err = error.HandlerError };
+    const json = if (result) |path| jsonString(ctx.allocator, path) catch return .{ .err = error.OutOfMemory } else "null";
+    return .{ .ok = json };
 }
 
-fn clipboardWrite(_: *Ctx, _: std.json.Value) HandlerResult {
-    return .{ .err = error.HandlerError };
+fn dialogPickDirectory(ctx: *Ctx, args: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const title = argString(args, "title") orelse "Choose a folder";
+    const result = macos_commands.openPanel(ctx.allocator, .{
+        .title = title,
+        .can_choose_files = false,
+        .can_choose_directories = true,
+    }) catch return .{ .err = error.HandlerError };
+    const json = if (result) |path| jsonString(ctx.allocator, path) catch return .{ .err = error.OutOfMemory } else "null";
+    return .{ .ok = json };
+}
+
+fn clipboardRead(ctx: *Ctx, _: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const text = macos_commands.clipboardRead() catch return .{ .err = error.HandlerError };
+    const json = jsonString(ctx.allocator, text) catch return .{ .err = error.OutOfMemory };
+    return .{ .ok = json };
+}
+
+fn clipboardWrite(_: *Ctx, args: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const text = switch (args) {
+        .string => |value| value,
+        .object => |object| blk: {
+            const value = object.get("text") orelse return .{ .err = error.HandlerError };
+            break :blk if (value == .string) value.string else return .{ .err = error.HandlerError };
+        },
+        else => return .{ .err = error.HandlerError },
+    };
+    macos_commands.clipboardWrite(text) catch return .{ .err = error.HandlerError };
+    return .{ .ok = "null" };
+}
+
+fn openExternal(_: *Ctx, args: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const url = argString(args, "url") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
+    macos_commands.openUrl(url) catch return .{ .err = error.HandlerError };
+    return .{ .ok = "null" };
+}
+
+fn openPath(_: *Ctx, args: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const path = argString(args, "path") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
+    macos_commands.openPath(path) catch return .{ .err = error.HandlerError };
+    return .{ .ok = "null" };
+}
+
+fn windowSetTitle(_: *Ctx, args: std.json.Value) HandlerResult {
+    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
+    const title = argString(args, "title") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
+    macos_commands.setWindowTitle(title) catch return .{ .err = error.HandlerError };
+    return .{ .ok = "null" };
+}
+
+fn argString(args: std.json.Value, key: []const u8) ?[]const u8 {
+    if (args != .object) return null;
+    const value = args.object.get(key) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn jsonString(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try jw.write(value);
+    return out.written();
 }
 
 /// True if `perm` is granted by the manifest's permissions list. Empty perm
@@ -193,14 +271,23 @@ test "dispatch: permission gate blocks unpermitted command" {
     try testing.expectEqualStrings("window.mer._resolve(3,false,\"PermissionDenied\");", js);
 }
 
-test "dispatch: permission gate allows permitted command" {
+test "dispatch: permission gate blocks clipboard/open/window commands" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var ctx = newCtx(alloc, &.{ "window", "dialog" });
-    const js = try dispatch(&ctx, "{\"cmd\":\"dialog.openFile\",\"args\":{},\"id\":3}");
-    // dialog.openFile handler returns HandlerError
-    try testing.expectEqualStrings("window.mer._resolve(3,false,\"HandlerError\");", js);
+    var ctx = newCtx(alloc, &.{"dialog"});
+    try testing.expectEqualStrings(
+        "window.mer._resolve(4,false,\"PermissionDenied\");",
+        try dispatch(&ctx, "{\"cmd\":\"clipboard.read\",\"args\":null,\"id\":4}"),
+    );
+    try testing.expectEqualStrings(
+        "window.mer._resolve(5,false,\"PermissionDenied\");",
+        try dispatch(&ctx, "{\"cmd\":\"open.path\",\"args\":{\"path\":\"/tmp\"},\"id\":5}"),
+    );
+    try testing.expectEqualStrings(
+        "window.mer._resolve(6,false,\"PermissionDenied\");",
+        try dispatch(&ctx, "{\"cmd\":\"window.setTitle\",\"args\":{\"title\":\"X\"},\"id\":6}"),
+    );
 }
 
 test "dispatch: oversized payload rejected" {

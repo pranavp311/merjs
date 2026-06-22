@@ -37,6 +37,7 @@ pub const Manifest = struct {
     dev: bool,
     window: WindowConfig,
     permissions: []const []const u8,
+    capabilities: []const []const u8,
     security: SecurityConfig = .{},
 };
 
@@ -64,8 +65,9 @@ pub fn fromZon(comptime zon: anytype) Manifest {
         .height = if (@hasField(WinT, "height")) win.height else default_window.height,
     };
 
-    // permissions[] is optional.
+    // permissions[] and capabilities[] are optional.
     const perms: []const []const u8 = if (@hasField(T, "permissions")) &zon.permissions else &.{};
+    const caps: []const []const u8 = if (@hasField(T, "capabilities")) &zon.capabilities else &.{};
 
     const security: SecurityConfig = if (@hasField(T, "security")) blk: {
         const SecurityT = @TypeOf(zon.security);
@@ -92,15 +94,17 @@ pub fn fromZon(comptime zon: anytype) Manifest {
         .dev = std.mem.eql(u8, server_mode, "dev"),
         .window = window,
         .permissions = perms,
+        .capabilities = caps,
         .security = security,
     };
 }
 
 /// True if the manifest declares a capability (e.g. "webview", "js_bridge").
 pub fn hasCapability(manifest: Manifest, cap: []const u8) bool {
-    _ = manifest;
-    _ = cap;
-    return false; // capabilities[] parsing lands with the bridge (P2).
+    for (manifest.capabilities) |declared| {
+        if (std.mem.eql(u8, declared, cap)) return true;
+    }
+    return false;
 }
 
 test "fromZon parses allowed origins" {
@@ -120,6 +124,39 @@ test "fromZon parses allowed origins" {
     const parsed = fromZon(zon);
     try std.testing.expectEqual(@as(usize, 2), parsed.security.allowed_origins.len);
     try std.testing.expectEqualStrings("mer://app", parsed.security.allowed_origins[1]);
+}
+
+test "fromZon parses capabilities" {
+    const zon = .{
+        .id = "com.example.test",
+        .name = "test",
+        .display_name = "Test",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .capabilities = .{ "webview", "js_bridge" },
+        .windows = .{
+            .{ .title = "Test" },
+        },
+    };
+    const parsed = fromZon(zon);
+    try std.testing.expect(hasCapability(parsed, "webview"));
+    try std.testing.expect(hasCapability(parsed, "js_bridge"));
+    try std.testing.expect(!hasCapability(parsed, "clipboard"));
+}
+
+test "fromZon defaults omitted capabilities" {
+    const zon = .{
+        .id = "com.example.test",
+        .name = "test",
+        .display_name = "Test",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .windows = .{
+            .{ .title = "Test" },
+        },
+    };
+    const parsed = fromZon(zon);
+    try std.testing.expect(!hasCapability(parsed, "webview"));
 }
 
 test "fromZon applies optional server watch_dir" {

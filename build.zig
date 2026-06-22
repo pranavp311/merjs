@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const helpers = @import("build/helpers.zig");
 const examples = @import("build/examples.zig");
 const tools = @import("build/tools.zig");
@@ -222,6 +223,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        if (std.mem.eql(u8, src_path, "src/native/bridge.zig") and builtin.os.tag == .macos) {
+            file_test_mod.linkFramework("AppKit", .{});
+            file_test_mod.linkFramework("Foundation", .{});
+        }
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = file_test_mod })).step);
     }
     {

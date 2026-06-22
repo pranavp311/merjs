@@ -82,7 +82,7 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
         .port = 0,                    // 0 = ephemeral; shell reads back via ServerReady
     },
     .capabilities = .{ "webview", "js_bridge" },
-    .permissions = .{ "window", "clipboard", "dialog" },
+    .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
         .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
     },
@@ -120,31 +120,30 @@ Each call is:
 | Command | Permission | Behavior |
 |---|---|---|
 | `mer.ping` | _(none)_ | Returns `{ "pong": true }`. Round-trip smoke test. |
-| `mer.echo` | _(none)_ | Returns `{ "echo": true }`. |
-| `dialog.openFile` | `dialog` | Stub (returns `HandlerError`); NSOpenPanel wiring lands after v0.2.53. |
-| `clipboard.write` | `clipboard` | Stub; NSPasteboard wiring lands after v0.2.53. |
+| `mer.echo` | _(none)_ | Returns `{ "echo": true }` as a smoke ack (not an args echo). |
+| `clipboard.read` | `clipboard` | Reads plain UTF-8 text from `NSPasteboard`; returns a string, or `""` when no text exists. |
+| `clipboard.write` | `clipboard` | Writes plain UTF-8 text to `NSPasteboard`; accepts `{ text }` or a raw string; returns `null`. |
+| `dialog.openFile` | `dialog` | Opens `NSOpenPanel` for one file; accepts optional `{ title }`; returns an absolute path string or `null` on cancel. |
+| `dialog.pickDirectory` | `dialog` | Opens `NSOpenPanel` for one directory; accepts optional `{ title }`; returns an absolute path string or `null` on cancel. |
+| `dialog.openDirectory` | `dialog` | Alias for `dialog.pickDirectory`. |
+| `open.external` | `open` | Opens `{ url }` (or raw string) with `NSWorkspace.openURL`; returns `null`. |
+| `open.path` | `open` | Opens `{ path }` (or raw string) with the default handler/Finder; returns `null`. |
+| `window.setTitle` | `window` | Sets the current key window title from `{ title }` (or raw string); returns `null`. |
 
-### Adding a command
+### Custom commands
 
-Add a handler and register it in the `registry` array in `src/native/bridge.zig`:
-
-```zig
-fn myCommand(ctx: *Ctx, args: std.json.Value) HandlerResult {
-    if (!ctx.hasPermission(...)) return .{ .err = error.PermissionDenied };
-    return .{ .ok = "{\"ok\":true}" };
-}
-
-pub const registry = [_]Command{
-    // ...
-    .{ .name = "app.myCommand", .permission = "window", .handler = myCommand },
-};
-```
+PR #100 ships the built-in registry above. App-level custom native command
+registries are a follow-up API; for now, consumers should rely on the built-ins
+rather than editing merjs internals as an extension mechanism.
 
 ### Security model
 
-The native shell only ever loads `http://127.0.0.1:<port>`, so the origin is
-trusted loopback by construction. The bridge also checks the WebView's current
-URL against `security.navigation.allowed_origins` before dispatching commands.
+The native shell currently loads the app over an embedded loopback URL such as
+`http://127.0.0.1:<port>/`. Before dispatching bridge commands, the macOS
+backend checks the WebView's current top-level URL against
+`security.navigation.allowed_origins`. Full per-frame origin extraction from
+`WKScriptMessage.frameInfo.securityOrigin` and per-command origin policy are
+hardening follow-ups; PR #100 uses top-level permissions plus global origins.
 
 ---
 
@@ -162,7 +161,7 @@ URL against `security.navigation.allowed_origins` before dispatching commands.
 ## Limitations (v0.2.53)
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned.
-- `dialog` / `clipboard` commands are stubs (return `HandlerError`).
+- App-level custom bridge command registries and per-command manifest allowlists are deferred; PR #100 uses built-in commands, top-level `permissions`, and global allowed origins.
 - No code signing / notarization.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.
 - `server.mode = "static"` (fully static export over `mer://app`) is a stretch
