@@ -200,6 +200,7 @@ fn handleConn(ctx: *ConnCtx) void {
             }
             return;
         };
+        const error_target = alloc.dupe(u8, std_req.head.target) catch "<unknown>";
 
         _request_start_ns = nanoTimestamp();
         _ttfb_ns = 0;
@@ -207,10 +208,10 @@ fn handleConn(ctx: *ConnCtx) void {
         serveRequest(alloc, &std_req, ctx.router, ctx.watcher, ctx.kuri, ctx.dev, ctx.verbose, ctx.io, ctx.static_dir, ctx.raw_handler) catch |err| {
             log.err("serveRequest: {}", .{err});
             if (ctx.dev) {
-                dev_mod.sendErrorOverlay(&std_req, std_req.head.target, err, mer.version) catch {};
+                dev_mod.sendErrorOverlay(&std_req, error_target, err, mer.version) catch {};
             }
-            telemetry.sentryCapture(@errorName(err), std_req.head.target, mer.version);
-            telemetry.ddError(std_req.head.target, @tagName(std_req.head.method), @errorName(err));
+            telemetry.sentryCapture(@errorName(err), error_target, mer.version);
+            telemetry.ddError(error_target, @tagName(std_req.head.method), @errorName(err));
             return;
         };
 
@@ -218,14 +219,14 @@ fn handleConn(ctx: *ConnCtx) void {
         const elapsed_us: u64 = @intCast(@divFloor(elapsed_ns, 1000));
         const ttfb_us: u64 = if (_ttfb_ns > 0) @intCast(@divFloor(_ttfb_ns, 1000)) else elapsed_us;
 
-        telemetry.ddTiming(std_req.head.target, @tagName(std_req.head.method), 200, elapsed_us);
+        telemetry.ddTiming(error_target, @tagName(std_req.head.method), 200, elapsed_us);
 
         if (ctx.verbose) {
             const elapsed_f: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1000.0;
             if (elapsed_f < 1000.0) {
-                log.info("{s} {s} {d:.0}us (ttfb: {d}us)", .{ @tagName(std_req.head.method), std_req.head.target, elapsed_f, ttfb_us });
+                log.info("{s} {s} {d:.0}us (ttfb: {d}us)", .{ @tagName(std_req.head.method), error_target, elapsed_f, ttfb_us });
             } else {
-                log.info("{s} {s} {d:.1}ms (ttfb: {d}us)", .{ @tagName(std_req.head.method), std_req.head.target, elapsed_f / 1000.0, ttfb_us });
+                log.info("{s} {s} {d:.1}ms (ttfb: {d}us)", .{ @tagName(std_req.head.method), error_target, elapsed_f / 1000.0, ttfb_us });
             }
         }
 
@@ -254,17 +255,17 @@ fn serveRequest(
     raw_handler: ?*const RawHandler,
 ) !void {
     _ = verbose;
-    const raw_target = std_req.head.target;
-
-    const path: []const u8 = if (std.mem.indexOfScalar(u8, raw_target, '?')) |q|
-        raw_target[0..q]
+    // `std_req.head.target` is borrowed from std.http's head buffer. Zig 0.16
+    // invalidates that string memory when the body reader is initialized, so
+    // copy target-derived slices before any framed body is read.
+    const head_target = std_req.head.target;
+    const query_index = std.mem.indexOfScalar(u8, head_target, '?');
+    const raw_target = try alloc.dupe(u8, head_target);
+    const path = try alloc.dupe(u8, if (query_index) |q| head_target[0..q] else head_target);
+    const query_string = try alloc.dupe(u8, if (query_index) |q|
+        if (q + 1 < head_target.len) head_target[q + 1 ..] else ""
     else
-        raw_target;
-
-    const query_string: []const u8 = if (std.mem.indexOfScalar(u8, raw_target, '?')) |q|
-        if (q + 1 < raw_target.len) raw_target[q + 1 ..] else ""
-    else
-        "";
+        "");
 
     // Raw handler hook (checked first) — lets apps register long-lived
     // endpoints (SSE, websockets) that must own the connection.
@@ -284,6 +285,7 @@ fn serveRequest(
 
     // Debug endpoint — shows registered routes, config, hints.
     if (dev and std.mem.eql(u8, path, "/_mer/debug")) {
+        if (requestHasFramedBody(std_req)) _ = try readRequestBody(alloc, std_req);
         const route_infos = alloc.alloc(dev_mod.RouteDebugInfo, router.routes.len) catch return error.OutOfMemory;
         for (router.routes, 0..) |route, i| route_infos[i] = .{ .path = route.path };
         const response = try dev_mod.serveDebug(alloc, route_infos, router.exact_map.count(), router.dynamic_routes.len, query_string, mer.version);
@@ -304,15 +306,17 @@ fn serveRequest(
     // Static files are checked before routes so real assets (e.g. /favicon.ico)
     // are not swallowed by broad dynamic routes. SPA history fallback is handled
     // later, after route lookup, so it cannot shadow API/page routes.
-    if (static_dir) |d| {
-        if (std.mem.eql(u8, path, "/")) {
-            if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
-        } else if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = false })) |_| return;
-    } else if (static.tryServe(alloc, std_req, path, io, .{})) |_| return;
+    if (!requestHasFramedBody(std_req)) {
+        if (static_dir) |d| {
+            if (std.mem.eql(u8, path, "/")) {
+                if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
+            } else if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = false })) |_| return;
+        } else if (static.tryServe(alloc, std_req, path, io, .{})) |_| return;
+    }
 
     // Pre-rendered pages from dist/ (SSG) should win in production even when a
     // registered route exists for the path.
-    if (!dev) {
+    if (!dev and !requestHasFramedBody(std_req)) {
         if (tryServePrerendered(alloc, std_req, path, io)) |_| return;
     }
 
@@ -320,7 +324,9 @@ fn serveRequest(
     if (!has_route) {
         // SPA history fallback only after proving no backend route matches.
         if (static_dir) |d| {
-            if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
+            if (!requestHasFramedBody(std_req)) {
+                if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
+            }
         }
     }
 
@@ -329,22 +335,12 @@ fn serveRequest(
     const cookies_raw: []const u8 = blk: {
         var it = std_req.iterateHeaders();
         while (it.next()) |hdr| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, "cookie")) break :blk hdr.value;
+            if (std.ascii.eqlIgnoreCase(hdr.name, "cookie")) break :blk try alloc.dupe(u8, hdr.value);
         }
         break :blk "";
     };
 
-    const body_bytes: []const u8 = blk: {
-        const cl = std_req.head.content_length orelse break :blk "";
-        if (cl == 0) break :blk "";
-        var transfer_buf: [4096]u8 = undefined;
-        var br = std_req.server.reader.bodyReader(
-            &transfer_buf,
-            std_req.head.transfer_encoding,
-            std_req.head.content_length,
-        );
-        break :blk br.allocRemaining(alloc, .limited(4 * 1024 * 1024)) catch "";
-    };
+    const body_bytes: []const u8 = try readRequestBody(alloc, std_req);
 
     var req = mer.Request.init(alloc, mer.Method.fromStd(std_req.head.method), path);
     req.query_string = query_string;
@@ -444,6 +440,39 @@ fn serveRequest(
     defer if (owned_body) |b| alloc.free(b);
 
     try sendResponse(std_req, response);
+}
+
+
+fn requestHasFramedBody(std_req: *const std.http.Server.Request) bool {
+    return switch (std_req.head.transfer_encoding) {
+        .chunked => true,
+        .none => if (std_req.head.content_length) |len| len > 0 else false,
+    };
+}
+
+fn readRequestBody(alloc: std.mem.Allocator, std_req: *std.http.Server.Request) ![]const u8 {
+    // In Zig 0.16, receiveHead() only consumes headers. If the request is
+    // framed with Content-Length or Transfer-Encoding: chunked, enter the
+    // std.http body reader exactly once so payload bytes are consumed before
+    // routing returns to the keep-alive receive loop. Reading the body consumes
+    // the head buffer storage, so callers must copy any needed header/target
+    // slices first.
+    if (std_req.head.transfer_encoding == .none) {
+        const len = std_req.head.content_length orelse return "";
+        if (len == 0) return "";
+    }
+
+    const should_flush_continue = std_req.head.expect != null;
+    try std_req.writeExpectContinue();
+    if (should_flush_continue) try std_req.server.out.flush();
+
+    var transfer_buf: [4096]u8 = undefined;
+    const reader = std_req.server.reader.bodyReader(
+        &transfer_buf,
+        std_req.head.transfer_encoding,
+        std_req.head.content_length,
+    );
+    return reader.allocRemaining(alloc, .limited(4 * 1024 * 1024));
 }
 
 fn streamWriteImpl(ctx: *anyopaque, data: []const u8) void {
