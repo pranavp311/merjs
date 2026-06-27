@@ -6,7 +6,7 @@
     .id = "com.merjs.desktop",
     .name = "merjs",
     .display_name = "MerJS",
-    .version = "0.2.53",
+    .version = "0.2.5",
     .web_engine = "system",
     .server = .{
         .mode = "dev", // "dev" (hot reload) | "embedded" (prod)

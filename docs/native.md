@@ -10,7 +10,7 @@ model — an unusually clean fit for merjs because the framework *already owns*
 the HTTP server, routing, SSR, and hot-reload transport. The shell only adds
 the WebView + window + bridge + packaging layer.
 
-> v0.2.53 ships macOS. Linux (WebKitGTK) and Windows (WebView2) are planned.
+> v0.2.5 ships macOS. Linux (WebKitGTK) and Windows (WebView2) are planned.
 
 ---
 
@@ -75,7 +75,7 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
     .name = "my-app",
     .display_name = "My App",         // → CFBundleName + .app bundle name
     .version = "0.1.0",               // → CFBundleVersion
-    .web_engine = "system",           // "system" (v0.2.53) | "chromium" (unsupported)
+    .web_engine = "system",           // "system" (v0.2.5) | "chromium" (unsupported)
     .server = .{
         .mode = "dev",                // "dev" (hot reload) | "embedded" (prod)
         .host = "127.0.0.1",
@@ -161,13 +161,13 @@ permissions plus global origins.
 
 ---
 
-## Limitations (v0.2.53)
+## Limitations (v0.2.5)
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned.
 - App-level custom bridge command registries and per-command manifest allowlists are deferred; PR #100 uses built-in commands, top-level `permissions`, and global allowed origins.
 - No code signing / notarization.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.
 - `server.mode = "static"` (fully static export over `mer://app`) is a stretch
-  goal; v0.2.53 runs the embedded loopback server in both dev and prod.
+  goal; v0.2.5 runs the embedded loopback server in both dev and prod.
 
 See `plans/mer-native.md` for the full design and phased roadmap.
