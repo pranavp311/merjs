@@ -5,6 +5,63 @@ const examples = @import("build/examples.zig");
 const tools = @import("build/tools.zig");
 const packages = @import("build/packages.zig");
 
+fn plistEscapeAlloc(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    for (input) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(alloc, "&amp;"),
+            '<' => try out.appendSlice(alloc, "&lt;"),
+            '>' => try out.appendSlice(alloc, "&gt;"),
+            '"' => try out.appendSlice(alloc, "&quot;"),
+            '\'' => try out.appendSlice(alloc, "&apos;"),
+            0...8, 11, 12, 14...31 => return error.InvalidPlistString,
+            else => try out.append(alloc, c),
+        }
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+fn plistEscape(b: *std.Build, input: []const u8) []const u8 {
+    return plistEscapeAlloc(b.allocator, input) catch @panic("invalid mer.app.zon string for Info.plist");
+}
+
+fn safeBundleComponentAlloc(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    for (input) |c| {
+        try out.append(alloc, switch (c) {
+            '/', '\\', ':', 0...31 => '-',
+            else => c,
+        });
+    }
+
+    const trimmed = std.mem.trim(u8, out.items, " .\t\r\n");
+    if (trimmed.len == 0) {
+        out.clearRetainingCapacity();
+        try out.appendSlice(alloc, "MerNative");
+        return out.toOwnedSlice(alloc);
+    }
+
+    if (trimmed.ptr != out.items.ptr or trimmed.len != out.items.len) {
+        const owned = try alloc.dupe(u8, trimmed);
+        out.deinit(alloc);
+        return owned;
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+fn safeBundleName(b: *std.Build, display_name: []const u8) []const u8 {
+    const component = safeBundleComponentAlloc(b.allocator, display_name) catch @panic("invalid mer.app.zon display_name for bundle path");
+    return b.fmt("{s}.app", .{component});
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -444,7 +501,10 @@ pub fn build(b: *std.Build) void {
         // `package` — install + .app bundle with manifest-driven Info.plist.
         // Read identity/version from mer.app.zon at build time.
         const app_zon = @import("mer.app.zon");
-        const pkg_name = b.fmt("{s}.app", .{app_zon.display_name});
+        const pkg_name = safeBundleName(b, app_zon.display_name);
+        const bundle_id_xml = plistEscape(b, app_zon.id);
+        const display_name_xml = plistEscape(b, app_zon.display_name);
+        const version_xml = plistEscape(b, app_zon.version);
         const plist_xml = b.fmt(
             \\<?xml version="1.0" encoding="UTF-8"?>
             \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -458,7 +518,7 @@ pub fn build(b: *std.Build) void {
             \\  <key>NSPrincipalClass</key>      <string>NSApplication</string>
             \\</dict>
             \\</plist>
-        , .{ app_zon.id, app_zon.display_name, app_zon.version });
+        , .{ bundle_id_xml, display_name_xml, version_xml });
         const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}), plist_xml);
         const pkg_bin = b.addInstallFile(
             native_exe.getEmittedBin(),

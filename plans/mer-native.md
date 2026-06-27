@@ -175,7 +175,7 @@ JS injection: the shell injects a small `window.mer.invoke` shim into the WKWebV
 | **P5** | Prod server embed | In-process loopback + asset embedding + `mer://app` scheme. `server.mode = "static"`. | stretch for v0.2.5 |
 | P6/P7 | Windows / mobile | Out of scope for v0.2.5. | deferred |
 
-**v0.2.5 ships P0 (verified) + P1 + P2 + P3 on macOS.** P4/P5 are stretch and gated on time.
+**PR #100 on the v0.2.5 target ships P0 (verified) + P1 + P2 + P3 on macOS.** P4/P5 are stretch and gated on time.
 
 ---
 

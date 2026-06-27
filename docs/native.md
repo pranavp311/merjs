@@ -10,7 +10,7 @@ model — an unusually clean fit for merjs because the framework *already owns*
 the HTTP server, routing, SSR, and hot-reload transport. The shell only adds
 the WebView + window + bridge + packaging layer.
 
-> v0.2.5 ships macOS. Linux (WebKitGTK) and Windows (WebView2) are planned.
+> PR #100 is rebased to the latest published release (`v0.2.5`) and ships macOS first. Linux (WebKitGTK) and Windows (WebView2) are planned.
 
 ---
 
@@ -161,13 +161,13 @@ permissions plus global origins.
 
 ---
 
-## Limitations (v0.2.5)
+## Limitations (PR #100 / v0.2.5 target)
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned.
 - App-level custom bridge command registries and per-command manifest allowlists are deferred; PR #100 uses built-in commands, top-level `permissions`, and global allowed origins.
 - No code signing / notarization.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.
 - `server.mode = "static"` (fully static export over `mer://app`) is a stretch
-  goal; v0.2.5 runs the embedded loopback server in both dev and prod.
+  goal; this target runs the embedded loopback server in both dev and prod.
 
 See `plans/mer-native.md` for the full design and phased roadmap.

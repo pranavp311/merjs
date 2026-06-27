@@ -775,7 +775,48 @@ const native_build_snippet =
     \\        b.step("native-build", "Build native shell binary").dependOn(&native_install.step);
     \\
     \\        const app_zon = @import("mer.app.zon");
-    \\        const pkg_name = b.fmt("{s}.app", .{app_zon.display_name});
+    \\        const NativePackage = struct {
+    \\            fn plistEscape(alloc: std.mem.Allocator, input: []const u8) []const u8 {
+    \\                if (!std.unicode.utf8ValidateSlice(input)) @panic("mer.app.zon Info.plist metadata must be valid UTF-8");
+    \\                var out: std.ArrayList(u8) = .empty;
+    \\                errdefer out.deinit(alloc);
+    \\                for (input) |c| switch (c) {
+    \\                    '&' => out.appendSlice(alloc, "&amp;") catch @panic("escape Info.plist"),
+    \\                    '<' => out.appendSlice(alloc, "&lt;") catch @panic("escape Info.plist"),
+    \\                    '>' => out.appendSlice(alloc, "&gt;") catch @panic("escape Info.plist"),
+    \\                    '"' => out.appendSlice(alloc, "&quot;") catch @panic("escape Info.plist"),
+    \\                    '\'' => out.appendSlice(alloc, "&apos;") catch @panic("escape Info.plist"),
+    \\                    0...8, 11, 12, 14...31 => @panic("mer.app.zon contains an XML-invalid control character"),
+    \\                    else => out.append(alloc, c) catch @panic("escape Info.plist"),
+    \\                };
+    \\                return out.toOwnedSlice(alloc) catch @panic("escape Info.plist");
+    \\            }
+    \\            fn safeBundleComponent(alloc: std.mem.Allocator, input: []const u8) []const u8 {
+    \\                var out: std.ArrayList(u8) = .empty;
+    \\                errdefer out.deinit(alloc);
+    \\                for (input) |c| out.append(alloc, switch (c) {
+    \\                    '/', '\\', ':', 0...31 => '-',
+    \\                    else => c,
+    \\                }) catch @panic("sanitize app bundle name");
+    \\                const trimmed = std.mem.trim(u8, out.items, " .\t\r\n");
+    \\                if (trimmed.len == 0) {
+    \\                    out.clearRetainingCapacity();
+    \\                    out.appendSlice(alloc, "MerNative") catch @panic("sanitize app bundle name");
+    \\                    return out.toOwnedSlice(alloc) catch @panic("sanitize app bundle name");
+    \\                }
+    \\                if (trimmed.ptr != out.items.ptr or trimmed.len != out.items.len) {
+    \\                    const owned = alloc.dupe(u8, trimmed) catch @panic("sanitize app bundle name");
+    \\                    out.deinit(alloc);
+    \\                    return owned;
+    \\                }
+    \\                return out.toOwnedSlice(alloc) catch @panic("sanitize app bundle name");
+    \\            }
+    \\        };
+    \\        const pkg_component = NativePackage.safeBundleComponent(b.allocator, app_zon.display_name);
+    \\        const pkg_name = b.fmt("{s}.app", .{pkg_component});
+    \\        const bundle_id_xml = NativePackage.plistEscape(b.allocator, app_zon.id);
+    \\        const display_name_xml = NativePackage.plistEscape(b.allocator, app_zon.display_name);
+    \\        const version_xml = NativePackage.plistEscape(b.allocator, app_zon.version);
     \\        const plist_xml = b.fmt(
     \\            \\<?xml version="1.0" encoding="UTF-8"?>
     \\            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -787,7 +828,7 @@ const native_build_snippet =
     \\            \\  <key>NSHighResolutionCapable</key><true/>
     \\            \\  <key>NSPrincipalClass</key><string>NSApplication</string>
     \\            \\</dict></plist>
-    \\        , .{ app_zon.id, app_zon.display_name, app_zon.version });
+    \\        , .{ bundle_id_xml, display_name_xml, version_xml });
     \\        const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}), plist_xml);
     \\        const pkg_bin = b.addInstallFile(native_exe.getEmittedBin(), b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}));
     \\        pkg_bin.step.dependOn(&native_install.step);
@@ -813,12 +854,67 @@ fn readZonStringField(alloc: std.mem.Allocator, field: []const u8) !?[]u8 {
     const eq = std.mem.indexOfScalar(u8, after_field, '=') orelse return null;
     const after_eq = std.mem.trim(u8, after_field[eq + 1 ..], " \t\r\n");
     if (after_eq.len == 0 or after_eq[0] != '"') return null;
-    const value_start: usize = 1;
-    const value_end = std.mem.indexOfScalarPos(u8, after_eq, value_start, '"') orelse return null;
-    return try alloc.dupe(u8, after_eq[value_start..value_end]);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var i: usize = 1;
+    while (i < after_eq.len) : (i += 1) {
+        const c = after_eq[i];
+        if (c == '"') return try out.toOwnedSlice(alloc);
+        if (c != '\\') {
+            try out.append(alloc, c);
+            continue;
+        }
+
+        i += 1;
+        if (i >= after_eq.len) return null;
+        try out.append(alloc, switch (after_eq[i]) {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '\\' => '\\',
+            '"' => '"',
+            '\'' => '\'',
+            else => after_eq[i],
+        });
+    }
+
+    return null;
+}
+
+fn safeBundleComponent(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    for (input) |c| {
+        try out.append(alloc, switch (c) {
+            '/', '\\', ':', 0...31 => '-',
+            else => c,
+        });
+    }
+
+    const trimmed = std.mem.trim(u8, out.items, " .\t\r\n");
+    if (trimmed.len == 0) {
+        out.clearRetainingCapacity();
+        try out.appendSlice(alloc, "MerNative");
+        return out.toOwnedSlice(alloc);
+    }
+
+    if (trimmed.ptr != out.items.ptr or trimmed.len != out.items.len) {
+        const owned = try alloc.dupe(u8, trimmed);
+        out.deinit(alloc);
+        return owned;
+    }
+
+    return out.toOwnedSlice(alloc);
 }
 
 fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
+    if (builtin.os.tag != .macos) {
+        print("mer: native currently supports macOS only (Linux/Windows planned)\n", .{});
+        std.process.exit(1);
+    }
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
@@ -828,10 +924,13 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
         std.process.exit(1);
     };
 
+    const zig_exe = try resolveInPath(alloc, "zig");
+    defer alloc.free(zig_exe);
+
     print("mer: running codegen...\n", .{});
     {
         const result = try std.process.run(alloc, runtime.io, .{
-            .argv = &.{ "zig", "build", "codegen" },
+            .argv = &.{ zig_exe, "build", "codegen" },
         });
         defer alloc.free(result.stdout);
         defer alloc.free(result.stderr);
@@ -845,7 +944,7 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     print("mer: launching native window (dev)...\n", .{});
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    try argv.appendSlice(alloc, &.{ "zig", "build", "native", "--", "--dev" });
+    try argv.appendSlice(alloc, &.{ zig_exe, "build", "native", "--", "--dev" });
     for (extra_args) |arg| try argv.append(alloc, arg);
 
     var child = try std.process.spawn(runtime.io, .{
@@ -861,7 +960,7 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
 }
 
-fn cmdNativeBuild(_: std.mem.Allocator) !void {
+fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
@@ -870,9 +969,12 @@ fn cmdNativeBuild(_: std.mem.Allocator) !void {
         print("mer: native build currently supports macOS only (Linux/Windows planned)\n", .{});
         std.process.exit(1);
     }
+    const zig_exe = try resolveInPath(alloc, "zig");
+    defer alloc.free(zig_exe);
+
     print("mer: building native shell (prod)...\n", .{});
     var child = try std.process.spawn(runtime.io, .{
-        .argv = &.{ "zig", "build", "native-build", "-Doptimize=ReleaseSmall" },
+        .argv = &.{ zig_exe, "build", "native-build", "-Doptimize=ReleaseSmall" },
         .stdout = .inherit,
         .stderr = .inherit,
     });
@@ -894,9 +996,12 @@ fn cmdPackage(alloc: std.mem.Allocator) !void {
         print("mer: package currently supports macOS only (Linux/Windows planned)\n", .{});
         std.process.exit(1);
     }
+    const zig_exe = try resolveInPath(alloc, "zig");
+    defer alloc.free(zig_exe);
+
     print("mer: packaging native app...\n", .{});
     var child = try std.process.spawn(runtime.io, .{
-        .argv = &.{ "zig", "build", "package", "-Doptimize=ReleaseSmall" },
+        .argv = &.{ zig_exe, "build", "package", "-Doptimize=ReleaseSmall" },
         .stdout = .inherit,
         .stderr = .inherit,
     });
@@ -908,8 +1013,10 @@ fn cmdPackage(alloc: std.mem.Allocator) !void {
     }
     if (try readZonStringField(alloc, "display_name")) |display_name| {
         defer alloc.free(display_name);
-        print("mer: packaged → zig-out/{s}.app\n", .{display_name});
-        print("    open zig-out/{s}.app\n", .{display_name});
+        const bundle_component = try safeBundleComponent(alloc, display_name);
+        defer alloc.free(bundle_component);
+        print("mer: packaged → zig-out/{s}.app\n", .{bundle_component});
+        print("    open zig-out/{s}.app\n", .{bundle_component});
     } else {
         print("mer: packaged → zig-out/<Display>.app\n", .{});
         print("    open zig-out/<Display>.app\n", .{});
