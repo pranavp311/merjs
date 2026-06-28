@@ -17,7 +17,7 @@
     .capabilities = .{ "webview", "js_bridge" },
     .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
-        .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
+        .navigation = .{ .allowed_origins = .{ "mer://app" } },
         .bridge = .{
             .allowed_commands = .{
                 "mer.ping", "mer.echo",
@@ -27,6 +27,8 @@
                 "window.setTitle", "window.close",
             },
             .command_origins = .{
+                "mer.ping|http://127.0.0.1",
+                "mer.echo|http://127.0.0.1",
                 "clipboard.read|http://127.0.0.1",
                 "clipboard.write|http://127.0.0.1",
                 "dialog.openFile|http://127.0.0.1",

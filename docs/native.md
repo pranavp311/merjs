@@ -31,6 +31,8 @@ mer package        # unsigned local .app (macOS): zig-out/<Display>.app
 mer package --sign # package + codesign (Developer ID; requires signing config)
 mer package --sign -Dmacos-signing-identity="Developer ID Application: Example, Inc. (TEAMID)"
 mer package --notarize # package + codesign + notarytool + stapler
+mer native doctor # check macOS production manifest hardening
+mer package --release # validate + sign + notarize + staple
 ```
 
 `mer native` reuses the `mer dev` pipeline (codegen → serve) and attaches a
@@ -87,13 +89,17 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
     .capabilities = .{ "webview", "js_bridge" },
     .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
-        .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
+        .navigation = .{ .allowed_origins = .{ "mer://app" } },
         .bridge = .{
             // Explicit command allowlist, similar to Tauri capabilities.
             .allowed_commands = .{ "mer.ping", "window.close" },
             // Per-command origin bindings use "command|origin". Port may be
-            // omitted for the shell's ephemeral loopback origin.
-            .command_origins = .{ "window.close|http://127.0.0.1" },
+            // omitted for the shell's ephemeral loopback origin. When configured,
+            // every allowed command needs a matching origin rule.
+            .command_origins = .{
+                "mer.ping|http://127.0.0.1",
+                "window.close|http://127.0.0.1",
+            },
         },
         .open = .{
             .external_schemes = .{ "http", "https", "mailto" },
@@ -242,6 +248,7 @@ Implemented in PR #100 plus hardening follow-up:
 - 64 KB bridge payload cap;
 - embedded-NUL guard before dispatch;
 - strict global origin check from the `WKScriptMessage` frame;
+- WKWebView navigation delegate cancellation for non-allowed origins;
 - explicit command allowlist via `security.bridge.allowed_commands`;
 - per-command origin bindings via `security.bridge.command_origins`;
 - `open.external` scheme allowlist (`http`, `https`, `mailto` by default);
@@ -257,7 +264,8 @@ Still deferred / not production-complete:
 - independent production security audit and cross-platform pen-test.
 
 See `SECURITY.md` for the project-wide vulnerability policy and native threat
-model checklist.
+model checklist. See `docs/native-production.md` for the macOS production
+release gate and signing/notarization flow.
 
 ---
 

@@ -93,6 +93,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // mer native build    → prod binary (no run)
         if (args.len >= 3 and std.mem.eql(u8, args[2], "build")) {
             try cmdNativeBuild(alloc);
+        } else if (args.len >= 3 and std.mem.eql(u8, args[2], "doctor")) {
+            try cmdNativeDoctor(alloc);
         } else {
             try cmdNative(alloc, args[2..]);
         }
@@ -656,6 +658,8 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package-sign\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package-notarize\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-check\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-release\",") != null);
 }
 
 test "native build snippet uses target OS and codegen dependency" {
@@ -827,6 +831,86 @@ const native_build_snippet =
     \\                if (!@hasField(MacT, field)) return null;
     \\                return @field(zon.macos, field);
     \\            }
+    \\            fn zonUpdateString(comptime zon: anytype, comptime field: []const u8) ?[]const u8 {
+    \\                const T = @TypeOf(zon);
+    \\                if (!@hasField(T, "update")) return null;
+    \\                const UpdateT = @TypeOf(zon.update);
+    \\                if (!@hasField(UpdateT, field)) return null;
+    \\                return @field(zon.update, field);
+    \\            }
+    \\            fn zonHasNavigationOrigins(comptime zon: anytype) bool {
+    \\                const T = @TypeOf(zon);
+    \\                if (!@hasField(T, "security")) return false;
+    \\                const SecurityT = @TypeOf(zon.security);
+    \\                if (!@hasField(SecurityT, "navigation")) return false;
+    \\                const NavigationT = @TypeOf(zon.security.navigation);
+    \\                if (!@hasField(NavigationT, "allowed_origins")) return false;
+    \\                return zon.security.navigation.allowed_origins.len > 0;
+    \\            }
+    \\            fn originHost(comptime origin: []const u8) ?[]const u8 {
+    \\                const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return null;
+    \\                const authority_start = scheme_end + 3;
+    \\                const authority_end = blk: {
+    \\                    var i: usize = authority_start;
+    \\                    while (i < origin.len) : (i += 1) {
+    \\                        switch (origin[i]) { '/', '?', '#' => break :blk i, else => {} }
+    \\                    }
+    \\                    break :blk origin.len;
+    \\                };
+    \\                var authority = origin[authority_start..authority_end];
+    \\                if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    \\                if (authority.len == 0) return null;
+    \\                if (authority[0] == '[') {
+    \\                    const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+    \\                    return authority[0 .. close + 1];
+    \\                }
+    \\                const colon = std.mem.indexOfScalar(u8, authority, ':');
+    \\                return if (colon) |c| authority[0..c] else authority;
+    \\            }
+    \\            fn isForbiddenProductionLoopbackHost(comptime host: []const u8) bool {
+    \\                return std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.eqlIgnoreCase(host, "[::1]") or std.mem.startsWith(u8, host, "127.");
+    \\            }
+    \\            fn zonNavigationHasForbiddenLoopback(comptime zon: anytype) bool {
+    \\                if (!zonHasNavigationOrigins(zon)) return false;
+    \\                for (zon.security.navigation.allowed_origins) |origin| {
+    \\                    const host = originHost(origin) orelse continue;
+    \\                    if (isForbiddenProductionLoopbackHost(host)) return true;
+    \\                }
+    \\                return false;
+    \\            }
+    \\            fn zonHasBridgeArray(comptime zon: anytype, comptime field: []const u8) bool {
+    \\                const T = @TypeOf(zon);
+    \\                if (!@hasField(T, "security")) return false;
+    \\                const SecurityT = @TypeOf(zon.security);
+    \\                if (!@hasField(SecurityT, "bridge")) return false;
+    \\                const BridgeT = @TypeOf(zon.security.bridge);
+    \\                if (!@hasField(BridgeT, field)) return false;
+    \\                return @field(zon.security.bridge, field).len > 0;
+    \\            }
+    \\            fn zonHasOpenArray(comptime zon: anytype, comptime field: []const u8) bool {
+    \\                const T = @TypeOf(zon);
+    \\                if (!@hasField(T, "security")) return false;
+    \\                const SecurityT = @TypeOf(zon.security);
+    \\                if (!@hasField(SecurityT, "open")) return false;
+    \\                const OpenT = @TypeOf(zon.security.open);
+    \\                if (!@hasField(OpenT, field)) return false;
+    \\                return @field(zon.security.open, field).len > 0;
+    \\            }
+    \\            fn macProdCheckMessage(comptime zon: anytype) []const u8 {
+    \\                comptime var msg: []const u8 = "";
+    \\                if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
+    \\                if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
+    \\                if (!zonHasNavigationOrigins(zon)) msg = msg ++ "missing explicit non-empty .security.navigation.allowed_origins\\n";
+    \\                if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
+    \\                if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
+    \\                if (!zonHasBridgeArray(zon, "command_origins")) msg = msg ++ "missing non-empty .security.bridge.command_origins\\n";
+    \\                if (!zonHasOpenArray(zon, "external_schemes")) msg = msg ++ "missing non-empty .security.open.external_schemes\\n";
+    \\                if (!zonHasOpenArray(zon, "path_roots")) msg = msg ++ "missing non-empty .security.open.path_roots\\n";
+    \\                if (nonEmpty(zonUpdateString(zon, "provider")) == null) msg = msg ++ "missing .update.provider\\n";
+    \\                if (nonEmpty(zonUpdateString(zon, "feed_url")) == null) msg = msg ++ "missing .update.feed_url\\n";
+    \\                if (nonEmpty(zonUpdateString(zon, "public_key")) == null) msg = msg ++ "missing .update.public_key\\n";
+    \\                return msg;
+    \\            }
     \\        };
     \\        const pkg_component = NativePackage.safeBundleComponent(b.allocator, app_zon.display_name);
     \\        const pkg_name = b.fmt("{s}.app", .{pkg_component});
@@ -858,6 +942,16 @@ const native_build_snippet =
     \\        package_step.dependOn(&pkg_plist.step);
     \\
     \\        const app_path = b.getInstallPath(.prefix, pkg_name);
+    \\        const prod_check_message = comptime NativePackage.macProdCheckMessage(app_zon);
+    \\        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
+    \\        if (prod_check_message.len == 0) {
+    \\            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
+    \\            native_prod_check_step.dependOn(&ok.step);
+    \\        } else {
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", b.fmt("printf 'mer native: macOS production manifest is incomplete:\\n{s}' >&2; exit 1", .{prod_check_message}) });
+    \\            native_prod_check_step.dependOn(&fail.step);
+    \\        }
+    \\
     \\        const signing_identity = NativePackage.firstNonEmpty(
     \\            b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
     \\            NativePackage.zonMacosString(app_zon, "signing_identity"),
@@ -871,10 +965,12 @@ const native_build_snippet =
     \\            const codesign = b.addSystemCommand(&.{ "codesign", "--deep", "--force", "--options", "runtime", "--timestamp", "--sign", identity });
     \\            if (entitlements) |path| codesign.addArgs(&.{ "--entitlements", path });
     \\            codesign.addArg(app_path);
+    \\            codesign.step.dependOn(native_prod_check_step);
     \\            codesign.step.dependOn(package_step);
     \\            package_sign_step.dependOn(&codesign.step);
     \\        } else {
     \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity' >&2; exit 1" });
+    \\            fail.step.dependOn(native_prod_check_step);
     \\            fail.step.dependOn(package_step);
     \\            package_sign_step.dependOn(&fail.step);
     \\        }
@@ -887,6 +983,7 @@ const native_build_snippet =
     \\        if (notarization_profile) |profile| {
     \\            const zip_path = b.fmt("zig-out/{s}.zip", .{pkg_name});
     \\            const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
+    \\            zip.step.dependOn(native_prod_check_step);
     \\            zip.step.dependOn(package_sign_step);
     \\            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", profile, "--wait" });
     \\            submit.step.dependOn(&zip.step);
@@ -895,9 +992,11 @@ const native_build_snippet =
     \\            package_notarize_step.dependOn(&staple.step);
     \\        } else {
     \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile' >&2; exit 1" });
-    \\            fail.step.dependOn(package_sign_step);
+    \\            fail.step.dependOn(native_prod_check_step);
     \\            package_notarize_step.dependOn(&fail.step);
     \\        }
+    \\        const native_prod_release_step = b.step("native-prod-release", "Validate, sign, notarize, and staple macOS native app");
+    \\        native_prod_release_step.dependOn(package_notarize_step);
     \\    }
 ;
 
@@ -1045,6 +1144,32 @@ fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
     print("mer: native binary built → zig-out/bin/mernative\n", .{});
 }
 
+fn cmdNativeDoctor(alloc: std.mem.Allocator) !void {
+    std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
+        print("mer: no build.zig found — are you in a merjs project?\n", .{});
+        std.process.exit(1);
+    };
+    if (builtin.os.tag != .macos) {
+        print("mer: native doctor currently checks macOS production readiness only\n", .{});
+        std.process.exit(1);
+    }
+    const zig_exe = try resolveInPath(alloc, "zig");
+    defer alloc.free(zig_exe);
+
+    print("mer: checking macOS native production manifest...\n", .{});
+    var child = try std.process.spawn(runtime.io, .{
+        .argv = &.{ zig_exe, "build", "native-prod-check" },
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(runtime.io);
+    const exited = term == .exited;
+    if (!exited or term.exited != 0) {
+        print("mer: native production check failed\n", .{});
+        std.process.exit(1);
+    }
+}
+
 fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
@@ -1065,10 +1190,12 @@ fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
             if (!std.mem.eql(u8, build_step, "package-notarize")) build_step = "package-sign";
         } else if (std.mem.eql(u8, arg, "--notarize")) {
             build_step = "package-notarize";
+        } else if (std.mem.eql(u8, arg, "--release")) {
+            build_step = "native-prod-release";
         } else if (std.mem.startsWith(u8, arg, "-D")) {
             try build_opts.append(alloc, arg);
         } else {
-            print("mer: unknown package option '{s}'\n  usage: mer package [--sign|--notarize] [-Dmacos-signing-identity=...] [-Dmacos-notarization-profile=...]\n", .{arg});
+            print("mer: unknown package option '{s}'\n  usage: mer package [--sign|--notarize|--release] [-Dmacos-signing-identity=...] [-Dmacos-notarization-profile=...]\n", .{arg});
             std.process.exit(1);
         }
     }
@@ -1097,7 +1224,7 @@ fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
         print("mer: packaged → zig-out/{s}.app\n", .{bundle_component});
         if (std.mem.eql(u8, build_step, "package-sign")) {
             print("    codesign --verify --deep --strict zig-out/{s}.app\n", .{bundle_component});
-        } else if (std.mem.eql(u8, build_step, "package-notarize")) {
+        } else if (std.mem.eql(u8, build_step, "package-notarize") or std.mem.eql(u8, build_step, "native-prod-release")) {
             print("    spctl --assess --type execute --verbose zig-out/{s}.app\n", .{bundle_component});
         } else {
             print("    open zig-out/{s}.app\n", .{bundle_component});
@@ -1106,7 +1233,7 @@ fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
         print("mer: packaged → zig-out/<Display>.app\n", .{});
         if (std.mem.eql(u8, build_step, "package-sign")) {
             print("    codesign --verify --deep --strict zig-out/<Display>.app\n", .{});
-        } else if (std.mem.eql(u8, build_step, "package-notarize")) {
+        } else if (std.mem.eql(u8, build_step, "package-notarize") or std.mem.eql(u8, build_step, "native-prod-release")) {
             print("    spctl --assess --type execute --verbose zig-out/<Display>.app\n", .{});
         } else {
             print("    open zig-out/<Display>.app\n", .{});
@@ -1402,9 +1529,11 @@ fn printUsage() void {
     print("    mer add <feature>    add optional features (css, wasm, worker, ui, native)\n", .{});
     print("    mer native           launch a native window against the dev server\n", .{});
     print("    mer native build     build the native shell binary (prod)\n", .{});
+    print("    mer native doctor    check macOS native production manifest\n", .{});
     print("    mer package          bundle the native app as a .app (macOS)\n", .{});
     print("    mer package --sign   package + codesign (Developer ID)\n", .{});
     print("    mer package --notarize package + codesign + notarize + staple\n", .{});
+    print("    mer package --release validate + codesign + notarize + staple\n", .{});
     print("    mer update           update merjs to latest version\n", .{});
     print("    mer --version        print version\n", .{});
     print("\n  https://github.com/justrach/merjs\n\n", .{});

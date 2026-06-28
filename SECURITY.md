@@ -42,12 +42,13 @@ Out of scope:
 - **Loopback binding:** the shell binds the embedded server to `127.0.0.1` by default and uses an ephemeral port (`port = 0`).
 - **Runtime origin pinning:** after the server binds, `shell.zig` prepends the exact `http://host:port` origin to the allowed origin list.
 - **Bridge origin validation:** the macOS backend reads the `WKScriptMessage` frame origin and rejects calls before dispatch when the origin is not allowed.
+- **WebView navigation policy:** the macOS shell installs a `WKNavigationDelegate` and cancels navigation to non-allowed origins.
 - **Payload limits:** bridge payloads over 64 KB are rejected.
 - **Embedded-NUL guard:** NSString payload byte length is compared against `UTF8String` length so NUL truncation cannot hide data from dispatch.
 - **Deny-by-default command registry:** unknown command names return `UnknownCommand`.
 - **Permission classes:** built-in commands require manifest permissions such as `clipboard`, `dialog`, `open`, and `window`.
 - **Explicit command allowlist:** `security.bridge.allowed_commands` can restrict the manifest to exact command names, similar to Tauri capabilities.
-- **Per-command origins:** `security.bridge.command_origins` can bind commands to origins with `"command|origin"` entries.
+- **Per-command origins:** `security.bridge.command_origins` can bind commands to origins with `"command|origin"` entries; when configured, commands without a matching origin rule are denied.
 - **Safer open commands:** `open.external` rejects disallowed schemes (default: `http`, `https`, `mailto`); `open.path` can be restricted to configured roots.
 - **macOS signing hooks:** `zig build package-sign` / `mer package --sign` run hardened-runtime `codesign`; `package-notarize` / `mer package --notarize` run `notarytool` and `stapler`.
 
@@ -59,9 +60,11 @@ Out of scope:
 - **Full Linux support:** WebKitGTK backend and package integration are not implemented.
 - **Full Windows support:** WebView2 backend and package integration are not implemented.
 - **Mature plugin system:** app-provided/plugin command registries and plugin capability manifests are not implemented.
-- **Navigation policy delegate:** bridge calls are origin-checked, but full WebView navigation interception is still a hardening item.
+- **Advanced navigation policy:** basic origin-based WKWebView navigation cancellation is implemented; richer per-window route policies and external-browser handoff are still future hardening items.
 - **Universal user prompts:** OS dialogs prompt where applicable, but merjs does not yet prompt for every sensitive bridge command.
 - **Independent production audit:** a full third-party audit / pen-test has not been completed.
+
+See also `docs/native-production.md` for the macOS production release gate.
 
 ## Native release checklist
 
@@ -90,6 +93,7 @@ Security smoke tests to keep in CI/manual review:
 - unknown command returns `UnknownCommand`
 - missing permission returns `PermissionDenied`
 - unlisted command returns `CommandDenied` when `allowed_commands` is configured
+- allowed command without a command-origin rule returns `OriginNotAllowed` when `command_origins` is configured
 - wrong command origin returns `OriginNotAllowed`
 - oversized payload returns `PayloadTooLarge`
 - malformed JSON returns `ParseError`

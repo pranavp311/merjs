@@ -46,6 +46,8 @@ const YES: BOOL = 1;
 const NO: BOOL = 0;
 const WKUserScriptInjectionTimeAtDocumentStart: NSUInteger = 0;
 const NSUTF8StringEncoding: NSUInteger = 4;
+const WKNavigationActionPolicyCancel: NSInteger = 0;
+const WKNavigationActionPolicyAllow: NSInteger = 1;
 
 fn cls(name: [*:0]const u8) Id {
     return objc_getClass(name);
@@ -176,6 +178,7 @@ fn installMainMenu(app: Id, app_title: [*:0]const u8) void {
 var g_webview: Id = null;
 var g_bridge_ctx: ?*bridge.Ctx = null;
 var g_app_delegate: Id = null;
+var g_nav_delegate: Id = null;
 
 /// The `window.mer` shim injected at document start. Provides:
 ///   window.mer.invoke(cmd, args) -> Promise
@@ -257,6 +260,46 @@ fn evalJs(ctx: *bridge.Ctx, webview: Id, js: []const u8) void {
     send2v(webview, sel("evaluateJavaScript:completionHandler:"), ns_js, null);
 }
 
+const BlockLiteral = extern struct {
+    isa: ?*anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (Id, NSInteger) callconv(.c) void,
+};
+
+fn callDecisionHandler(handler: Id, policy: NSInteger) void {
+    const h = handler orelse return;
+    const block: *const BlockLiteral = @ptrCast(@alignCast(h));
+    block.invoke(h, policy);
+}
+
+fn navigationActionUrl(action: Id) ?[]const u8 {
+    const request = send(action, sel("request")) orelse return null;
+    const url = send(request, sel("URL")) orelse return null;
+    const absolute = send(url, sel("absoluteString")) orelse return null;
+    const cstr = sendPtr(absolute, sel("UTF8String"));
+    return std.mem.span(cstr);
+}
+
+fn navigationPolicyIMP(self: Id, _cmd: Sel, webview: Id, action: Id, decision_handler: Id) callconv(.c) void {
+    _ = self;
+    _ = _cmd;
+    _ = webview;
+    const ctx = g_bridge_ctx orelse {
+        callDecisionHandler(decision_handler, WKNavigationActionPolicyCancel);
+        return;
+    };
+    const url = navigationActionUrl(action) orelse {
+        callDecisionHandler(decision_handler, WKNavigationActionPolicyCancel);
+        return;
+    };
+    if (bridge.isOriginAllowed(ctx, url)) {
+        callDecisionHandler(decision_handler, WKNavigationActionPolicyAllow);
+    } else {
+        callDecisionHandler(decision_handler, WKNavigationActionPolicyCancel);
+    }
+}
+
 fn messageFrameOrigin(message: Id, buf: *[512]u8) ?[]const u8 {
     const frame_info = send(message, sel("frameInfo")) orelse return null;
     const security_origin = send(frame_info, sel("securityOrigin")) orelse return null;
@@ -285,6 +328,22 @@ fn createMerHandlerClass() Id {
         sel("userContentController:didReceiveScriptMessage:"),
         @ptrCast(&merInvokeIMP),
         "v@:@@",
+    );
+    objc_registerClassPair(new_class);
+    return new_class;
+}
+
+fn createNavigationDelegateClass() Id {
+    if (cls("MerNavigationDelegate")) |existing| return existing;
+    const nsobject = cls("NSObject") orelse return null;
+    const new_class = objc_allocateClassPair(nsobject, "MerNavigationDelegate", 0);
+    if (new_class == null) return null;
+    // void webView:(id)webView decidePolicyForNavigationAction:(id)action decisionHandler:(id)handler
+    _ = class_addMethod(
+        new_class,
+        sel("webView:decidePolicyForNavigationAction:decisionHandler:"),
+        @ptrCast(&navigationPolicyIMP),
+        "v@:@@@",
     );
     objc_registerClassPair(new_class);
     return new_class;
@@ -340,6 +399,14 @@ fn setupBridge(webview: Id, ctx: *bridge.Ctx) void {
     const name_z = std.fmt.bufPrintZ(&name_buf, "merInvoke", .{}) catch return;
     const ns_name = sendStr(cls("NSString"), sel("stringWithUTF8String:"), name_z.ptr);
     send2v(ucc, sel("addScriptMessageHandler:name:"), handler, ns_name);
+
+    // 3. Enforce the same origin policy at navigation time, not only when a
+    // page calls the bridge. This keeps untrusted remote pages from replacing
+    // the trusted loopback UI inside the native window.
+    if (createNavigationDelegateClass()) |delegate_class| {
+        g_nav_delegate = send(send(delegate_class, sel("alloc")), sel("init"));
+        send1v(webview, sel("setNavigationDelegate:"), g_nav_delegate);
+    }
 }
 
 /// Open a native window hosting a WKWebView pointed at `url_z`. Blocks on the

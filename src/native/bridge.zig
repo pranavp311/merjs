@@ -244,7 +244,7 @@ pub fn isCommandOriginAllowed(ctx: *Ctx, name: []const u8) bool {
         }
         return true;
     }
-    return !saw_rule_for_command;
+    return ctx.command_origins.len == 0 and !saw_rule_for_command;
 }
 
 fn isAllowedExternalUrl(ctx: *Ctx, url: []const u8) bool {
@@ -521,6 +521,18 @@ test "dispatch: explicit command allowlist denies unlisted commands" {
     ctx.allowed_commands = &.{"mer.ping"};
     const js = try dispatch(&ctx, "{\"cmd\":\"window.close\",\"args\":null,\"id\":11}");
     try testing.expectEqualStrings("window.mer._resolve(11,false,\"CommandDenied\");", js);
+}
+
+test "dispatch: per-command origin bindings deny commands without a rule" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{});
+    ctx.allowed_commands = &.{ "mer.ping", "mer.echo" };
+    ctx.command_origins = &.{"mer.ping|http://127.0.0.1:3000"};
+    ctx.current_origin = "http://127.0.0.1:3000";
+    const js = try dispatch(&ctx, "{\"cmd\":\"mer.echo\",\"args\":null,\"id\":16}");
+    try testing.expectEqualStrings("window.mer._resolve(16,false,\"OriginNotAllowed\");", js);
 }
 
 test "dispatch: per-command origin bindings deny wrong origins" {

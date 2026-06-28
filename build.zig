@@ -79,6 +79,99 @@ fn zonMacosString(comptime zon: anytype, comptime field: []const u8) ?[]const u8
     return @field(zon.macos, field);
 }
 
+fn zonUpdateString(comptime zon: anytype, comptime field: []const u8) ?[]const u8 {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "update")) return null;
+    const UpdateT = @TypeOf(zon.update);
+    if (!@hasField(UpdateT, field)) return null;
+    return @field(zon.update, field);
+}
+
+fn zonHasNavigationOrigins(comptime zon: anytype) bool {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "security")) return false;
+    const SecurityT = @TypeOf(zon.security);
+    if (!@hasField(SecurityT, "navigation")) return false;
+    const NavigationT = @TypeOf(zon.security.navigation);
+    if (!@hasField(NavigationT, "allowed_origins")) return false;
+    return zon.security.navigation.allowed_origins.len > 0;
+}
+
+fn originHost(comptime origin: []const u8) ?[]const u8 {
+    const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return null;
+    const authority_start = scheme_end + 3;
+    const authority_end = blk: {
+        var i: usize = authority_start;
+        while (i < origin.len) : (i += 1) {
+            switch (origin[i]) {
+                '/', '?', '#' => break :blk i,
+                else => {},
+            }
+        }
+        break :blk origin.len;
+    };
+    var authority = origin[authority_start..authority_end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    if (authority.len == 0) return null;
+    if (authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+        return authority[0 .. close + 1];
+    }
+    const colon = std.mem.indexOfScalar(u8, authority, ':');
+    return if (colon) |c| authority[0..c] else authority;
+}
+
+fn isForbiddenProductionLoopbackHost(comptime host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.ascii.eqlIgnoreCase(host, "[::1]") or
+        std.mem.startsWith(u8, host, "127.");
+}
+
+fn zonNavigationHasForbiddenLoopback(comptime zon: anytype) bool {
+    if (!zonHasNavigationOrigins(zon)) return false;
+    for (zon.security.navigation.allowed_origins) |origin| {
+        const host = originHost(origin) orelse continue;
+        if (isForbiddenProductionLoopbackHost(host)) return true;
+    }
+    return false;
+}
+
+fn zonHasBridgeArray(comptime zon: anytype, comptime field: []const u8) bool {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "security")) return false;
+    const SecurityT = @TypeOf(zon.security);
+    if (!@hasField(SecurityT, "bridge")) return false;
+    const BridgeT = @TypeOf(zon.security.bridge);
+    if (!@hasField(BridgeT, field)) return false;
+    return @field(zon.security.bridge, field).len > 0;
+}
+
+fn zonHasOpenArray(comptime zon: anytype, comptime field: []const u8) bool {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "security")) return false;
+    const SecurityT = @TypeOf(zon.security);
+    if (!@hasField(SecurityT, "open")) return false;
+    const OpenT = @TypeOf(zon.security.open);
+    if (!@hasField(OpenT, field)) return false;
+    return @field(zon.security.open, field).len > 0;
+}
+
+fn macProdCheckMessage(comptime zon: anytype) []const u8 {
+    comptime var msg: []const u8 = "";
+    if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
+    if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
+    if (!zonHasNavigationOrigins(zon)) msg = msg ++ "missing explicit non-empty .security.navigation.allowed_origins\\n";
+    if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
+    if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
+    if (!zonHasBridgeArray(zon, "command_origins")) msg = msg ++ "missing non-empty .security.bridge.command_origins\\n";
+    if (!zonHasOpenArray(zon, "external_schemes")) msg = msg ++ "missing non-empty .security.open.external_schemes\\n";
+    if (!zonHasOpenArray(zon, "path_roots")) msg = msg ++ "missing non-empty .security.open.path_roots\\n";
+    if (nonEmpty(zonUpdateString(zon, "provider")) == null) msg = msg ++ "missing .update.provider\\n";
+    if (nonEmpty(zonUpdateString(zon, "feed_url")) == null) msg = msg ++ "missing .update.feed_url\\n";
+    if (nonEmpty(zonUpdateString(zon, "public_key")) == null) msg = msg ++ "missing .update.public_key\\n";
+    return msg;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -551,6 +644,20 @@ pub fn build(b: *std.Build) void {
         package_step.dependOn(&pkg_bin.step);
         package_step.dependOn(&pkg_plist.step);
 
+        const prod_check_message = comptime macProdCheckMessage(app_zon);
+        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
+        if (prod_check_message.len == 0) {
+            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
+            native_prod_check_step.dependOn(&ok.step);
+        } else {
+            const fail = b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                b.fmt("printf 'mer native: macOS production manifest is incomplete:\n{s}' >&2; exit 1", .{prod_check_message}),
+            });
+            native_prod_check_step.dependOn(&fail.step);
+        }
+
         // `package-sign` — optional Developer ID signing. Unsigned local
         // packages remain the default; this step is explicit like Tauri's
         // macOS bundle signing path.
@@ -577,6 +684,7 @@ pub fn build(b: *std.Build) void {
             });
             if (entitlements) |path| codesign.addArgs(&.{ "--entitlements", path });
             codesign.addArg(app_path);
+            codesign.step.dependOn(native_prod_check_step);
             codesign.step.dependOn(package_step);
             package_sign_step.dependOn(&codesign.step);
         } else {
@@ -585,12 +693,15 @@ pub fn build(b: *std.Build) void {
                 "-c",
                 "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity in mer.app.zon' >&2; exit 1",
             });
+            fail.step.dependOn(native_prod_check_step);
             fail.step.dependOn(package_step);
             package_sign_step.dependOn(&fail.step);
         }
 
         // `package-notarize` — sign, zip, submit, and staple. Credentials stay
         // in the developer's keychain profile; merjs never stores passwords.
+        // The production manifest gate is a hard precondition for every
+        // notarization side-effect command.
         const notarization_profile = firstNonEmpty(
             b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
             zonMacosString(app_zon, "notarization_profile"),
@@ -599,6 +710,7 @@ pub fn build(b: *std.Build) void {
         if (notarization_profile) |profile| {
             const zip_path = b.fmt("zig-out/{s}.zip", .{pkg_name});
             const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
+            zip.step.dependOn(native_prod_check_step);
             zip.step.dependOn(package_sign_step);
             const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", profile, "--wait" });
             submit.step.dependOn(&zip.step);
@@ -611,8 +723,11 @@ pub fn build(b: *std.Build) void {
                 "-c",
                 "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile in mer.app.zon' >&2; exit 1",
             });
-            fail.step.dependOn(package_sign_step);
+            fail.step.dependOn(native_prod_check_step);
             package_notarize_step.dependOn(&fail.step);
         }
+
+        const native_prod_release_step = b.step("native-prod-release", "Validate, sign, notarize, and staple the macOS native app");
+        native_prod_release_step.dependOn(package_notarize_step);
     }
 }
