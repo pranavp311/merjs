@@ -15,6 +15,29 @@ pub const version = "0.2.5";
 
 const print = std.debug.print;
 
+var process_environ: std.process.Environ = std.process.Environ.empty;
+
+fn childEnv(alloc: std.mem.Allocator) !std.process.Environ.Map {
+    return try process_environ.createMap(alloc);
+}
+
+fn runInheritEnv(alloc: std.mem.Allocator, options: std.process.RunOptions) !std.process.RunResult {
+    var env = try childEnv(alloc);
+    defer env.deinit();
+    var opts = options;
+    opts.environ_map = &env;
+    return try std.process.run(alloc, runtime.io, opts);
+}
+
+fn spawnWaitInheritEnv(alloc: std.mem.Allocator, options: std.process.SpawnOptions) !std.process.Child.Term {
+    var env = try childEnv(alloc);
+    defer env.deinit();
+    var opts = options;
+    opts.environ_map = &env;
+    var child = try std.process.spawn(runtime.io, opts);
+    return try child.wait(runtime.io);
+}
+
 /// Resolve an executable name to full path using PATH environment variable.
 /// Caller owns the returned memory.
 fn resolveInPath(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
@@ -51,6 +74,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+    process_environ = init.environ;
 
     // Initialize std.Io runtime (Auto-selects Evented on Linux, Threaded elsewhere)
     try runtime.init(alloc);
@@ -465,7 +489,7 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
         const cwd_path = if (use_cwd) "." else name;
         const zig_exe = try resolveInPath(alloc, "zig");
         defer alloc.free(zig_exe);
-        const result = try std.process.run(alloc, runtime.io, .{
+        const result = try runInheritEnv(alloc, .{
             .argv = &.{ zig_exe, "build" },
             .cwd = .{ .path = cwd_path },
         });
@@ -506,7 +530,7 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
         defer alloc.free(zig_exe);
 
         // Get the package hash (printed to stdout by zig fetch without --save).
-        const hash_result = try std.process.run(alloc, runtime.io, .{
+        const hash_result = try runInheritEnv(alloc, .{
             .argv = &.{ zig_exe, "fetch", "git+https://github.com/justrach/merjs.git" },
             .cwd = .{ .path = cwd_path },
         });
@@ -520,7 +544,7 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
             const pkg_hash = std.mem.trimEnd(u8, hash_result.stdout, "\n\r ");
 
             // Pin the commit URL into build.zig.zon.
-            const save_result = try std.process.run(alloc, runtime.io, .{
+            const save_result = try runInheritEnv(alloc, .{
                 .argv = &.{ zig_exe, "fetch", "--save=merjs", "git+https://github.com/justrach/merjs.git" },
                 .cwd = .{ .path = cwd_path },
             });
@@ -662,6 +686,32 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-release\",") != null);
 }
 
+test "CLI child processes inherit configured environment" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    try runtime.init(alloc);
+    defer runtime.deinit();
+
+    var map = std.process.Environ.Map.init(alloc);
+    defer map.deinit();
+    try map.put("MERJS_ENV_SENTINEL", "ok");
+
+    const synthetic_env: std.process.Environ = .{ .block = try map.createPosixBlock(alloc, .{}) };
+    defer synthetic_env.block.deinit(alloc);
+
+    const previous = process_environ;
+    process_environ = synthetic_env;
+    defer process_environ = previous;
+
+    const result = try runInheritEnv(alloc, .{ .argv = &.{ "env" }, .stdout_limit = .limited(64 * 1024) });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(result.term == .exited);
+    try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "MERJS_ENV_SENTINEL=ok") != null);
+}
+
 test "native build snippet uses target OS and codegen dependency" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "target.result.os.tag == .macos") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_exe.step.dependOn(&run_codegen.step);") != null);
@@ -721,7 +771,7 @@ fn cmdDev(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     print("mer: running codegen...\n", .{});
     {
-        const result = try std.process.run(alloc, runtime.io, .{
+        const result = try runInheritEnv(alloc, .{
             .argv = &.{ "zig", "build", "codegen" },
         });
         defer alloc.free(result.stdout);
@@ -742,12 +792,11 @@ fn cmdDev(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
         for (extra_args) |arg| try argv.append(alloc, arg);
     }
 
-    var child = try std.process.spawn(runtime.io, .{
+    _ = try spawnWaitInheritEnv(alloc, .{
         .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    _ = try child.wait(runtime.io);
 }
 
 // -- native ------------------------------------------------------------------
@@ -1086,7 +1135,7 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
 
     print("mer: running codegen...\n", .{});
     {
-        const result = try std.process.run(alloc, runtime.io, .{
+        const result = try runInheritEnv(alloc, .{
             .argv = &.{ zig_exe, "build", "codegen" },
         });
         defer alloc.free(result.stdout);
@@ -1104,12 +1153,11 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     try argv.appendSlice(alloc, &.{ zig_exe, "build", "native", "--", "--dev" });
     for (extra_args) |arg| try argv.append(alloc, arg);
 
-    var child = try std.process.spawn(runtime.io, .{
+    const term = try spawnWaitInheritEnv(alloc, .{
         .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(runtime.io);
     const exited = term == .exited;
     if (!exited or term.exited != 0) {
         print("mer: native run failed\n", .{});
@@ -1130,12 +1178,11 @@ fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
     defer alloc.free(zig_exe);
 
     print("mer: building native shell (prod)...\n", .{});
-    var child = try std.process.spawn(runtime.io, .{
+    const term = try spawnWaitInheritEnv(alloc, .{
         .argv = &.{ zig_exe, "build", "native-build", "-Doptimize=ReleaseSmall" },
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(runtime.io);
     const exited = term == .exited;
     if (!exited or term.exited != 0) {
         print("mer: native build failed\n", .{});
@@ -1157,12 +1204,11 @@ fn cmdNativeDoctor(alloc: std.mem.Allocator) !void {
     defer alloc.free(zig_exe);
 
     print("mer: checking macOS native production manifest...\n", .{});
-    var child = try std.process.spawn(runtime.io, .{
+    const term = try spawnWaitInheritEnv(alloc, .{
         .argv = &.{ zig_exe, "build", "native-prod-check" },
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(runtime.io);
     const exited = term == .exited;
     if (!exited or term.exited != 0) {
         print("mer: native production check failed\n", .{});
@@ -1206,12 +1252,11 @@ fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     try argv.appendSlice(alloc, build_opts.items);
 
     print("mer: running zig build {s}...\n", .{build_step});
-    var child = try std.process.spawn(runtime.io, .{
+    const term = try spawnWaitInheritEnv(alloc, .{
         .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(runtime.io);
     const exited = term == .exited;
     if (!exited or term.exited != 0) {
         print("mer: package failed\n", .{});
@@ -1277,12 +1322,11 @@ fn cmdBuild(_: std.mem.Allocator) !void {
     };
 
     print("mer: production build...\n", .{});
-    var child = try std.process.spawn(runtime.io, .{
+    const term = try spawnWaitInheritEnv(std.heap.page_allocator, .{
         .argv = &.{ "zig", "build", "-Doptimize=ReleaseSmall", "prod" },
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(runtime.io);
     const exited = term == .exited;
     if (!exited or term.exited != 0) {
         print("mer: build failed\n", .{});
@@ -1300,12 +1344,11 @@ fn cmdUpdate(_: std.mem.Allocator) !void {
     };
 
     print("mer: updating merjs to latest...\n", .{});
-    var child = try std.process.spawn(runtime.io, .{
+    const term = try spawnWaitInheritEnv(std.heap.page_allocator, .{
         .argv = &.{ "zig", "fetch", "--save=merjs", "git+https://github.com/justrach/merjs.git" },
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(runtime.io);
     const exited = term == .exited;
     if (!exited or term.exited != 0) {
         print("mer: update failed\n", .{});
@@ -1356,12 +1399,11 @@ fn cmdAddCss(_: std.mem.Allocator) !void {
     } else {
         print("  downloading Tailwind CSS standalone CLI...\n", .{});
         _ = std.Io.Dir.cwd().createDirPathOpen(runtime.io, "tools", .{}) catch {};
-        var child = try std.process.spawn(runtime.io, .{
+        const term = try spawnWaitInheritEnv(std.heap.page_allocator, .{
             .argv = &.{ "sh", "-c", "curl -sLo tools/tailwindcss " ++ tailwind_url ++ " && chmod +x tools/tailwindcss" },
             .stdout = .inherit,
             .stderr = .inherit,
         });
-        const term = try child.wait(runtime.io);
         const exited = term == .exited;
         if (!exited or term.exited != 0) {
             print("  failed to download Tailwind CLI\n", .{});

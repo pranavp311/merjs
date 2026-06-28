@@ -56,6 +56,28 @@ pub const ServerReady = struct {
     }
 };
 
+pub const TargetMetadata = struct {
+    raw_target: []const u8,
+    path: []const u8,
+    query_string: []const u8,
+};
+
+pub fn splitRequestTarget(head_target: []const u8) TargetMetadata {
+    const query_index = std.mem.indexOfScalar(u8, head_target, '?');
+    return .{
+        .raw_target = head_target,
+        .path = if (query_index) |q| head_target[0..q] else head_target,
+        .query_string = if (query_index) |q|
+            if (q + 1 < head_target.len) head_target[q + 1 ..] else ""
+        else
+            "",
+    };
+}
+
+pub fn shouldTrySpaFallback(static_dir: ?[]const u8, has_route: bool, has_framed_body: bool) bool {
+    return static_dir != null and !has_route and !has_framed_body;
+}
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3000,
@@ -258,14 +280,10 @@ fn serveRequest(
     // `std_req.head.target` is borrowed from std.http's head buffer. Zig 0.16
     // invalidates that string memory when the body reader is initialized, so
     // copy target-derived slices before any framed body is read.
-    const head_target = std_req.head.target;
-    const query_index = std.mem.indexOfScalar(u8, head_target, '?');
-    const raw_target = try alloc.dupe(u8, head_target);
-    const path = try alloc.dupe(u8, if (query_index) |q| head_target[0..q] else head_target);
-    const query_string = try alloc.dupe(u8, if (query_index) |q|
-        if (q + 1 < head_target.len) head_target[q + 1 ..] else ""
-    else
-        "");
+    const target_meta = splitRequestTarget(std_req.head.target);
+    const raw_target = try alloc.dupe(u8, target_meta.raw_target);
+    const path = try alloc.dupe(u8, target_meta.path);
+    const query_string = try alloc.dupe(u8, target_meta.query_string);
 
     // Raw handler hook (checked first) — lets apps register long-lived
     // endpoints (SSE, websockets) that must own the connection.
@@ -321,12 +339,10 @@ fn serveRequest(
     }
 
     const has_route = router.findRoute(path) != null;
-    if (!has_route) {
-        // SPA history fallback only after proving no backend route matches.
+    // SPA history fallback only after proving no backend route matches.
+    if (shouldTrySpaFallback(static_dir, has_route, requestHasFramedBody(std_req))) {
         if (static_dir) |d| {
-            if (!requestHasFramedBody(std_req)) {
-                if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
-            }
+            if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
         }
     }
 
@@ -576,4 +592,22 @@ fn tryServePrerendered(
     bw.end() catch return null;
 
     return {};
+}
+
+test "splitRequestTarget preserves metadata before body reads" {
+    const meta = splitRequestTarget("/api/echo?name=mer&debug=1");
+    try std.testing.expectEqualStrings("/api/echo?name=mer&debug=1", meta.raw_target);
+    try std.testing.expectEqualStrings("/api/echo", meta.path);
+    try std.testing.expectEqualStrings("name=mer&debug=1", meta.query_string);
+
+    const empty_query = splitRequestTarget("/submit?");
+    try std.testing.expectEqualStrings("/submit", empty_query.path);
+    try std.testing.expectEqualStrings("", empty_query.query_string);
+}
+
+test "SPA static fallback does not shadow real routes or request bodies" {
+    try std.testing.expect(!shouldTrySpaFallback("dist", true, false));
+    try std.testing.expect(!shouldTrySpaFallback("dist", false, true));
+    try std.testing.expect(!shouldTrySpaFallback(null, false, false));
+    try std.testing.expect(shouldTrySpaFallback("dist", false, false));
 }

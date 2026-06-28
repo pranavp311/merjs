@@ -403,6 +403,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        cli_test_mod.addImport("runtime", runtime_mod);
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_test_mod })).step);
     }
     // Run router + runtime inline tests (through mer.zig as root to avoid
