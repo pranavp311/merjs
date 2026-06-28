@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Initialize std.Io runtime (Auto-selects Evented on Linux, Threaded elsewhere)
+    // Initialize std.Io runtime (Threaded on Zig 0.16-supported targets).
     try runtime.init(alloc);
     defer runtime.deinit();
 

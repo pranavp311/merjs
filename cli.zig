@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = gpa.allocator();
     process_environ = init.environ;
 
-    // Initialize std.Io runtime (Auto-selects Evented on Linux, Threaded elsewhere)
+    // Initialize std.Io runtime (Threaded on Zig 0.16-supported targets).
     try runtime.init(alloc);
     defer runtime.deinit();
 
