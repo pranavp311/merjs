@@ -63,7 +63,7 @@ pub fn run(
     opts: RunOpts,
 ) !void {
     if (builtin.os.tag != .macos) {
-        log.err("native shell not yet implemented for {s}", .{@tagName(builtin.os.tag)});
+        log.err("native shell currently supports macOS only; {s} backend is planned", .{@tagName(builtin.os.tag)});
         return error.UnsupportedPlatform;
     }
 

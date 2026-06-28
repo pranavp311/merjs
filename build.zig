@@ -383,14 +383,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     // Run inline tests in individual framework source files.
-    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/mercss-jit.zig", "src/native/bridge.zig", "src/native/manifest.zig" }) |src_path| {
+    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/mercss-jit.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig" }) |src_path| {
         const file_test_mod = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        if (std.mem.eql(u8, src_path, "src/native/bridge.zig") and builtin.os.tag == .macos) {
+        if (std.mem.eql(u8, src_path, "src/native/bridge.zig") and target.result.os.tag == .macos) {
             file_test_mod.linkFramework("AppKit", .{});
             file_test_mod.linkFramework("Foundation", .{});
         }
@@ -574,6 +574,9 @@ pub fn build(b: *std.Build) void {
     // ── `zig build native` — native shell (dev: builds + runs) ─────────────
     //     `zig build native-build` — install only (prod)
     //     `zig build package` — install + .app bundle with manifest Info.plist
+    // Native runtime steps are macOS-only today. Linux WebKitGTK and Windows
+    // WebView2 backends will split shared native executable setup from
+    // platform-specific linking once those SDKs are implemented and validated.
     if (target.result.os.tag == .macos) {
         const native_mod = b.createModule(.{
             .root_source_file = b.path("src/native/main.zig"),

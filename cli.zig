@@ -1118,7 +1118,7 @@ fn safeBundleComponent(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 
 fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     if (builtin.os.tag != .macos) {
-        print("mer: native currently supports macOS only (Linux/Windows planned)\n", .{});
+        print("mer: native currently supports macOS only; Linux WebKitGTK and Windows WebView2 backends are planned\n", .{});
         std.process.exit(1);
     }
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
@@ -1171,7 +1171,7 @@ fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
         std.process.exit(1);
     };
     if (builtin.os.tag != .macos) {
-        print("mer: native build currently supports macOS only (Linux/Windows planned)\n", .{});
+        print("mer: native build currently supports macOS only; Linux WebKitGTK and Windows WebView2 backends are planned\n", .{});
         std.process.exit(1);
     }
     const zig_exe = try resolveInPath(alloc, "zig");
@@ -1222,7 +1222,7 @@ fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
         std.process.exit(1);
     };
     if (builtin.os.tag != .macos) {
-        print("mer: package currently supports macOS only (Linux/Windows planned)\n", .{});
+        print("mer: package currently produces macOS .app bundles only; Linux/Windows packaging will be platform-specific\n", .{});
         std.process.exit(1);
     }
     const zig_exe = try resolveInPath(alloc, "zig");

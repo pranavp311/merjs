@@ -20,7 +20,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const macos_commands = if (builtin.os.tag == .macos) @import("macos_commands.zig") else struct {};
+const platform_commands = @import("platform_commands.zig");
+const commands = platform_commands.commands;
 
 /// Maximum inbound bridge payload size (keeps the ObjC string bridge bounded).
 pub const max_payload_bytes: usize = 64 * 1024;
@@ -106,9 +107,8 @@ fn echo(_: *Ctx, _: std.json.Value) HandlerResult {
 }
 
 fn dialogOpenFile(ctx: *Ctx, args: std.json.Value) HandlerResult {
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
     const title = argString(args, "title") orelse "Choose a file";
-    const result = macos_commands.openPanel(ctx.allocator, .{
+    const result = commands.openPanel(ctx.allocator, .{
         .title = title,
         .can_choose_files = true,
         .can_choose_directories = false,
@@ -121,9 +121,8 @@ fn dialogOpenFile(ctx: *Ctx, args: std.json.Value) HandlerResult {
 }
 
 fn dialogPickDirectory(ctx: *Ctx, args: std.json.Value) HandlerResult {
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
     const title = argString(args, "title") orelse "Choose a folder";
-    const result = macos_commands.openPanel(ctx.allocator, .{
+    const result = commands.openPanel(ctx.allocator, .{
         .title = title,
         .can_choose_files = false,
         .can_choose_directories = true,
@@ -137,14 +136,12 @@ fn dialogPickDirectory(ctx: *Ctx, args: std.json.Value) HandlerResult {
 }
 
 fn clipboardRead(ctx: *Ctx, _: std.json.Value) HandlerResult {
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
-    const text = macos_commands.clipboardRead() catch return .{ .err = error.HandlerError };
+    const text = commands.clipboardRead() catch return .{ .err = error.HandlerError };
     const json = jsonString(ctx.allocator, text) catch return .{ .err = error.OutOfMemory };
     return .{ .ok_owned = json };
 }
 
 fn clipboardWrite(_: *Ctx, args: std.json.Value) HandlerResult {
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
     const text = switch (args) {
         .string => |value| value,
         .object => |object| blk: {
@@ -153,15 +150,14 @@ fn clipboardWrite(_: *Ctx, args: std.json.Value) HandlerResult {
         },
         else => return .{ .err = error.HandlerError },
     };
-    macos_commands.clipboardWrite(text) catch return .{ .err = error.HandlerError };
+    commands.clipboardWrite(text) catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
 fn openExternal(ctx: *Ctx, args: std.json.Value) HandlerResult {
     const url = argString(args, "url") orelse if (args == .string) args.string else return .{ .err = error.InvalidArgs };
     if (!isAllowedExternalUrl(ctx, url)) return .{ .err = error.UrlDenied };
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
-    macos_commands.openUrl(url) catch return .{ .err = error.HandlerError };
+    commands.openUrl(url) catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
@@ -169,21 +165,18 @@ fn openPath(ctx: *Ctx, args: std.json.Value) HandlerResult {
     const path = argString(args, "path") orelse if (args == .string) args.string else return .{ .err = error.InvalidArgs };
     const resolved_path = resolveAllowedPath(ctx, path) orelse return .{ .err = error.PathDenied };
     defer ctx.allocator.free(resolved_path);
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
-    macos_commands.openPath(resolved_path) catch return .{ .err = error.HandlerError };
+    commands.openPath(resolved_path) catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
 fn windowSetTitle(_: *Ctx, args: std.json.Value) HandlerResult {
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
     const title = argString(args, "title") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
-    macos_commands.setWindowTitle(title) catch return .{ .err = error.HandlerError };
+    commands.setWindowTitle(title) catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
 fn windowClose(_: *Ctx, _: std.json.Value) HandlerResult {
-    if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
-    macos_commands.closeWindow() catch return .{ .err = error.HandlerError };
+    commands.closeWindow() catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
@@ -260,12 +253,26 @@ fn isAllowedExternalUrl(ctx: *Ctx, url: []const u8) bool {
     return false;
 }
 
+const path_canonicalizer = if (builtin.os.tag == .windows) struct {
+    fn realPathAlloc(_: std.mem.Allocator, _: []const u8) ![]u8 {
+        // Windows needs drive/UNC/case-insensitive/symlink-aware canonicalization
+        // before `open.path` can be enabled there. Until the WebView2 backend
+        // lands, rooted open.path checks fail closed on Windows without pulling
+        // POSIX libc symbols into the platform-neutral bridge.
+        return error.RealPathFailed;
+    }
+} else struct {
+    fn realPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+        const path_z = try alloc.dupeZ(u8, path);
+        defer alloc.free(path_z);
+        var buf: [std.c.PATH_MAX]u8 = undefined;
+        const resolved = std.c.realpath(path_z.ptr, &buf) orelse return error.RealPathFailed;
+        return try alloc.dupe(u8, std.mem.span(resolved));
+    }
+};
+
 fn realPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    const path_z = try alloc.dupeZ(u8, path);
-    defer alloc.free(path_z);
-    var buf: [std.c.PATH_MAX]u8 = undefined;
-    const resolved = std.c.realpath(path_z.ptr, &buf) orelse return error.RealPathFailed;
-    return try alloc.dupe(u8, std.mem.span(resolved));
+    return path_canonicalizer.realPathAlloc(alloc, path);
 }
 
 fn pathWithinRoot(path: []const u8, root: []const u8) bool {
@@ -500,7 +507,7 @@ test "jsonString returns an owned exact slice" {
 }
 
 test "dispatch: clipboard read owned result is freeable" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!platform_commands.has_platform_commands) return error.SkipZigTest;
 
     var ctx = newCtx(testing.allocator, &.{"clipboard"});
     const js = try dispatch(&ctx, "{\"cmd\":\"clipboard.read\",\"args\":null,\"id\":9}");

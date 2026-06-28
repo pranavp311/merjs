@@ -2,6 +2,8 @@
 
 This checklist is for shipping a **macOS** `mer native` app. Linux, Windows, mobile, and a mature plugin/updater runtime remain tracked separately.
 
+Linux/WebKitGTK and Windows/WebView2 production packaging/signing/runtime checks will be added with those native backends. See [`docs/native-platforms.md`](native-platforms.md) for the staged platform plan.
+
 ## 1. Harden the manifest
 
 Production manifests should use explicit least privilege:

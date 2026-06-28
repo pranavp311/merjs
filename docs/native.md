@@ -1,9 +1,9 @@
 # `mer native` — ship a merjs app as a native desktop app
 
 A merjs project can be packaged and run as a small native desktop app: a Zig
-shell hosting the system **WebView** (WKWebView on macOS) that loads the merjs
+shell hosting the system **WebView** (WKWebView on macOS today; WebKitGTK on Linux and WebView2 on Windows are planned) that loads the merjs
 UI over a loopback HTTP server, with a `window.mer.invoke()` JS↔Zig bridge for
-native calls. **No Electron, no Chromium, no Node.**
+native calls. **No Electron, no bundled Chromium, no Node.**
 
 This implements the [zero-native](https://github.com/vercel-labs/zero-native)
 model — an unusually clean fit for merjs because the framework *already owns*
@@ -11,6 +11,18 @@ the HTTP server, routing, SSR, and hot-reload transport. The shell only adds
 the WebView + window + bridge + packaging layer.
 
 > PR #100 is rebased to the latest published release (`v0.2.5`) and ships macOS first. Linux (WebKitGTK) and Windows (WebView2) are planned.
+
+## Platform status
+
+| Platform | WebView backend | Status |
+|---|---|---|
+| macOS | WKWebView + AppKit | Implemented, including `.app` packaging, signing hooks, notarization hooks, and production manifest gate. |
+| Linux | WebKitGTK | Planned. Shared bridge/security code is being prepared for platform-neutral use; GTK/WebKitGTK window, message-origin extraction, navigation policy, and packaging remain to be implemented and validated. |
+| Windows | WebView2 + Win32 | Planned. Shared bridge/security code is being prepared for platform-neutral use; COM/WebView2 hosting, navigation/message events, Windows path canonicalization, and packaging/signing remain to be implemented and validated. |
+
+The shared pieces are being isolated in platform-neutral Zig (`shell.zig`, `bridge.zig`, `manifest.zig`, and `platform_commands.zig`). Platform-specific work is deliberately kept behind the WebView backend and command facade so Linux/Windows can be added without weakening the macOS bridge policy.
+
+See [`docs/native-platforms.md`](native-platforms.md) for the staged Linux/Windows implementation plan.
 
 ---
 
@@ -51,7 +63,7 @@ codegen → zig build serve (in-process)
    ▼
 native shell (WKWebView)
    │  loadURL("http://127.0.0.1:<port>/")
-   │  window.mer.invoke ⇄ native/commands.zig
+   │  window.mer.invoke ⇄ bridge.zig ⇄ platform_commands.zig
    └─ SSE /_mer/events → live reload (dev mode)
 ```
 
@@ -62,9 +74,10 @@ web framework. The native layer lives under `src/native/`:
 |---|---|
 | `shell.zig` | Server-on-port-0 + `ServerReady` handshake + platform `openWindow`. |
 | `macos.zig` | WKWebView + NSWindow via extern ObjC primitives (no `@cImport`); `WKScriptMessageHandler` glue for the bridge. |
-| `bridge.zig` | `window.mer.invoke` dispatch: size/permission guards + comptime command registry. |
+| `bridge.zig` | `window.mer.invoke` dispatch: size/permission/origin/URL/path guards + comptime command registry. |
+| `platform_commands.zig` | Facade that selects macOS command implementations today and unsupported stubs on planned platforms. |
+| `macos_commands.zig` | macOS implementations for built-in clipboard/dialog/open/window commands. |
 | `manifest.zig` | Comptime parse of `mer.app.zon`. |
-| `commands.zig` | Reference bridge command handlers. |
 | `main.zig` | The native binary entry point. |
 
 The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSend`
@@ -178,8 +191,9 @@ backend checks the `WKScriptMessage` frame origin against
 `security.navigation.allowed_origins`. `shell.zig` prepends the exact runtime
 origin after the server binds its ephemeral port, so portless manifest entries
 (for example `http://127.0.0.1`) do **not** wildcard every local server port.
-Per-command origin policy is still a hardening follow-up; PR #100 uses top-level
-permissions plus global origins.
+Bridge dispatch then enforces the explicit command allowlist, per-command origin
+bindings, permission class, and command-specific URL/path restrictions before
+calling the platform command facade.
 
 ---
 
@@ -271,8 +285,8 @@ release gate and signing/notarization flow.
 
 ## Limitations (PR #100 / v0.2.5 target)
 
-- macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned.
-- App-level custom bridge command registries and per-command manifest allowlists are deferred; PR #100 uses built-in commands, top-level `permissions`, and global allowed origins.
+- macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned and documented in `docs/native-platforms.md`.
+- Built-in command allowlists and per-command origins are implemented. App-level custom bridge command registries / plugin commands are deferred.
 - Code signing / notarization hooks exist for macOS, but release credentials,
   notarized artifacts, and CI distribution are not configured by default.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.

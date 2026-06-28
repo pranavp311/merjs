@@ -57,14 +57,14 @@ Out of scope:
 - **Auto-updater:** manifest fields may describe an update feed/public key, but no updater downloads or installs artifacts yet.
 - **Signed update manifests/artifacts:** planned; not implemented.
 - **Rollback prevention:** planned with the updater; not implemented.
-- **Full Linux support:** WebKitGTK backend and package integration are not implemented.
-- **Full Windows support:** WebView2 backend and package integration are not implemented.
+- **Full Linux support:** WebKitGTK backend and package integration are planned but not implemented; see `docs/native-platforms.md`.
+- **Full Windows support:** WebView2 backend and package integration are planned but not implemented; see `docs/native-platforms.md`.
 - **Mature plugin system:** app-provided/plugin command registries and plugin capability manifests are not implemented.
 - **Advanced navigation policy:** basic origin-based WKWebView navigation cancellation is implemented; richer per-window route policies and external-browser handoff are still future hardening items.
 - **Universal user prompts:** OS dialogs prompt where applicable, but merjs does not yet prompt for every sensitive bridge command.
 - **Independent production audit:** a full third-party audit / pen-test has not been completed.
 
-See also `docs/native-production.md` for the macOS production release gate.
+See also `docs/native-production.md` for the macOS production release gate and `docs/native-platforms.md` for the Linux/Windows backend plan.
 
 ## Native release checklist
 
