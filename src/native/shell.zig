@@ -126,6 +126,10 @@ pub fn run(
         .allocator = allocator,
         .permissions = app_manifest.permissions,
         .allowed_origins = allowed_origins,
+        .allowed_commands = app_manifest.security.bridge.allowed_commands,
+        .command_origins = app_manifest.security.bridge.command_origins,
+        .external_url_schemes = app_manifest.security.open.external_schemes,
+        .open_path_roots = app_manifest.security.open.path_roots,
     };
 
     // Hand off to the platform backend (blocks on the event loop).

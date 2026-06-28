@@ -100,7 +100,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (std.mem.eql(u8, cmd, "package")) {
-        try cmdPackage(alloc);
+        try cmdPackage(alloc, args[2..]);
         return;
     }
 
@@ -654,6 +654,8 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-build\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package-sign\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package-notarize\",") != null);
 }
 
 test "native build snippet uses target OS and codegen dependency" {
@@ -811,6 +813,20 @@ const native_build_snippet =
     \\                }
     \\                return out.toOwnedSlice(alloc) catch @panic("sanitize app bundle name");
     \\            }
+    \\            fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    \\                const v = value orelse return null;
+    \\                return if (v.len == 0) null else v;
+    \\            }
+    \\            fn firstNonEmpty(a: ?[]const u8, b_: ?[]const u8) ?[]const u8 {
+    \\                return nonEmpty(a) orelse nonEmpty(b_);
+    \\            }
+    \\            fn zonMacosString(comptime zon: anytype, comptime field: []const u8) ?[]const u8 {
+    \\                const T = @TypeOf(zon);
+    \\                if (!@hasField(T, "macos")) return null;
+    \\                const MacT = @TypeOf(zon.macos);
+    \\                if (!@hasField(MacT, field)) return null;
+    \\                return @field(zon.macos, field);
+    \\            }
     \\        };
     \\        const pkg_component = NativePackage.safeBundleComponent(b.allocator, app_zon.display_name);
     \\        const pkg_name = b.fmt("{s}.app", .{pkg_component});
@@ -840,6 +856,48 @@ const native_build_snippet =
     \\        const package_step = b.step("package", "Package native app as a .app bundle");
     \\        package_step.dependOn(&pkg_bin.step);
     \\        package_step.dependOn(&pkg_plist.step);
+    \\
+    \\        const app_path = b.getInstallPath(.prefix, pkg_name);
+    \\        const signing_identity = NativePackage.firstNonEmpty(
+    \\            b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
+    \\            NativePackage.zonMacosString(app_zon, "signing_identity"),
+    \\        );
+    \\        const entitlements = NativePackage.firstNonEmpty(
+    \\            b.option([]const u8, "macos-entitlements", "macOS entitlements plist for package-sign"),
+    \\            NativePackage.zonMacosString(app_zon, "entitlements"),
+    \\        );
+    \\        const package_sign_step = b.step("package-sign", "Package and codesign native app");
+    \\        if (signing_identity) |identity| {
+    \\            const codesign = b.addSystemCommand(&.{ "codesign", "--deep", "--force", "--options", "runtime", "--timestamp", "--sign", identity });
+    \\            if (entitlements) |path| codesign.addArgs(&.{ "--entitlements", path });
+    \\            codesign.addArg(app_path);
+    \\            codesign.step.dependOn(package_step);
+    \\            package_sign_step.dependOn(&codesign.step);
+    \\        } else {
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity' >&2; exit 1" });
+    \\            fail.step.dependOn(package_step);
+    \\            package_sign_step.dependOn(&fail.step);
+    \\        }
+    \\
+    \\        const notarization_profile = NativePackage.firstNonEmpty(
+    \\            b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
+    \\            NativePackage.zonMacosString(app_zon, "notarization_profile"),
+    \\        );
+    \\        const package_notarize_step = b.step("package-notarize", "Codesign, notarize, and staple native app");
+    \\        if (notarization_profile) |profile| {
+    \\            const zip_path = b.fmt("zig-out/{s}.zip", .{pkg_name});
+    \\            const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
+    \\            zip.step.dependOn(package_sign_step);
+    \\            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", profile, "--wait" });
+    \\            submit.step.dependOn(&zip.step);
+    \\            const staple = b.addSystemCommand(&.{ "xcrun", "stapler", "staple", app_path });
+    \\            staple.step.dependOn(&submit.step);
+    \\            package_notarize_step.dependOn(&staple.step);
+    \\        } else {
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile' >&2; exit 1" });
+    \\            fail.step.dependOn(package_sign_step);
+    \\            package_notarize_step.dependOn(&fail.step);
+    \\        }
     \\    }
 ;
 
@@ -987,7 +1045,7 @@ fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
     print("mer: native binary built → zig-out/bin/mernative\n", .{});
 }
 
-fn cmdPackage(alloc: std.mem.Allocator) !void {
+fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
@@ -999,9 +1057,30 @@ fn cmdPackage(alloc: std.mem.Allocator) !void {
     const zig_exe = try resolveInPath(alloc, "zig");
     defer alloc.free(zig_exe);
 
-    print("mer: packaging native app...\n", .{});
+    var build_step: []const u8 = "package";
+    var build_opts: std.ArrayList([]const u8) = .empty;
+    defer build_opts.deinit(alloc);
+    for (extra_args) |arg| {
+        if (std.mem.eql(u8, arg, "--sign")) {
+            if (!std.mem.eql(u8, build_step, "package-notarize")) build_step = "package-sign";
+        } else if (std.mem.eql(u8, arg, "--notarize")) {
+            build_step = "package-notarize";
+        } else if (std.mem.startsWith(u8, arg, "-D")) {
+            try build_opts.append(alloc, arg);
+        } else {
+            print("mer: unknown package option '{s}'\n  usage: mer package [--sign|--notarize] [-Dmacos-signing-identity=...] [-Dmacos-notarization-profile=...]\n", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    try argv.appendSlice(alloc, &.{ zig_exe, "build", build_step, "-Doptimize=ReleaseSmall" });
+    try argv.appendSlice(alloc, build_opts.items);
+
+    print("mer: running zig build {s}...\n", .{build_step});
     var child = try std.process.spawn(runtime.io, .{
-        .argv = &.{ zig_exe, "build", "package", "-Doptimize=ReleaseSmall" },
+        .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     });
@@ -1016,10 +1095,22 @@ fn cmdPackage(alloc: std.mem.Allocator) !void {
         const bundle_component = try safeBundleComponent(alloc, display_name);
         defer alloc.free(bundle_component);
         print("mer: packaged → zig-out/{s}.app\n", .{bundle_component});
-        print("    open zig-out/{s}.app\n", .{bundle_component});
+        if (std.mem.eql(u8, build_step, "package-sign")) {
+            print("    codesign --verify --deep --strict zig-out/{s}.app\n", .{bundle_component});
+        } else if (std.mem.eql(u8, build_step, "package-notarize")) {
+            print("    spctl --assess --type execute --verbose zig-out/{s}.app\n", .{bundle_component});
+        } else {
+            print("    open zig-out/{s}.app\n", .{bundle_component});
+        }
     } else {
         print("mer: packaged → zig-out/<Display>.app\n", .{});
-        print("    open zig-out/<Display>.app\n", .{});
+        if (std.mem.eql(u8, build_step, "package-sign")) {
+            print("    codesign --verify --deep --strict zig-out/<Display>.app\n", .{});
+        } else if (std.mem.eql(u8, build_step, "package-notarize")) {
+            print("    spctl --assess --type execute --verbose zig-out/<Display>.app\n", .{});
+        } else {
+            print("    open zig-out/<Display>.app\n", .{});
+        }
     }
 }
 
@@ -1312,6 +1403,8 @@ fn printUsage() void {
     print("    mer native           launch a native window against the dev server\n", .{});
     print("    mer native build     build the native shell binary (prod)\n", .{});
     print("    mer package          bundle the native app as a .app (macOS)\n", .{});
+    print("    mer package --sign   package + codesign (Developer ID)\n", .{});
+    print("    mer package --notarize package + codesign + notarize + staple\n", .{});
     print("    mer update           update merjs to latest version\n", .{});
     print("    mer --version        print version\n", .{});
     print("\n  https://github.com/justrach/merjs\n\n", .{});

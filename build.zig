@@ -62,6 +62,23 @@ fn safeBundleName(b: *std.Build, display_name: []const u8) []const u8 {
     return b.fmt("{s}.app", .{component});
 }
 
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    const v = value orelse return null;
+    return if (v.len == 0) null else v;
+}
+
+fn firstNonEmpty(a: ?[]const u8, b_: ?[]const u8) ?[]const u8 {
+    return nonEmpty(a) orelse nonEmpty(b_);
+}
+
+fn zonMacosString(comptime zon: anytype, comptime field: []const u8) ?[]const u8 {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "macos")) return null;
+    const MacT = @TypeOf(zon.macos);
+    if (!@hasField(MacT, field)) return null;
+    return @field(zon.macos, field);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -533,5 +550,69 @@ pub fn build(b: *std.Build) void {
         const package_step = b.step("package", "Package the native app as a .app bundle (macOS)");
         package_step.dependOn(&pkg_bin.step);
         package_step.dependOn(&pkg_plist.step);
+
+        // `package-sign` — optional Developer ID signing. Unsigned local
+        // packages remain the default; this step is explicit like Tauri's
+        // macOS bundle signing path.
+        const app_path = b.getInstallPath(.prefix, pkg_name);
+        const signing_identity = firstNonEmpty(
+            b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
+            zonMacosString(app_zon, "signing_identity"),
+        );
+        const entitlements = firstNonEmpty(
+            b.option([]const u8, "macos-entitlements", "macOS entitlements plist for package-sign"),
+            zonMacosString(app_zon, "entitlements"),
+        );
+        const package_sign_step = b.step("package-sign", "Package and codesign the native .app bundle (macOS)");
+        if (signing_identity) |identity| {
+            const codesign = b.addSystemCommand(&.{
+                "codesign",
+                "--deep",
+                "--force",
+                "--options",
+                "runtime",
+                "--timestamp",
+                "--sign",
+                identity,
+            });
+            if (entitlements) |path| codesign.addArgs(&.{ "--entitlements", path });
+            codesign.addArg(app_path);
+            codesign.step.dependOn(package_step);
+            package_sign_step.dependOn(&codesign.step);
+        } else {
+            const fail = b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity in mer.app.zon' >&2; exit 1",
+            });
+            fail.step.dependOn(package_step);
+            package_sign_step.dependOn(&fail.step);
+        }
+
+        // `package-notarize` — sign, zip, submit, and staple. Credentials stay
+        // in the developer's keychain profile; merjs never stores passwords.
+        const notarization_profile = firstNonEmpty(
+            b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
+            zonMacosString(app_zon, "notarization_profile"),
+        );
+        const package_notarize_step = b.step("package-notarize", "Codesign, notarize, and staple the native .app bundle (macOS)");
+        if (notarization_profile) |profile| {
+            const zip_path = b.fmt("zig-out/{s}.zip", .{pkg_name});
+            const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
+            zip.step.dependOn(package_sign_step);
+            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", profile, "--wait" });
+            submit.step.dependOn(&zip.step);
+            const staple = b.addSystemCommand(&.{ "xcrun", "stapler", "staple", app_path });
+            staple.step.dependOn(&submit.step);
+            package_notarize_step.dependOn(&staple.step);
+        } else {
+            const fail = b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile in mer.app.zon' >&2; exit 1",
+            });
+            fail.step.dependOn(package_sign_step);
+            package_notarize_step.dependOn(&fail.step);
+        }
     }
 }

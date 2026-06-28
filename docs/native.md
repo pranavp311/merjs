@@ -27,7 +27,10 @@ Paste the printed snippet into `build.zig` (inside `pub fn build`), then:
 ```bash
 mer native         # dev: launch a native window against the hot-reloading server
 mer native build   # prod: build the native shell binary (ReleaseSmall)
-mer package        # bundle as a .app (macOS): zig-out/<Display>.app
+mer package        # unsigned local .app (macOS): zig-out/<Display>.app
+mer package --sign # package + codesign (Developer ID; requires signing config)
+mer package --sign -Dmacos-signing-identity="Developer ID Application: Example, Inc. (TEAMID)"
+mer package --notarize # package + codesign + notarytool + stapler
 ```
 
 `mer native` reuses the `mer dev` pipeline (codegen → serve) and attaches a
@@ -85,6 +88,30 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
     .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
         .navigation = .{ .allowed_origins = .{ "http://127.0.0.1", "mer://app" } },
+        .bridge = .{
+            // Explicit command allowlist, similar to Tauri capabilities.
+            .allowed_commands = .{ "mer.ping", "window.close" },
+            // Per-command origin bindings use "command|origin". Port may be
+            // omitted for the shell's ephemeral loopback origin.
+            .command_origins = .{ "window.close|http://127.0.0.1" },
+        },
+        .open = .{
+            .external_schemes = .{ "http", "https", "mailto" },
+            .path_roots = .{ "public" },
+        },
+    },
+    .macos = .{
+        // Optional Developer ID signing/notarization config.
+        // .signing_identity = "Developer ID Application: Example, Inc. (TEAMID)",
+        // .team_id = "TEAMID",
+        // .entitlements = "native/entitlements.plist",
+        // .notarization_profile = "merjs-notary",
+    },
+    .update = .{
+        // Planned: signed update manifests/artifacts. No updater runs in v0.2.5.
+        // .provider = "github-releases",
+        // .feed_url = "https://example.com/mer-native/update.json",
+        // .public_key = "ed25519:...",
     },
     .windows = .{
         .{ .label = "main", .title = "My App", .width = 1024, .height = 720 },
@@ -157,7 +184,80 @@ permissions plus global origins.
 - **Prod (`mer package`):** the SSR binary + WebView shell are built with
   `-Doptimize=ReleaseSmall`; hot reload is off; the result is a `.app` bundle
   whose `Info.plist` reflects `id` / `display_name` / `version` from the
-  manifest. Not code-signed — runs locally, not App Store distributable (yet).
+  manifest. Unsigned by default for fast local packaging.
+
+---
+
+## macOS code signing and notarization
+
+Unsigned packages remain the default for local development:
+
+```bash
+zig build package -Doptimize=ReleaseSmall
+mer package
+```
+
+For Developer ID distribution, set signing metadata in `mer.app.zon` or pass
+build options:
+
+```zig
+.macos = .{
+    .signing_identity = "Developer ID Application: Example, Inc. (TEAMID)",
+    .team_id = "TEAMID",
+    .entitlements = "native/entitlements.plist",
+    .notarization_profile = "merjs-notary",
+},
+```
+
+```bash
+zig build package-sign -Doptimize=ReleaseSmall \
+  -Dmacos-signing-identity="Developer ID Application: Example, Inc. (TEAMID)"
+
+codesign --verify --deep --strict zig-out/<Display>.app
+
+# After creating a notarytool keychain profile once:
+# xcrun notarytool store-credentials merjs-notary --apple-id ... --team-id ... --password ...
+zig build package-notarize -Doptimize=ReleaseSmall -Dmacos-notarization-profile=merjs-notary
+spctl --assess --type execute --verbose zig-out/<Display>.app
+```
+
+`package-sign` runs:
+
+```bash
+codesign --deep --force --options runtime --timestamp --sign <identity> [--entitlements <plist>] zig-out/<Display>.app
+```
+
+`package-notarize` signs, zips the app with `ditto --keepParent`, submits it via
+`xcrun notarytool submit --wait`, then staples the ticket with
+`xcrun stapler staple`. merjs does not store Apple credentials; use a keychain
+profile.
+
+---
+
+## Native security status
+
+Implemented in PR #100 plus hardening follow-up:
+
+- deny-by-default command registry;
+- 64 KB bridge payload cap;
+- embedded-NUL guard before dispatch;
+- strict global origin check from the `WKScriptMessage` frame;
+- explicit command allowlist via `security.bridge.allowed_commands`;
+- per-command origin bindings via `security.bridge.command_origins`;
+- `open.external` scheme allowlist (`http`, `https`, `mailto` by default);
+- optional `open.path` roots;
+- manifest-driven macOS signing/notarization hooks.
+
+Still deferred / not production-complete:
+
+- auto-updater runtime (manifest fields are placeholders only);
+- full Linux WebKitGTK and Windows WebView2 backends;
+- mature app/plugin command registry API;
+- UI prompts for every sensitive native API;
+- independent production security audit and cross-platform pen-test.
+
+See `SECURITY.md` for the project-wide vulnerability policy and native threat
+model checklist.
 
 ---
 
@@ -165,7 +265,8 @@ permissions plus global origins.
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned.
 - App-level custom bridge command registries and per-command manifest allowlists are deferred; PR #100 uses built-in commands, top-level `permissions`, and global allowed origins.
-- No code signing / notarization.
+- Code signing / notarization hooks exist for macOS, but release credentials,
+  notarized artifacts, and CI distribution are not configured by default.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.
 - `server.mode = "static"` (fully static export over `mer://app`) is a stretch
   goal; this target runs the embedded loopback server in both dev and prod.

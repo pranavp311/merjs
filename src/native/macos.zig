@@ -243,6 +243,8 @@ fn merInvokeIMP(self: Id, _cmd: Sel, ucc: Id, message: Id) callconv(.c) void {
         return;
     }
 
+    ctx.current_origin = origin;
+    defer ctx.current_origin = null;
     const js = bridge.dispatch(ctx, payload) catch return;
     defer ctx.allocator.free(js);
     evalJs(ctx, wv, js);

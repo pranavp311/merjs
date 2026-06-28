@@ -30,6 +30,15 @@ pub const Ctx = struct {
     allocator: std.mem.Allocator,
     permissions: []const []const u8,
     allowed_origins: []const []const u8 = &.{},
+    /// Optional explicit command allowlist. Empty preserves the older
+    /// permission-only behavior; generated manifests fill this in for least privilege.
+    allowed_commands: []const []const u8 = &.{},
+    /// Optional per-command origin bindings encoded as "command|origin".
+    command_origins: []const []const u8 = &.{},
+    /// Origin of the current bridge call, set by the platform backend.
+    current_origin: ?[]const u8 = null,
+    external_url_schemes: []const []const u8 = &.{ "http", "https", "mailto" },
+    open_path_roots: []const []const u8 = &.{},
 };
 
 /// A JSON value returned by a bridge handler (an owned string of JSON).
@@ -43,6 +52,10 @@ pub const BridgeError = error{
     PayloadTooLarge,
     ParseError,
     HandlerError,
+    CommandDenied,
+    UrlDenied,
+    PathDenied,
+    InvalidArgs,
     OutOfMemory,
 };
 
@@ -144,17 +157,20 @@ fn clipboardWrite(_: *Ctx, args: std.json.Value) HandlerResult {
     return .{ .ok = "null" };
 }
 
-fn openExternal(_: *Ctx, args: std.json.Value) HandlerResult {
+fn openExternal(ctx: *Ctx, args: std.json.Value) HandlerResult {
+    const url = argString(args, "url") orelse if (args == .string) args.string else return .{ .err = error.InvalidArgs };
+    if (!isAllowedExternalUrl(ctx, url)) return .{ .err = error.UrlDenied };
     if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
-    const url = argString(args, "url") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
     macos_commands.openUrl(url) catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
-fn openPath(_: *Ctx, args: std.json.Value) HandlerResult {
+fn openPath(ctx: *Ctx, args: std.json.Value) HandlerResult {
+    const path = argString(args, "path") orelse if (args == .string) args.string else return .{ .err = error.InvalidArgs };
+    const resolved_path = resolveAllowedPath(ctx, path) orelse return .{ .err = error.PathDenied };
+    defer ctx.allocator.free(resolved_path);
     if (builtin.os.tag != .macos) return .{ .err = error.HandlerError };
-    const path = argString(args, "path") orelse if (args == .string) args.string else return .{ .err = error.HandlerError };
-    macos_commands.openPath(path) catch return .{ .err = error.HandlerError };
+    macos_commands.openPath(resolved_path) catch return .{ .err = error.HandlerError };
     return .{ .ok = "null" };
 }
 
@@ -198,6 +214,85 @@ pub fn hasPermission(ctx: *Ctx, perm: []const u8) bool {
         if (std.mem.eql(u8, p, perm)) return true;
     }
     return false;
+}
+
+pub fn isCommandAllowed(ctx: *Ctx, name: []const u8) bool {
+    if (ctx.allowed_commands.len == 0) return true;
+    for (ctx.allowed_commands) |allowed| {
+        if (std.mem.eql(u8, allowed, name)) return true;
+    }
+    return false;
+}
+
+pub fn isCommandOriginAllowed(ctx: *Ctx, name: []const u8) bool {
+    const origin = ctx.current_origin orelse return ctx.command_origins.len == 0;
+    const actual = parseOrigin(origin) orelse return false;
+    var saw_rule_for_command = false;
+    for (ctx.command_origins) |entry| {
+        const sep = std.mem.indexOfScalar(u8, entry, '|') orelse continue;
+        const cmd_name = entry[0..sep];
+        if (!std.mem.eql(u8, cmd_name, name)) continue;
+        saw_rule_for_command = true;
+        const allowed = parseOrigin(entry[sep + 1 ..]) orelse continue;
+        if (!std.ascii.eqlIgnoreCase(actual.scheme, allowed.scheme)) continue;
+        if (!std.ascii.eqlIgnoreCase(actual.host, allowed.host)) continue;
+        // Command-origin entries may omit the port for ephemeral loopback apps.
+        // The platform backend has already enforced the strict global origin,
+        // so this does not expand bridge access beyond the loaded app origin.
+        if (allowed.port) |allowed_port| {
+            if (actual.port == null or !std.mem.eql(u8, actual.port.?, allowed_port)) continue;
+        }
+        return true;
+    }
+    return !saw_rule_for_command;
+}
+
+fn isAllowedExternalUrl(ctx: *Ctx, url: []const u8) bool {
+    const scheme_end = std.mem.indexOfScalar(u8, url, ':') orelse return false;
+    const scheme = url[0..scheme_end];
+    if (scheme.len == 0) return false;
+    for (scheme) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.')) return false;
+    }
+    for (ctx.external_url_schemes) |allowed| {
+        if (std.ascii.eqlIgnoreCase(scheme, allowed)) return true;
+    }
+    return false;
+}
+
+fn realPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var buf: [std.c.PATH_MAX]u8 = undefined;
+    const resolved = std.c.realpath(path_z.ptr, &buf) orelse return error.RealPathFailed;
+    return try alloc.dupe(u8, std.mem.span(resolved));
+}
+
+fn pathWithinRoot(path: []const u8, root: []const u8) bool {
+    if (std.mem.eql(u8, path, root)) return true;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return root.len > 0 and (root[root.len - 1] == '/' or (path.len > root.len and path[root.len] == '/'));
+}
+
+fn resolveAllowedPath(ctx: *Ctx, path: []const u8) ?[]u8 {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+
+    const resolved_path = if (ctx.open_path_roots.len == 0)
+        ctx.allocator.dupe(u8, path) catch return null
+    else
+        realPathAlloc(ctx.allocator, path) catch return null;
+    errdefer ctx.allocator.free(resolved_path);
+
+    if (ctx.open_path_roots.len == 0) return resolved_path;
+
+    for (ctx.open_path_roots) |root| {
+        if (root.len == 0 or std.mem.indexOfScalar(u8, root, 0) != null) continue;
+        const resolved_root = realPathAlloc(ctx.allocator, root) catch continue;
+        defer ctx.allocator.free(resolved_root);
+        if (pathWithinRoot(resolved_path, resolved_root)) return resolved_path;
+    }
+    ctx.allocator.free(resolved_path);
+    return null;
 }
 
 const ParsedOrigin = struct {
@@ -284,6 +379,12 @@ pub fn dispatch(ctx: *Ctx, payload: []const u8) BridgeError![]u8 {
 
     for (registry) |cmd| {
         if (std.mem.eql(u8, cmd.name, env.cmd)) {
+            if (!isCommandAllowed(ctx, cmd.name)) {
+                return resolveError(alloc, env.id, "CommandDenied");
+            }
+            if (!isCommandOriginAllowed(ctx, cmd.name)) {
+                return resolveError(alloc, env.id, "OriginNotAllowed");
+            }
             if (!hasPermission(ctx, cmd.permission)) {
                 return resolveStr(alloc, env.id, false, "\"PermissionDenied\"");
             }
@@ -410,6 +511,60 @@ test "dispatch: clipboard read owned result is freeable" {
 test "hasPermission: empty perm always allowed" {
     var ctx = newCtx(testing.allocator, &.{});
     try testing.expect(hasPermission(&ctx, ""));
+}
+
+test "dispatch: explicit command allowlist denies unlisted commands" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{"window"});
+    ctx.allowed_commands = &.{"mer.ping"};
+    const js = try dispatch(&ctx, "{\"cmd\":\"window.close\",\"args\":null,\"id\":11}");
+    try testing.expectEqualStrings("window.mer._resolve(11,false,\"CommandDenied\");", js);
+}
+
+test "dispatch: per-command origin bindings deny wrong origins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{});
+    ctx.allowed_commands = &.{"mer.ping"};
+    ctx.command_origins = &.{"mer.ping|http://127.0.0.1:3000"};
+    ctx.current_origin = "http://evil.test";
+    const js = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":12}");
+    try testing.expectEqualStrings("window.mer._resolve(12,false,\"OriginNotAllowed\");", js);
+}
+
+test "dispatch: open.external rejects disallowed URL schemes before native open" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{"open"});
+    ctx.allowed_commands = &.{"open.external"};
+    const js = try dispatch(&ctx, "{\"cmd\":\"open.external\",\"args\":{\"url\":\"javascript:alert(1)\"},\"id\":13}");
+    try testing.expectEqualStrings("window.mer._resolve(13,false,\"UrlDenied\");", js);
+}
+
+test "dispatch: open.path rejects paths outside configured roots before native open" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{"open"});
+    ctx.allowed_commands = &.{"open.path"};
+    ctx.open_path_roots = &.{"/safe/root"};
+    const js = try dispatch(&ctx, "{\"cmd\":\"open.path\",\"args\":{\"path\":\"/safe/root-evil/file\"},\"id\":14}");
+    try testing.expectEqualStrings("window.mer._resolve(14,false,\"PathDenied\");", js);
+}
+
+test "dispatch: open.path rejects parent traversal outside configured roots" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{"open"});
+    ctx.allowed_commands = &.{"open.path"};
+    ctx.open_path_roots = &.{"public"};
+    const js = try dispatch(&ctx, "{\"cmd\":\"open.path\",\"args\":{\"path\":\"public/../build.zig\"},\"id\":15}");
+    try testing.expectEqualStrings("window.mer._resolve(15,false,\"PathDenied\");", js);
 }
 
 test "isOriginAllowed: matches scheme host and port, not string prefixes" {

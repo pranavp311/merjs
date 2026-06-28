@@ -16,8 +16,40 @@ pub const WindowConfig = struct {
     height: u32 = 720,
 };
 
+pub const BridgeSecurityConfig = struct {
+    /// Optional command allowlist. Empty means "all built-ins allowed by permission".
+    /// Generated manifests set this explicitly for Tauri-style least privilege.
+    allowed_commands: []const []const u8 = &.{},
+    /// Optional per-command origin bindings, encoded as "command|origin" strings.
+    /// Example: "clipboard.read|http://127.0.0.1".
+    command_origins: []const []const u8 = &.{},
+};
+
+pub const OpenSecurityConfig = struct {
+    /// URL schemes that `open.external` may hand to the OS.
+    external_schemes: []const []const u8 = &.{ "http", "https", "mailto" },
+    /// Optional path roots for `open.path`. Empty preserves legacy behavior;
+    /// generated manifests set explicit roots for production apps.
+    path_roots: []const []const u8 = &.{},
+};
+
 pub const SecurityConfig = struct {
     allowed_origins: []const []const u8 = &.{ "http://127.0.0.1", "http://localhost" },
+    bridge: BridgeSecurityConfig = .{},
+    open: OpenSecurityConfig = .{},
+};
+
+pub const MacOSConfig = struct {
+    signing_identity: ?[]const u8 = null,
+    team_id: ?[]const u8 = null,
+    entitlements: ?[]const u8 = null,
+    notarization_profile: ?[]const u8 = null,
+};
+
+pub const UpdateConfig = struct {
+    provider: ?[]const u8 = null,
+    feed_url: ?[]const u8 = null,
+    public_key: ?[]const u8 = null,
 };
 
 /// Resolved manifest. Built comptime from the imported .zon struct.
@@ -39,6 +71,8 @@ pub const Manifest = struct {
     permissions: []const []const u8,
     capabilities: []const []const u8,
     security: SecurityConfig = .{},
+    macos: MacOSConfig = .{},
+    update: UpdateConfig = .{},
 };
 
 /// Extract a `Manifest` from an imported .zon struct, applying defaults for
@@ -71,13 +105,45 @@ pub fn fromZon(comptime zon: anytype) Manifest {
 
     const security: SecurityConfig = if (@hasField(T, "security")) blk: {
         const SecurityT = @TypeOf(zon.security);
-        if (@hasField(SecurityT, "navigation")) {
+        const allowed_origins = if (@hasField(SecurityT, "navigation")) nav_blk: {
             const NavigationT = @TypeOf(zon.security.navigation);
-            if (@hasField(NavigationT, "allowed_origins")) {
-                break :blk .{ .allowed_origins = &zon.security.navigation.allowed_origins };
-            }
-        }
-        break :blk .{};
+            if (@hasField(NavigationT, "allowed_origins")) break :nav_blk &zon.security.navigation.allowed_origins;
+            break :nav_blk (SecurityConfig{}).allowed_origins;
+        } else (SecurityConfig{}).allowed_origins;
+        const bridge = if (@hasField(SecurityT, "bridge")) bridge_blk: {
+            const BridgeT = @TypeOf(zon.security.bridge);
+            break :bridge_blk BridgeSecurityConfig{
+                .allowed_commands = if (@hasField(BridgeT, "allowed_commands")) &zon.security.bridge.allowed_commands else &.{},
+                .command_origins = if (@hasField(BridgeT, "command_origins")) &zon.security.bridge.command_origins else &.{},
+            };
+        } else BridgeSecurityConfig{};
+        const open = if (@hasField(SecurityT, "open")) open_blk: {
+            const OpenT = @TypeOf(zon.security.open);
+            break :open_blk OpenSecurityConfig{
+                .external_schemes = if (@hasField(OpenT, "external_schemes")) &zon.security.open.external_schemes else (OpenSecurityConfig{}).external_schemes,
+                .path_roots = if (@hasField(OpenT, "path_roots")) &zon.security.open.path_roots else &.{},
+            };
+        } else OpenSecurityConfig{};
+        break :blk .{ .allowed_origins = allowed_origins, .bridge = bridge, .open = open };
+    } else .{};
+
+    const macos: MacOSConfig = if (@hasField(T, "macos")) blk: {
+        const MacT = @TypeOf(zon.macos);
+        break :blk .{
+            .signing_identity = if (@hasField(MacT, "signing_identity")) zon.macos.signing_identity else null,
+            .team_id = if (@hasField(MacT, "team_id")) zon.macos.team_id else null,
+            .entitlements = if (@hasField(MacT, "entitlements")) zon.macos.entitlements else null,
+            .notarization_profile = if (@hasField(MacT, "notarization_profile")) zon.macos.notarization_profile else null,
+        };
+    } else .{};
+
+    const update: UpdateConfig = if (@hasField(T, "update")) blk: {
+        const UpdateT = @TypeOf(zon.update);
+        break :blk .{
+            .provider = if (@hasField(UpdateT, "provider")) zon.update.provider else null,
+            .feed_url = if (@hasField(UpdateT, "feed_url")) zon.update.feed_url else null,
+            .public_key = if (@hasField(UpdateT, "public_key")) zon.update.public_key else null,
+        };
     } else .{};
 
     return .{
@@ -96,6 +162,8 @@ pub fn fromZon(comptime zon: anytype) Manifest {
         .permissions = perms,
         .capabilities = caps,
         .security = security,
+        .macos = macos,
+        .update = update,
     };
 }
 
@@ -179,6 +247,49 @@ test "fromZon applies optional server watch_dir" {
     const parsed = fromZon(zon);
     try std.testing.expectEqualStrings("examples/site/app", parsed.watch_dir);
     try std.testing.expect(parsed.dev);
+}
+
+test "fromZon parses native security hardening blocks" {
+    const zon = .{
+        .id = "com.example.test",
+        .name = "test",
+        .display_name = "Test",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .security = .{
+            .navigation = .{ .allowed_origins = .{ "http://127.0.0.1" } },
+            .bridge = .{
+                .allowed_commands = .{ "mer.ping", "window.close" },
+                .command_origins = .{ "window.close|http://127.0.0.1" },
+            },
+            .open = .{
+                .external_schemes = .{ "https" },
+                .path_roots = .{ "/tmp/test" },
+            },
+        },
+        .macos = .{
+            .signing_identity = "Developer ID Application: Example (TEAMID)",
+            .team_id = "TEAMID",
+            .entitlements = "native/entitlements.plist",
+            .notarization_profile = "merjs-notary",
+        },
+        .update = .{
+            .provider = "github-releases",
+            .feed_url = "https://example.com/update.json",
+            .public_key = "ed25519:example",
+        },
+        .windows = .{
+            .{ .title = "Test" },
+        },
+    };
+    const parsed = fromZon(zon);
+    try std.testing.expectEqualStrings("window.close", parsed.security.bridge.allowed_commands[1]);
+    try std.testing.expectEqualStrings("window.close|http://127.0.0.1", parsed.security.bridge.command_origins[0]);
+    try std.testing.expectEqualStrings("https", parsed.security.open.external_schemes[0]);
+    try std.testing.expectEqualStrings("/tmp/test", parsed.security.open.path_roots[0]);
+    try std.testing.expectEqualStrings("Developer ID Application: Example (TEAMID)", parsed.macos.signing_identity.?);
+    try std.testing.expectEqualStrings("merjs-notary", parsed.macos.notarization_profile.?);
+    try std.testing.expectEqualStrings("github-releases", parsed.update.provider.?);
 }
 
 test "fromZon defaults omitted window fields" {
