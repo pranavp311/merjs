@@ -436,7 +436,7 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = .ReleaseSmall,
     });
-    worker_named.addImport("mer", mer_mod);
+    worker_named.addImport("mer", mer_worker_mod);
     const worker_mod = b.createModule(.{
         .root_source_file = b.path("src/worker.zig"),
         .target = wasm_target,
