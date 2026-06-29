@@ -950,7 +950,13 @@ const native_build_snippet =
     \\            fn isEd25519TokenLiteral(comptime value: []const u8) bool {
     \\                const prefix = "ed25519:";
     \\                if (!std.mem.startsWith(u8, value, prefix) or value.len == prefix.len) return false;
-    \\                for (value[prefix.len..]) |c| if (c <= 0x20 or c == 0x7f or c == '\\') return false;
+    \\                const encoded = value[prefix.len..];
+    \\                for (encoded) |c| if (c <= 0x20 or c == 0x7f or c == '\\') return false;
+    \\                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return false;
+    \\                if (decoded_len != 32) return false;
+    \\                var decoded: [32]u8 = undefined;
+    \\                _ = std.base64.standard.Decoder.decode(&decoded, encoded) catch return false;
+    \\                _ = std.crypto.sign.Ed25519.PublicKey.fromBytes(decoded) catch return false;
     \\                return true;
     \\            }
     \\            fn zonUpdateProviderValid(comptime zon: anytype) bool {
@@ -1036,7 +1042,7 @@ const native_build_snippet =
     \\                if (!zonHasOpenArray(zon, "path_roots")) msg = msg ++ "missing non-empty .security.open.path_roots\\n";
     \\                if (nonEmpty(zonUpdateString(zon, "provider")) == null) msg = msg ++ "missing .update.provider\\n" else if (!zonUpdateProviderValid(zon)) msg = msg ++ "invalid .update.provider (expected github-releases or custom-http)\\n";
     \\                if (nonEmpty(zonUpdateString(zon, "feed_url")) == null) msg = msg ++ "missing .update.feed_url\\n" else if (!zonUpdateFeedUrlValid(zon)) msg = msg ++ "invalid .update.feed_url (expected strict https URL)\\n";
-    \\                if (nonEmpty(zonUpdateString(zon, "public_key")) == null) msg = msg ++ "missing .update.public_key\\n" else if (!zonUpdatePublicKeyValid(zon)) msg = msg ++ "invalid .update.public_key (expected ed25519:<key>)\\n";
+    \\                if (nonEmpty(zonUpdateString(zon, "public_key")) == null) msg = msg ++ "missing .update.public_key\\n" else if (!zonUpdatePublicKeyValid(zon)) msg = msg ++ "invalid .update.public_key (expected ed25519:<base64 raw 32-byte public key>)\\n";
     \\                return msg;
     \\            }
     \\        };

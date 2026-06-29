@@ -52,13 +52,12 @@ Out of scope:
 - **Per-command origins:** `security.bridge.command_origins` can bind commands to origins with `"command|origin"` entries; when configured, commands without a matching origin rule are denied.
 - **Safer open commands:** `open.external` rejects disallowed schemes (default: `http`, `https`, `mailto`); `open.path` fails closed unless explicit path roots are configured.
 - **macOS signing hooks:** `zig build package-sign` / `mer package --sign` run hardened-runtime `codesign`; `package-notarize` / `mer package --notarize` run `notarytool` and `stapler`.
-- **Update feed structure validation:** `src/native/update.zig` validates feed/config shape, HTTPS URLs, SHA-256 hashes, Ed25519-tagged keys/signatures, platform uniqueness, and rollback-window metadata before any future updater runtime consumes them.
+- **Signed update checks:** `src/native/update.zig` verifies HTTPS feed/config shape, Ed25519 signatures over canonical update metadata, SHA-256 artifact hashes, platform uniqueness, signed metadata_version anti-replay state, and rollback-window metadata before reporting an update.
 
 ### Not yet done / do not claim production-complete
 
-- **Auto-updater runtime:** update config/feed structure is validated, but no updater downloads or installs artifacts yet.
-- **Cryptographic update verification:** Ed25519-tagged keys/signatures are required structurally, but signature verification over a canonical payload is not implemented.
-- **Rollback prevention:** version window metadata is validated structurally; durable installed-version rollback protection is planned with the updater runtime.
+- **Auto-updater install/runtime:** signed update checks and artifact byte verification are implemented, but merjs does not automatically replace the running app yet.
+- **Durable rollback prevention:** version window metadata is validated; persistent installed-version rollback protection is planned with the installer runtime.
 - **Full Linux support:** WebKitGTK backend and package integration are planned but not implemented; see `docs/native-platforms.md`.
 - **Full Windows support:** WebView2 backend and package integration are planned but not implemented; see `docs/native-platforms.md`.
 - **Dynamic plugin system:** static app command registries are implemented; loading commands/plugins from disk and plugin capability manifests are not implemented.

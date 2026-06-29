@@ -127,11 +127,11 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
         // .notarization_profile = "merjs-notary",
     },
     .update = .{
-        // Structural update feed validation is implemented. Runtime download,
-        // cryptographic signature verification, and install are still deferred.
+        // Signed update feed checks and artifact hash verification are implemented.
+        // Automatic install/self-replacement remains deferred.
         // .provider = "github-releases", // or "custom-http"
         // .feed_url = "https://example.com/mer-native/update.json",
-        // .public_key = "ed25519:...",
+        // .public_key = "ed25519:base64-raw-32-byte-public-key",
     },
     .windows = .{
         .{ .label = "main", .title = "My App", .width = 1024, .height = 720 },
@@ -311,13 +311,14 @@ Implemented in PR #100 plus hardening follow-up:
 - `open.external` scheme allowlist (`http`, `https`, `mailto` by default);
 - fail-closed `open.path` roots (no roots means `PathDenied`);
 - manifest-driven macOS signing/notarization hooks;
-- structural update feed/config validation (`src/native/update.zig`) for HTTPS
-  feeds, Ed25519-tagged keys/signatures, SHA-256 artifact hashes, platform
-  uniqueness, and rollback-window metadata.
+- signed update feed/config checks (`src/native/update.zig`) for HTTPS feeds,
+  Ed25519 signatures over canonical metadata, SHA-256 artifact hashes, platform
+  uniqueness, version comparisons, signed metadata_version anti-replay state, and rollback-window metadata;
+- artifact byte verification against signed size/SHA-256 metadata.
 
 Still deferred / not production-complete:
 
-- auto-updater runtime download/install and cryptographic signature verification;
+- automatic updater install/self-replacement and durable rollback state;
 - full Linux WebKitGTK and Windows WebView2 backends;
 - dynamic plugin loading / third-party command bundles;
 - UI prompts for every sensitive native API;
@@ -333,7 +334,7 @@ release gate and signing/notarization flow.
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned and documented in `docs/native-platforms.md`.
 - Built-in command allowlists, per-command origins, and static app-level custom bridge command registries are implemented. Dynamic plugin loading is deferred.
-- Structural update feed/config validation is implemented. Runtime download/install and cryptographic signature verification are deferred.
+- Signed update feed/config checks and artifact hash verification are implemented. Runtime install/self-replacement is deferred.
 - Code signing / notarization hooks exist for macOS, but release credentials,
   notarized artifacts, and CI distribution are not configured by default.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.

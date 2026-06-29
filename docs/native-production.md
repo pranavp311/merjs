@@ -66,19 +66,20 @@ The production gate requires update metadata so releases do not ship without an 
 .update = .{
     .provider = "github-releases", // or "custom-http"
     .feed_url = "https://example.com/my-app/update.json",
-    .public_key = "ed25519:base64-public-key",
+    .public_key = "ed25519:base64-raw-32-byte-public-key",
 },
 ```
 
-`src/native/update.zig` now validates the **structure** of update config and feed manifests. It requires strict HTTPS feed/artifact URLs, `ed25519:`-tagged public keys and artifact signatures, lowercase SHA-256 artifact hashes, positive artifact sizes, unique `(os, arch)` platform entries, and numeric `N[.N[.N]]` version metadata.
+`src/native/update.zig` now implements signed update checks and artifact verification helpers. It requires strict HTTPS feed/artifact URLs, a base64 raw 32-byte Ed25519 public key, Ed25519 signatures over canonical metadata, lowercase SHA-256 artifact hashes, positive artifact sizes, unique `(os, arch)` platform entries, signed monotonic `metadata_version`, and numeric `N[.N[.N]]` version metadata.
 
-Current status: this is not an automatic updater yet. merjs does **not** download, install, or cryptographically verify update artifacts in this PR. Do not claim automatic updates until Ed25519 verification, installer/rollback behavior, and updater UX are implemented and audited.
+Current status: this is not an automatic installer yet. merjs can verify signed update metadata and artifact bytes, including stale-feed rejection when the caller persists and supplies the highest accepted `metadata_version` returned by `no_update` or `update_available` results (equal or lower feed metadata is rejected as stale), but it does **not** replace the running app or perform platform-specific install/rollback in this PR. Do not claim automatic updates until installer/rollback behavior and updater UX are implemented and audited.
 
 Example feed contract:
 
 ```json
 {
   "schema_version": 1,
+  "metadata_version": 42,
   "app_id": "com.example.my-app",
   "version": "1.2.3",
   "min_supported_version": "1.0.0",
@@ -89,7 +90,7 @@ Example feed contract:
     "url": "https://example.com/my-app/MyApp-1.2.3-aarch64.zip",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "size": 12345678,
-    "signature": "ed25519:base64-signature"
+    "signature": "ed25519:base64-raw-64-byte-signature"
   }]
 }
 ```
@@ -114,7 +115,7 @@ This fails if the manifest is missing or misconfigures:
 - non-empty `.security.open.path_roots`
 - `.update.provider` (`github-releases` or `custom-http`)
 - `.update.feed_url` (strict `https://` URL)
-- `.update.public_key` (`ed25519:<key>`)
+- `.update.public_key` (`ed25519:<base64 raw 32-byte public key>`)
 
 ## 5. Build, sign, notarize, staple
 
