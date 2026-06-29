@@ -9,3 +9,4 @@ pub const Manifest = @import("manifest.zig");
 pub const macos = @import("macos.zig");
 pub const bridge = @import("bridge.zig");
 pub const commands = @import("commands.zig");
+pub const update = @import("update.zig");

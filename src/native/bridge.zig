@@ -38,6 +38,9 @@ pub const Ctx = struct {
     command_origins: []const []const u8 = &.{},
     /// Origin of the current bridge call, set by the platform backend.
     current_origin: ?[]const u8 = null,
+    /// Optional app-provided static command registry. Dynamic/plugin loading is
+    /// intentionally unsupported; these entries are validated before dispatch.
+    extra_commands: []const Command = &.{},
     external_url_schemes: []const []const u8 = &.{ "http", "https", "mailto" },
     open_path_roots: []const []const u8 = &.{},
 };
@@ -57,6 +60,7 @@ pub const BridgeError = error{
     UrlDenied,
     PathDenied,
     InvalidArgs,
+    InvalidRegistry,
     OutOfMemory,
 };
 
@@ -80,9 +84,10 @@ pub const Command = struct {
     handler: HandlerFn,
 };
 
-/// The comptime command registry. Add commands here; matched by name in
-/// dispatch(). Mirrors the static route table in src/dispatch.zig.
-pub const registry = [_]Command{
+/// Built-in commands shipped by merjs. Apps can pass additional static commands
+/// to `dispatchWithRegistry`; dynamic/plugin loading is intentionally not part
+/// of the bridge surface.
+pub const builtin_registry = [_]Command{
     .{ .name = "mer.ping", .permission = "", .handler = ping },
     .{ .name = "mer.echo", .permission = "", .handler = echo },
     .{ .name = "dialog.openFile", .permission = "dialog", .handler = dialogOpenFile },
@@ -95,6 +100,69 @@ pub const registry = [_]Command{
     .{ .name = "window.setTitle", .permission = "window", .handler = windowSetTitle },
     .{ .name = "window.close", .permission = "window", .handler = windowClose },
 };
+
+/// Back-compat alias for callers that inspect the built-in registry.
+pub const registry = builtin_registry;
+
+const reserved_command_prefixes = [_][]const u8{ "mer.", "dialog.", "clipboard.", "open.", "window." };
+
+fn isCommandNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_';
+}
+
+pub fn isValidCommandName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 96) return false;
+    if (name[0] == '.' or name[name.len - 1] == '.') return false;
+    var saw_dot = false;
+    var prev_dot = false;
+    for (name) |c| {
+        if (!isCommandNameChar(c)) return false;
+        if (c == '.') {
+            if (prev_dot) return false;
+            saw_dot = true;
+            prev_dot = true;
+        } else {
+            prev_dot = false;
+        }
+    }
+    return saw_dot;
+}
+
+pub fn isValidPermissionName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_' or c == ':')) return false;
+    }
+    return true;
+}
+
+fn isReservedCommandName(name: []const u8) bool {
+    for (reserved_command_prefixes) |prefix| {
+        if (name.len >= prefix.len and std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix)) return true;
+    }
+    return false;
+}
+
+fn builtinCommandExists(name: []const u8) bool {
+    for (builtin_registry) |cmd| {
+        if (std.mem.eql(u8, cmd.name, name)) return true;
+    }
+    return false;
+}
+
+/// Validate app-provided static bridge commands. Custom commands must be in an
+/// app namespace (for example `app.export`) and must declare an explicit,
+/// non-empty permission; only benign built-ins may use empty permissions.
+pub fn validateCommandRegistry(extra_commands: []const Command) BridgeError!void {
+    for (extra_commands, 0..) |cmd, i| {
+        if (!isValidCommandName(cmd.name)) return error.InvalidRegistry;
+        if (isReservedCommandName(cmd.name) or builtinCommandExists(cmd.name)) return error.InvalidRegistry;
+        if (!isValidPermissionName(cmd.permission)) return error.InvalidRegistry;
+        for (extra_commands[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, cmd.name, other.name)) return error.InvalidRegistry;
+        }
+    }
+}
 
 fn ping(_: *Ctx, _: std.json.Value) HandlerResult {
     return .{ .ok = "{\"pong\":true}" };
@@ -283,14 +351,12 @@ fn pathWithinRoot(path: []const u8, root: []const u8) bool {
 
 fn resolveAllowedPath(ctx: *Ctx, path: []const u8) ?[]u8 {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    // `open.path` is a broad native capability; require explicit roots rather
+    // than treating an omitted roots list as unrestricted filesystem access.
+    if (ctx.open_path_roots.len == 0) return null;
 
-    const resolved_path = if (ctx.open_path_roots.len == 0)
-        ctx.allocator.dupe(u8, path) catch return null
-    else
-        realPathAlloc(ctx.allocator, path) catch return null;
+    const resolved_path = realPathAlloc(ctx.allocator, path) catch return null;
     errdefer ctx.allocator.free(resolved_path);
-
-    if (ctx.open_path_roots.len == 0) return resolved_path;
 
     for (ctx.open_path_roots) |root| {
         if (root.len == 0 or std.mem.indexOfScalar(u8, root, 0) != null) continue;
@@ -369,9 +435,35 @@ const Envelope = struct {
     id: i64 = 0,
 };
 
-/// Dispatch an inbound payload. Returns an owned JS string of the form
-/// `window.mer._resolve(<id>,<ok>,<json>);` for the IMP to evaluate.
-pub fn dispatch(ctx: *Ctx, payload: []const u8) BridgeError![]u8 {
+fn dispatchCommand(ctx: *Ctx, env: Envelope, cmd: Command, require_explicit_allowlist: bool) BridgeError![]u8 {
+    const alloc = ctx.allocator;
+    if (require_explicit_allowlist and ctx.allowed_commands.len == 0) {
+        return resolveError(alloc, env.id, "CommandDenied");
+    }
+    if (!isCommandAllowed(ctx, cmd.name)) {
+        return resolveError(alloc, env.id, "CommandDenied");
+    }
+    if (!isCommandOriginAllowed(ctx, cmd.name)) {
+        return resolveError(alloc, env.id, "OriginNotAllowed");
+    }
+    if (!hasPermission(ctx, cmd.permission)) {
+        return resolveStr(alloc, env.id, false, "\"PermissionDenied\"");
+    }
+    const res = cmd.handler(ctx, env.args);
+    switch (res) {
+        .ok => |json| return resolveStr(alloc, env.id, true, json),
+        .ok_owned => |json| {
+            defer alloc.free(json);
+            return resolveStr(alloc, env.id, true, json);
+        },
+        .err => |e| return resolveError(alloc, env.id, @errorName(e)),
+    }
+}
+
+/// Dispatch using built-ins plus an app-provided static command registry. The
+/// extra registry is validated after envelope parse but before any handler runs,
+/// so malformed custom command tables fail closed and still resolve the caller id.
+pub fn dispatchWithRegistry(ctx: *Ctx, payload: []const u8, extra_commands: []const Command) BridgeError![]u8 {
     const alloc = ctx.allocator;
 
     if (payload.len > max_payload_bytes) {
@@ -384,29 +476,28 @@ pub fn dispatch(ctx: *Ctx, payload: []const u8) BridgeError![]u8 {
     defer parsed.deinit();
     const env = parsed.value;
 
-    for (registry) |cmd| {
+    validateCommandRegistry(extra_commands) catch {
+        return resolveError(alloc, env.id, "InvalidRegistry");
+    };
+
+    for (builtin_registry) |cmd| {
         if (std.mem.eql(u8, cmd.name, env.cmd)) {
-            if (!isCommandAllowed(ctx, cmd.name)) {
-                return resolveError(alloc, env.id, "CommandDenied");
-            }
-            if (!isCommandOriginAllowed(ctx, cmd.name)) {
-                return resolveError(alloc, env.id, "OriginNotAllowed");
-            }
-            if (!hasPermission(ctx, cmd.permission)) {
-                return resolveStr(alloc, env.id, false, "\"PermissionDenied\"");
-            }
-            const res = cmd.handler(ctx, env.args);
-            switch (res) {
-                .ok => |json| return resolveStr(alloc, env.id, true, json),
-                .ok_owned => |json| {
-                    defer alloc.free(json);
-                    return resolveStr(alloc, env.id, true, json);
-                },
-                .err => |e| return resolveError(alloc, env.id, @errorName(e)),
-            }
+            return dispatchCommand(ctx, env, cmd, false);
+        }
+    }
+
+    for (extra_commands) |cmd| {
+        if (std.mem.eql(u8, cmd.name, env.cmd)) {
+            return dispatchCommand(ctx, env, cmd, true);
         }
     }
     return resolveError(alloc, env.id, "UnknownCommand");
+}
+
+/// Dispatch an inbound payload. Returns an owned JS string of the form
+/// `window.mer._resolve(<id>,<ok>,<json>);` for the IMP to evaluate.
+pub fn dispatch(ctx: *Ctx, payload: []const u8) BridgeError![]u8 {
+    return dispatchWithRegistry(ctx, payload, ctx.extra_commands);
 }
 
 pub fn rejectFromPayload(ctx: *Ctx, payload: []const u8, name: []const u8) BridgeError![]u8 {
@@ -433,6 +524,18 @@ fn newCtx(alloc: std.mem.Allocator, perms: []const []const u8) Ctx {
     return .{ .allocator = alloc, .permissions = perms };
 }
 
+var custom_handler_called = false;
+
+fn customOk(_: *Ctx, _: std.json.Value) HandlerResult {
+    custom_handler_called = true;
+    return .{ .ok = "{\"custom\":true}" };
+}
+
+fn customDanger(_: *Ctx, _: std.json.Value) HandlerResult {
+    custom_handler_called = true;
+    return .{ .ok = "{\"danger\":true}" };
+}
+
 test "dispatch: mer.ping resolves ok" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -449,6 +552,114 @@ test "dispatch: unknown command denies by default" {
     var ctx = newCtx(alloc, &.{});
     const js = try dispatch(&ctx, "{\"cmd\":\"nope\",\"args\":null,\"id\":1}");
     try testing.expectEqualStrings("window.mer._resolve(1,false,\"UnknownCommand\");", js);
+}
+
+test "dispatch: uses custom commands stored on context" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    const extra = [_]Command{.{ .name = "app.exportData", .permission = "app.export", .handler = customOk }};
+    var ctx = newCtx(alloc, &.{"app.export"});
+    ctx.allowed_commands = &.{"app.exportData"};
+    ctx.extra_commands = &extra;
+    const js = try dispatch(&ctx, "{\"cmd\":\"app.exportData\",\"args\":null,\"id\":20}");
+    try testing.expectEqualStrings("window.mer._resolve(20,true,{\"custom\":true});", js);
+    try testing.expect(custom_handler_called);
+}
+
+test "dispatchWithRegistry: custom command requires explicit allowlist permission and origin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    var ctx = newCtx(alloc, &.{"app.export"});
+    ctx.allowed_commands = &.{"app.exportData"};
+    ctx.command_origins = &.{"app.exportData|http://127.0.0.1"};
+    ctx.current_origin = "http://127.0.0.1:49152";
+    const extra = [_]Command{.{ .name = "app.exportData", .permission = "app.export", .handler = customOk }};
+    const js = try dispatchWithRegistry(&ctx, "{\"cmd\":\"app.exportData\",\"args\":null,\"id\":21}", &extra);
+    try testing.expectEqualStrings("window.mer._resolve(21,true,{\"custom\":true});", js);
+    try testing.expect(custom_handler_called);
+}
+
+test "dispatchWithRegistry: custom command is denied when not explicitly allowlisted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    var ctx = newCtx(alloc, &.{"app.export"});
+    const extra = [_]Command{.{ .name = "app.exportData", .permission = "app.export", .handler = customOk }};
+    const js = try dispatchWithRegistry(&ctx, "{\"cmd\":\"app.exportData\",\"args\":null,\"id\":22}", &extra);
+    try testing.expectEqualStrings("window.mer._resolve(22,false,\"CommandDenied\");", js);
+    try testing.expect(!custom_handler_called);
+}
+
+test "dispatchWithRegistry: custom command without permission is invalid and not invoked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    var ctx = newCtx(alloc, &.{});
+    ctx.allowed_commands = &.{"app.danger"};
+    const extra = [_]Command{.{ .name = "app.danger", .permission = "", .handler = customDanger }};
+    const js = try dispatchWithRegistry(&ctx, "{\"cmd\":\"app.danger\",\"args\":null,\"id\":23}", &extra);
+    try testing.expectEqualStrings("window.mer._resolve(23,false,\"InvalidRegistry\");", js);
+    try testing.expect(!custom_handler_called);
+}
+
+test "dispatchWithRegistry: invalid custom registry blocks built-ins before handlers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    var ctx = newCtx(alloc, &.{});
+    const extra = [_]Command{.{ .name = "mer.ping", .permission = "app.fake", .handler = customDanger }};
+    const js = try dispatchWithRegistry(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":24}", &extra);
+    try testing.expectEqualStrings("window.mer._resolve(24,false,\"InvalidRegistry\");", js);
+    try testing.expect(!custom_handler_called);
+}
+
+test "validateCommandRegistry rejects reserved prefixes case-insensitively" {
+    const extra = [_]Command{
+        .{ .name = "Mer.fake", .permission = "app.fake", .handler = customDanger },
+        .{ .name = "OPEN.fake", .permission = "app.fake", .handler = customDanger },
+        .{ .name = "Window.fake", .permission = "app.fake", .handler = customDanger },
+    };
+    for (extra) |cmd| {
+        const one = [_]Command{cmd};
+        try testing.expectError(error.InvalidRegistry, validateCommandRegistry(&one));
+    }
+}
+
+test "dispatchWithRegistry: duplicate custom commands are invalid" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    var ctx = newCtx(alloc, &.{"app.export"});
+    ctx.allowed_commands = &.{"app.exportData"};
+    const extra = [_]Command{
+        .{ .name = "app.exportData", .permission = "app.export", .handler = customOk },
+        .{ .name = "app.exportData", .permission = "app.export", .handler = customDanger },
+    };
+    const js = try dispatchWithRegistry(&ctx, "{\"cmd\":\"app.exportData\",\"args\":null,\"id\":25}", &extra);
+    try testing.expectEqualStrings("window.mer._resolve(25,false,\"InvalidRegistry\");", js);
+    try testing.expect(!custom_handler_called);
+}
+
+test "dispatchWithRegistry: command origin bindings deny missing origin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    custom_handler_called = false;
+    var ctx = newCtx(alloc, &.{"app.export"});
+    ctx.allowed_commands = &.{"app.exportData"};
+    ctx.command_origins = &.{"app.exportData|http://127.0.0.1"};
+    const extra = [_]Command{.{ .name = "app.exportData", .permission = "app.export", .handler = customOk }};
+    const js = try dispatchWithRegistry(&ctx, "{\"cmd\":\"app.exportData\",\"args\":null,\"id\":26}", &extra);
+    try testing.expectEqualStrings("window.mer._resolve(26,false,\"OriginNotAllowed\");", js);
+    try testing.expect(!custom_handler_called);
 }
 
 test "dispatch: permission gate blocks unpermitted command" {
@@ -562,6 +773,15 @@ test "dispatch: open.external rejects disallowed URL schemes before native open"
     ctx.allowed_commands = &.{"open.external"};
     const js = try dispatch(&ctx, "{\"cmd\":\"open.external\",\"args\":{\"url\":\"javascript:alert(1)\"},\"id\":13}");
     try testing.expectEqualStrings("window.mer._resolve(13,false,\"UrlDenied\");", js);
+}
+
+test "dispatch: open.path rejects when no roots are configured" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{"open"});
+    const js = try dispatch(&ctx, "{\"cmd\":\"open.path\",\"args\":{\"path\":\"/tmp/file\"},\"id\":17}");
+    try testing.expectEqualStrings("window.mer._resolve(17,false,\"PathDenied\");", js);
 }
 
 test "dispatch: open.path rejects paths outside configured roots before native open" {

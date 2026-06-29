@@ -87,6 +87,108 @@ fn zonUpdateString(comptime zon: anytype, comptime field: []const u8) ?[]const u
     return @field(zon.update, field);
 }
 
+fn zonServerHost(comptime zon: anytype) []const u8 {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "server")) return "127.0.0.1";
+    const ServerT = @TypeOf(zon.server);
+    if (!@hasField(ServerT, "host")) return "127.0.0.1";
+    return zon.server.host;
+}
+
+fn parseIpv4ByteLiteral(comptime part: []const u8) ?u8 {
+    if (part.len == 0 or part.len > 3) return null;
+    for (part) |c| if (!std.ascii.isDigit(c)) return null;
+    return std.fmt.parseInt(u8, part, 10) catch null;
+}
+
+fn isIpv4LoopbackLiteral(comptime host: []const u8) bool {
+    var it = std.mem.splitScalar(u8, host, '.');
+    var count: usize = 0;
+    var first: u8 = 0;
+    while (it.next()) |part| {
+        const value = parseIpv4ByteLiteral(part) orelse return false;
+        if (count == 0) first = value;
+        count += 1;
+        if (count > 4) return false;
+    }
+    return count == 4 and first == 127;
+}
+
+fn isLoopbackHostLiteral(comptime host: []const u8) bool {
+    return isIpv4LoopbackLiteral(host) or
+        std.ascii.eqlIgnoreCase(host, "::1") or
+        std.ascii.eqlIgnoreCase(host, "[::1]");
+}
+
+fn isValidPortLiteral(comptime port: []const u8) bool {
+    if (port.len == 0 or port.len > 5) return false;
+    for (port) |c| if (!std.ascii.isDigit(c)) return false;
+    const value = std.fmt.parseInt(u16, port, 10) catch return false;
+    return value > 0;
+}
+
+fn isStrictHttpsUrlLiteral(comptime url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '\\') return false;
+    }
+    const scheme_end = std.mem.indexOfScalar(u8, url, ':') orelse return false;
+    if (!std.ascii.eqlIgnoreCase(url[0..scheme_end], "https")) return false;
+    if (url.len < scheme_end + 3 or !std.mem.eql(u8, url[scheme_end + 1 .. scheme_end + 3], "//")) return false;
+    const authority_start = scheme_end + 3;
+    const authority_end = blk: {
+        var i: usize = authority_start;
+        while (i < url.len) : (i += 1) {
+            switch (url[i]) {
+                '/', '?', '#' => break :blk i,
+                else => {},
+            }
+        }
+        break :blk url.len;
+    };
+    const authority = url[authority_start..authority_end];
+    if (authority.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    if (authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        if (close == 1) return false;
+        const rest = authority[close + 1 ..];
+        return rest.len == 0 or (rest[0] == ':' and isValidPortLiteral(rest[1..]));
+    }
+    const colon = std.mem.indexOfScalar(u8, authority, ':');
+    const host = if (colon) |c| authority[0..c] else authority;
+    if (host.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, host, '.') == null and !std.ascii.eqlIgnoreCase(host, "localhost")) return false;
+    if (colon) |c| {
+        if (!isValidPortLiteral(authority[c + 1 ..])) return false;
+    }
+    return true;
+}
+
+fn isEd25519TokenLiteral(comptime value: []const u8) bool {
+    const prefix = "ed25519:";
+    if (!std.mem.startsWith(u8, value, prefix) or value.len == prefix.len) return false;
+    for (value[prefix.len..]) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '\\') return false;
+    }
+    return true;
+}
+
+fn zonUpdateProviderValid(comptime zon: anytype) bool {
+    const provider = nonEmpty(zonUpdateString(zon, "provider")) orelse return false;
+    return std.mem.eql(u8, provider, "github-releases") or std.mem.eql(u8, provider, "custom-http");
+}
+
+fn zonUpdateFeedUrlValid(comptime zon: anytype) bool {
+    const feed_url = nonEmpty(zonUpdateString(zon, "feed_url")) orelse return false;
+    return isStrictHttpsUrlLiteral(feed_url);
+}
+
+fn zonUpdatePublicKeyValid(comptime zon: anytype) bool {
+    const public_key = nonEmpty(zonUpdateString(zon, "public_key")) orelse return false;
+    return isEd25519TokenLiteral(public_key);
+}
+
 fn zonHasNavigationOrigins(comptime zon: anytype) bool {
     const T = @TypeOf(zon);
     if (!@hasField(T, "security")) return false;
@@ -160,15 +262,16 @@ fn macProdCheckMessage(comptime zon: anytype) []const u8 {
     comptime var msg: []const u8 = "";
     if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
     if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
+    if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
     if (!zonHasNavigationOrigins(zon)) msg = msg ++ "missing explicit non-empty .security.navigation.allowed_origins\\n";
     if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
     if (!zonHasBridgeArray(zon, "command_origins")) msg = msg ++ "missing non-empty .security.bridge.command_origins\\n";
     if (!zonHasOpenArray(zon, "external_schemes")) msg = msg ++ "missing non-empty .security.open.external_schemes\\n";
     if (!zonHasOpenArray(zon, "path_roots")) msg = msg ++ "missing non-empty .security.open.path_roots\\n";
-    if (nonEmpty(zonUpdateString(zon, "provider")) == null) msg = msg ++ "missing .update.provider\\n";
-    if (nonEmpty(zonUpdateString(zon, "feed_url")) == null) msg = msg ++ "missing .update.feed_url\\n";
-    if (nonEmpty(zonUpdateString(zon, "public_key")) == null) msg = msg ++ "missing .update.public_key\\n";
+    if (nonEmpty(zonUpdateString(zon, "provider")) == null) msg = msg ++ "missing .update.provider\\n" else if (!zonUpdateProviderValid(zon)) msg = msg ++ "invalid .update.provider (expected github-releases or custom-http)\\n";
+    if (nonEmpty(zonUpdateString(zon, "feed_url")) == null) msg = msg ++ "missing .update.feed_url\\n" else if (!zonUpdateFeedUrlValid(zon)) msg = msg ++ "invalid .update.feed_url (expected strict https URL)\\n";
+    if (nonEmpty(zonUpdateString(zon, "public_key")) == null) msg = msg ++ "missing .update.public_key\\n" else if (!zonUpdatePublicKeyValid(zon)) msg = msg ++ "invalid .update.public_key (expected ed25519:<key>)\\n";
     return msg;
 }
 
@@ -383,7 +486,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     // Run inline tests in individual framework source files.
-    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/mercss-jit.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig" }) |src_path| {
+    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/mercss-jit.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
         const file_test_mod = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,

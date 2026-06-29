@@ -16,6 +16,7 @@ const mer = @import("mer");
 const runtime = @import("runtime");
 const manifest_mod = @import("manifest.zig");
 const bridge = @import("bridge.zig");
+const update = @import("update.zig");
 const builtin = @import("builtin");
 
 const log = std.log.scoped(.native);
@@ -46,11 +47,14 @@ fn runServer(ctx: *ServerCtx) void {
     };
 }
 
-/// Options for `run`. Pass `.{}` for defaults (no raw handler).
+/// Options for `run`. Pass `.{}` for defaults (no raw handler and no custom commands).
 pub const RunOpts = struct {
     /// Optional raw-request handler (e.g. SSE /events). Receives the live
     /// request so it can hold the connection open. See mer.RawHandler.
     raw_handler: ?*const mer.RawHandler = null,
+    /// Optional app-provided static native bridge commands. These are validated
+    /// by bridge.dispatch before any built-in or custom handler runs.
+    commands: []const bridge.Command = &.{},
 };
 
 /// Run the native shell. Blocks until the window is closed.
@@ -75,6 +79,13 @@ pub fn run(
         log.err("web_engine='{s}' is not supported in this release (use \"system\")", .{app_manifest.web_engine});
         return error.UnsupportedWebEngine;
     }
+
+    if (!manifest_mod.isLoopbackHost(app_manifest.host)) {
+        log.err("native server host '{s}' is not loopback; use 127.0.0.1 for the hardened native shell", .{app_manifest.host});
+        return error.UnsafeNativeHost;
+    }
+
+    try update.validateFeedConfig(app_manifest.update);
 
     // Dev mode: start the file watcher so hot-reload SSE works in the window.
     var watcher: ?mer.Watcher = null;
@@ -128,6 +139,7 @@ pub fn run(
         .allowed_origins = allowed_origins,
         .allowed_commands = app_manifest.security.bridge.allowed_commands,
         .command_origins = app_manifest.security.bridge.command_origins,
+        .extra_commands = opts.commands,
         .external_url_schemes = app_manifest.security.open.external_schemes,
         .open_path_roots = app_manifest.security.open.path_roots,
     };

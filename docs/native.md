@@ -96,7 +96,7 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
     .web_engine = "system",           // "system" (v0.2.5) | "chromium" (unsupported)
     .server = .{
         .mode = "dev",                // "dev" (hot reload) | "embedded" (prod)
-        .host = "127.0.0.1",
+        .host = "127.0.0.1",         // native shell requires loopback IP literals
         .port = 0,                    // 0 = ephemeral; shell reads back via ServerReady
     },
     .capabilities = .{ "webview", "js_bridge" },
@@ -127,8 +127,9 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
         // .notarization_profile = "merjs-notary",
     },
     .update = .{
-        // Planned: signed update manifests/artifacts. No updater runs in v0.2.5.
-        // .provider = "github-releases",
+        // Structural update feed validation is implemented. Runtime download,
+        // cryptographic signature verification, and install are still deferred.
+        // .provider = "github-releases", // or "custom-http"
         // .feed_url = "https://example.com/mer-native/update.json",
         // .public_key = "ed25519:...",
     },
@@ -173,15 +174,55 @@ Each call is:
 | `dialog.pickDirectory` | `dialog` | Opens `NSOpenPanel` for one directory; accepts optional `{ title }`; returns an absolute path string or `null` on cancel. |
 | `dialog.openDirectory` | `dialog` | Alias for `dialog.pickDirectory`. |
 | `open.external` | `open` | Opens `{ url }` (or raw string) with `NSWorkspace.openURL`; returns `null`. |
-| `open.path` | `open` | Opens `{ path }` (or raw string) with the default handler/Finder; returns `null`. |
+| `open.path` | `open` | Opens `{ path }` (or raw string) with the default handler/Finder; disabled unless `security.open.path_roots` contains at least one explicit root. |
 | `window.setTitle` | `window` | Sets the current key window title from `{ title }` (or raw string); returns `null`. |
 | `window.close` | `window` | Closes the current key window (`performClose:`); returns `null`. |
 
 ### Custom commands
 
-PR #100 ships the built-in registry above. App-level custom native command
-registries are a follow-up API; for now, consumers should rely on the built-ins
-rather than editing merjs internals as an extension mechanism.
+PR #100 includes a **static** app command extension point without dynamic plugin
+loading. Native apps pass a comptime/constant slice of additional `Command`
+entries through `Shell.run` options:
+
+```zig
+const bridge = mer.native.bridge;
+
+fn exportData(ctx: *bridge.Ctx, args: std.json.Value) bridge.HandlerResult {
+    _ = ctx;
+    _ = args;
+    return .{ .ok = "{\"exported\":true}" };
+}
+
+const app_commands = [_]bridge.Command{
+    .{ .name = "app.exportData", .permission = "app.export", .handler = exportData },
+};
+
+try mer.native.Shell.run(allocator, app_manifest, &router, .{
+    .commands = &app_commands,
+});
+```
+
+Lower-level embedders can call `mer.native.bridge.dispatchWithRegistry(ctx,
+payload, extra_commands)` directly.
+
+Custom handlers must return valid JSON fragments (`null`, a string encoded with the
+bridge JSON helpers, an object, etc.). Handler output is embedded into the JS
+resolver call, so do not concatenate untrusted strings into `.ok`/`.ok_owned`
+without JSON encoding.
+
+Custom commands fail closed unless all of the following are true:
+
+- the command name is in an app namespace such as `app.exportData`;
+- the name does not use reserved built-in prefixes (`mer.`, `dialog.`,
+  `clipboard.`, `open.`, `window.`);
+- the command declares a non-empty permission;
+- the manifest grants that permission;
+- `security.bridge.allowed_commands` explicitly lists the command;
+- any configured `security.bridge.command_origins` entry matches the caller
+  origin.
+
+Dynamic plugins, loading commands from disk, and third-party command bundles are
+still intentionally deferred because they expand the native attack surface.
 
 ### Security model
 
@@ -258,7 +299,9 @@ profile.
 
 Implemented in PR #100 plus hardening follow-up:
 
-- deny-by-default command registry;
+- deny-by-default built-in command registry;
+- static custom command registry API with reserved-prefix, permission, allowlist,
+  and origin-binding validation;
 - 64 KB bridge payload cap;
 - embedded-NUL guard before dispatch;
 - strict global origin check from the `WKScriptMessage` frame;
@@ -266,14 +309,17 @@ Implemented in PR #100 plus hardening follow-up:
 - explicit command allowlist via `security.bridge.allowed_commands`;
 - per-command origin bindings via `security.bridge.command_origins`;
 - `open.external` scheme allowlist (`http`, `https`, `mailto` by default);
-- optional `open.path` roots;
-- manifest-driven macOS signing/notarization hooks.
+- fail-closed `open.path` roots (no roots means `PathDenied`);
+- manifest-driven macOS signing/notarization hooks;
+- structural update feed/config validation (`src/native/update.zig`) for HTTPS
+  feeds, Ed25519-tagged keys/signatures, SHA-256 artifact hashes, platform
+  uniqueness, and rollback-window metadata.
 
 Still deferred / not production-complete:
 
-- auto-updater runtime (manifest fields are placeholders only);
+- auto-updater runtime download/install and cryptographic signature verification;
 - full Linux WebKitGTK and Windows WebView2 backends;
-- mature app/plugin command registry API;
+- dynamic plugin loading / third-party command bundles;
 - UI prompts for every sensitive native API;
 - independent production security audit and cross-platform pen-test.
 
@@ -286,7 +332,8 @@ release gate and signing/notarization flow.
 ## Limitations (PR #100 / v0.2.5 target)
 
 - macOS only (WKWebView). Linux (WebKitGTK) and Windows (WebView2) are planned and documented in `docs/native-platforms.md`.
-- Built-in command allowlists and per-command origins are implemented. App-level custom bridge command registries / plugin commands are deferred.
+- Built-in command allowlists, per-command origins, and static app-level custom bridge command registries are implemented. Dynamic plugin loading is deferred.
+- Structural update feed/config validation is implemented. Runtime download/install and cryptographic signature verification are deferred.
 - Code signing / notarization hooks exist for macOS, but release credentials,
   notarized artifacts, and CI distribution are not configured by default.
 - `web_engine = "chromium"` (CEF) is parsed but unsupported.

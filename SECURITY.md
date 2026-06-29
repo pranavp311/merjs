@@ -39,27 +39,29 @@ Out of scope:
 
 ### Implemented hardening
 
-- **Loopback binding:** the shell binds the embedded server to `127.0.0.1` by default and uses an ephemeral port (`port = 0`).
+- **Loopback binding:** the shell binds the embedded server to `127.0.0.1` by default, uses an ephemeral port (`port = 0`), and rejects non-loopback/non-literal native `server.host` values (`localhost` is intentionally rejected; use `127.0.0.1`).
 - **Runtime origin pinning:** after the server binds, `shell.zig` prepends the exact `http://host:port` origin to the allowed origin list.
 - **Bridge origin validation:** the macOS backend reads the `WKScriptMessage` frame origin and rejects calls before dispatch when the origin is not allowed.
 - **WebView navigation policy:** the macOS shell installs a `WKNavigationDelegate` and cancels navigation to non-allowed origins.
 - **Payload limits:** bridge payloads over 64 KB are rejected.
 - **Embedded-NUL guard:** NSString payload byte length is compared against `UTF8String` length so NUL truncation cannot hide data from dispatch.
 - **Deny-by-default command registry:** unknown command names return `UnknownCommand`.
+- **Static custom command validation:** app-provided commands must use non-reserved names, non-empty permissions, explicit `allowed_commands`, and the same origin/permission gates as built-ins; dynamic plugin loading is not supported.
 - **Permission classes:** built-in commands require manifest permissions such as `clipboard`, `dialog`, `open`, and `window`.
 - **Explicit command allowlist:** `security.bridge.allowed_commands` can restrict the manifest to exact command names, similar to Tauri capabilities.
 - **Per-command origins:** `security.bridge.command_origins` can bind commands to origins with `"command|origin"` entries; when configured, commands without a matching origin rule are denied.
-- **Safer open commands:** `open.external` rejects disallowed schemes (default: `http`, `https`, `mailto`); `open.path` can be restricted to configured roots.
+- **Safer open commands:** `open.external` rejects disallowed schemes (default: `http`, `https`, `mailto`); `open.path` fails closed unless explicit path roots are configured.
 - **macOS signing hooks:** `zig build package-sign` / `mer package --sign` run hardened-runtime `codesign`; `package-notarize` / `mer package --notarize` run `notarytool` and `stapler`.
+- **Update feed structure validation:** `src/native/update.zig` validates feed/config shape, HTTPS URLs, SHA-256 hashes, Ed25519-tagged keys/signatures, platform uniqueness, and rollback-window metadata before any future updater runtime consumes them.
 
 ### Not yet done / do not claim production-complete
 
-- **Auto-updater:** manifest fields may describe an update feed/public key, but no updater downloads or installs artifacts yet.
-- **Signed update manifests/artifacts:** planned; not implemented.
-- **Rollback prevention:** planned with the updater; not implemented.
+- **Auto-updater runtime:** update config/feed structure is validated, but no updater downloads or installs artifacts yet.
+- **Cryptographic update verification:** Ed25519-tagged keys/signatures are required structurally, but signature verification over a canonical payload is not implemented.
+- **Rollback prevention:** version window metadata is validated structurally; durable installed-version rollback protection is planned with the updater runtime.
 - **Full Linux support:** WebKitGTK backend and package integration are planned but not implemented; see `docs/native-platforms.md`.
 - **Full Windows support:** WebView2 backend and package integration are planned but not implemented; see `docs/native-platforms.md`.
-- **Mature plugin system:** app-provided/plugin command registries and plugin capability manifests are not implemented.
+- **Dynamic plugin system:** static app command registries are implemented; loading commands/plugins from disk and plugin capability manifests are not implemented.
 - **Advanced navigation policy:** basic origin-based WKWebView navigation cancellation is implemented; richer per-window route policies and external-browser handoff are still future hardening items.
 - **Universal user prompts:** OS dialogs prompt where applicable, but merjs does not yet prompt for every sensitive bridge command.
 - **Independent production audit:** a full third-party audit / pen-test has not been completed.

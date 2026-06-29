@@ -225,8 +225,9 @@ fn merInvokeIMP(self: Id, _cmd: Sel, ucc: Id, message: Id) callconv(.c) void {
     }
     if (payload.len != byte_len) {
         // A directly-posted NSString can contain embedded NUL bytes. Do not let
-        // UTF8String/std.mem.span truncate the message before dispatch checks.
-        const js = bridge.rejectFromPayload(ctx, payload, "ParseError") catch return;
+        // UTF8String/std.mem.span truncate the message or resolve an attacker-
+        // chosen id from the prefix; reject as an unknown caller instead.
+        const js = bridge.rejectFromPayload(ctx, "", "ParseError") catch return;
         defer ctx.allocator.free(js);
         evalJs(ctx, wv, js);
         return;

@@ -34,7 +34,10 @@ pub const OpenSecurityConfig = struct {
 };
 
 pub const SecurityConfig = struct {
-    allowed_origins: []const []const u8 = &.{ "http://127.0.0.1", "http://localhost" },
+    /// Extra origins allowed to navigate and call the bridge. The shell always
+    /// injects the exact runtime loopback origin after binding its ephemeral
+    /// port; defaults stay empty to avoid authorizing unrelated local servers.
+    allowed_origins: []const []const u8 = &.{},
     bridge: BridgeSecurityConfig = .{},
     open: OpenSecurityConfig = .{},
 };
@@ -167,12 +170,52 @@ pub fn fromZon(comptime zon: anytype) Manifest {
     };
 }
 
+fn parseIpv4Byte(part: []const u8) ?u8 {
+    if (part.len == 0 or part.len > 3) return null;
+    for (part) |c| if (!std.ascii.isDigit(c)) return null;
+    return std.fmt.parseInt(u8, part, 10) catch null;
+}
+
+fn isIpv4LoopbackLiteral(host: []const u8) bool {
+    var it = std.mem.splitScalar(u8, host, '.');
+    var count: usize = 0;
+    var first: u8 = 0;
+    while (it.next()) |part| {
+        const value = parseIpv4Byte(part) orelse return false;
+        if (count == 0) first = value;
+        count += 1;
+        if (count > 4) return false;
+    }
+    return count == 4 and first == 127;
+}
+
+/// True when a native server host stays on local loopback. The native bridge
+/// security model assumes the embedded HTTP server is not LAN/publicly exposed.
+pub fn isLoopbackHost(host: []const u8) bool {
+    return isIpv4LoopbackLiteral(host) or
+        std.ascii.eqlIgnoreCase(host, "::1") or
+        std.ascii.eqlIgnoreCase(host, "[::1]");
+}
+
 /// True if the manifest declares a capability (e.g. "webview", "js_bridge").
 pub fn hasCapability(manifest: Manifest, cap: []const u8) bool {
     for (manifest.capabilities) |declared| {
         if (std.mem.eql(u8, declared, cap)) return true;
     }
     return false;
+}
+
+test "isLoopbackHost only accepts local native bind hosts" {
+    try std.testing.expect(isLoopbackHost("127.0.0.1"));
+    try std.testing.expect(isLoopbackHost("127.10.20.30"));
+    try std.testing.expect(isLoopbackHost("::1"));
+    try std.testing.expect(isLoopbackHost("[::1]"));
+    try std.testing.expect(!isLoopbackHost("localhost"));
+    try std.testing.expect(!isLoopbackHost("127.example.com"));
+    try std.testing.expect(!isLoopbackHost("127.0.0.1.evil"));
+    try std.testing.expect(!isLoopbackHost("0.0.0.0"));
+    try std.testing.expect(!isLoopbackHost("192.168.1.5"));
+    try std.testing.expect(!isLoopbackHost("example.com"));
 }
 
 test "fromZon parses allowed origins" {
@@ -225,6 +268,21 @@ test "fromZon defaults omitted capabilities" {
     };
     const parsed = fromZon(zon);
     try std.testing.expect(!hasCapability(parsed, "webview"));
+}
+
+test "fromZon defaults navigation origins to shell-injected runtime origin only" {
+    const zon = .{
+        .id = "com.example.test",
+        .name = "test",
+        .display_name = "Test",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .windows = .{
+            .{ .title = "Test" },
+        },
+    };
+    const parsed = fromZon(zon);
+    try std.testing.expectEqual(@as(usize, 0), parsed.security.allowed_origins.len);
 }
 
 test "fromZon applies optional server watch_dir" {
