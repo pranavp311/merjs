@@ -8,12 +8,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const has_platform_commands = builtin.os.tag == .macos;
+// Plain `zig test src/native/bridge.zig` does not link AppKit/WebKit, so tests
+// use the fail-closed facade even on macOS. Production builds still select the
+// macOS command backend below.
+pub const has_platform_commands = !builtin.is_test and builtin.os.tag == .macos;
 
-pub const commands = switch (builtin.os.tag) {
-    .macos => @import("macos_commands.zig"),
-    else => UnsupportedCommands,
-};
+pub const commands = if (has_platform_commands) @import("macos_commands.zig") else UnsupportedCommands;
 
 const UnsupportedCommands = struct {
     pub const OpenPanelOptions = struct {
@@ -59,5 +59,5 @@ const UnsupportedCommands = struct {
 };
 
 test "platform command facade selects only implemented backends" {
-    try std.testing.expectEqual(builtin.os.tag == .macos, has_platform_commands);
+    try std.testing.expectEqual(!builtin.is_test and builtin.os.tag == .macos, has_platform_commands);
 }

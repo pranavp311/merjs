@@ -47,6 +47,13 @@ fn runServer(ctx: *ServerCtx) void {
     };
 }
 
+fn createBridgeToken(allocator: std.mem.Allocator) ![]u8 {
+    var random: [32]u8 = undefined;
+    try runtime.io.randomSecure(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    return try allocator.dupe(u8, &hex);
+}
+
 /// Options for `run`. Pass `.{}` for defaults (no raw handler and no custom commands).
 pub const RunOpts = struct {
     /// Optional raw-request handler (e.g. SSE /events). Receives the live
@@ -132,6 +139,8 @@ pub fn run(
 
     // Bridge context (heap-allocated; outlives the blocking event loop). The
     // ObjC IMP reaches it via the macos backend's g_bridge_ctx global.
+    const token = try createBridgeToken(allocator);
+    if (!bridge.isValidBridgeToken(token)) return error.InvalidBridgeToken;
     const bctx = try allocator.create(bridge.Ctx);
     bctx.* = .{
         .allocator = allocator,
@@ -140,6 +149,7 @@ pub fn run(
         .allowed_commands = app_manifest.security.bridge.allowed_commands,
         .command_origins = app_manifest.security.bridge.command_origins,
         .extra_commands = opts.commands,
+        .bridge_token = token,
         .external_url_schemes = app_manifest.security.open.external_schemes,
         .open_path_roots = app_manifest.security.open.path_roots,
     };

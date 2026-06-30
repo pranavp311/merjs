@@ -7,12 +7,14 @@
 // "merInvoke". The ObjC IMP (macos.zig) pulls the body string and calls
 // dispatch() here, which:
 //   1. size limit  — reject payloads > max_payload_bytes
-//   2. parse       — { cmd, args, id }
-//   3. permission  — command.permission ∈ manifest.permissions (deny-default)
-//   4. dispatch    — command name → handler via comptime registry
+//   2. parse       — { cmd, args, id, token }
+//   3. token       — when configured, every call must prove the per-session capability
+//   4. permission  — command.permission ∈ manifest.permissions (deny-default)
+//   5. dispatch    — command name → handler via comptime registry
 //                    (same shape as Router.exact_map in src/dispatch.zig)
-//   5. resolve     — returns a `window.mer._resolve(<id>, ok, <json>)` JS
-//                    string the IMP evaluates on the webview
+//   6. resolve     — returns a `window.mer._resolve(<token>, <id>, ok, <json>)`
+//                    JS string the IMP evaluates on the webview when a valid
+//                    token is configured
 //
 // Origin note: the native shell only ever loads http://127.0.0.1:<port>, so the
 // origin is trusted loopback by construction. Dynamic origin extraction from
@@ -41,6 +43,12 @@ pub const Ctx = struct {
     /// Optional app-provided static command registry. Dynamic/plugin loading is
     /// intentionally unsupported; these entries are validated before dispatch.
     extra_commands: []const Command = &.{},
+    /// Per-process unguessable bridge capability. Platform backends inject this
+    /// into the private JS shim closure and every bridge envelope must echo it.
+    bridge_token: ?[]const u8 = null,
+    /// Token validation is required by default for fail-closed embedders. Unit
+    /// tests that exercise legacy dispatch behavior can opt out explicitly.
+    require_bridge_token: bool = true,
     external_url_schemes: []const []const u8 = &.{ "http", "https", "mailto" },
     open_path_roots: []const []const u8 = &.{},
 };
@@ -61,6 +69,7 @@ pub const BridgeError = error{
     PathDenied,
     InvalidArgs,
     InvalidRegistry,
+    InvalidToken,
     OutOfMemory,
 };
 
@@ -105,6 +114,16 @@ pub const builtin_registry = [_]Command{
 pub const registry = builtin_registry;
 
 const reserved_command_prefixes = [_][]const u8{ "mer.", "dialog.", "clipboard.", "open.", "window." };
+
+fn isValidBridgeTokenByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+pub fn isValidBridgeToken(token: []const u8) bool {
+    if (token.len < 32 or token.len > 128) return false;
+    for (token) |c| if (!isValidBridgeTokenByte(c)) return false;
+    return true;
+}
 
 fn isCommandNameChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_';
@@ -433,30 +452,30 @@ const Envelope = struct {
     cmd: []const u8,
     args: std.json.Value = .null,
     id: i64 = 0,
+    token: ?[]const u8 = null,
 };
 
 fn dispatchCommand(ctx: *Ctx, env: Envelope, cmd: Command, require_explicit_allowlist: bool) BridgeError![]u8 {
-    const alloc = ctx.allocator;
     if (require_explicit_allowlist and ctx.allowed_commands.len == 0) {
-        return resolveError(alloc, env.id, "CommandDenied");
+        return resolveErrorForCtx(ctx, env.id, "CommandDenied");
     }
     if (!isCommandAllowed(ctx, cmd.name)) {
-        return resolveError(alloc, env.id, "CommandDenied");
+        return resolveErrorForCtx(ctx, env.id, "CommandDenied");
     }
     if (!isCommandOriginAllowed(ctx, cmd.name)) {
-        return resolveError(alloc, env.id, "OriginNotAllowed");
+        return resolveErrorForCtx(ctx, env.id, "OriginNotAllowed");
     }
     if (!hasPermission(ctx, cmd.permission)) {
-        return resolveStr(alloc, env.id, false, "\"PermissionDenied\"");
+        return resolveStrForCtx(ctx, env.id, false, "\"PermissionDenied\"");
     }
     const res = cmd.handler(ctx, env.args);
     switch (res) {
-        .ok => |json| return resolveStr(alloc, env.id, true, json),
+        .ok => |json| return resolveStrForCtx(ctx, env.id, true, json),
         .ok_owned => |json| {
-            defer alloc.free(json);
-            return resolveStr(alloc, env.id, true, json);
+            defer ctx.allocator.free(json);
+            return resolveStrForCtx(ctx, env.id, true, json);
         },
-        .err => |e| return resolveError(alloc, env.id, @errorName(e)),
+        .err => |e| return resolveErrorForCtx(ctx, env.id, @errorName(e)),
     }
 }
 
@@ -476,8 +495,18 @@ pub fn dispatchWithRegistry(ctx: *Ctx, payload: []const u8, extra_commands: []co
     defer parsed.deinit();
     const env = parsed.value;
 
+    if (ctx.require_bridge_token) {
+        // Do not resolve attacker-controlled ids until the request has proven
+        // the session bridge capability. Forged messages should not be able to
+        // reject legitimate in-flight renderer promises by guessing ids.
+        const expected = ctx.bridge_token orelse return resolveError(alloc, 0, "InvalidToken");
+        if (!isValidBridgeToken(expected)) return resolveError(alloc, 0, "InvalidToken");
+        const supplied = env.token orelse return resolveError(alloc, 0, "InvalidToken");
+        if (!std.mem.eql(u8, supplied, expected)) return resolveError(alloc, 0, "InvalidToken");
+    }
+
     validateCommandRegistry(extra_commands) catch {
-        return resolveError(alloc, env.id, "InvalidRegistry");
+        return resolveErrorForCtx(ctx, env.id, "InvalidRegistry");
     };
 
     for (builtin_registry) |cmd| {
@@ -491,7 +520,7 @@ pub fn dispatchWithRegistry(ctx: *Ctx, payload: []const u8, extra_commands: []co
             return dispatchCommand(ctx, env, cmd, true);
         }
     }
-    return resolveError(alloc, env.id, "UnknownCommand");
+    return resolveErrorForCtx(ctx, env.id, "UnknownCommand");
 }
 
 /// Dispatch an inbound payload. Returns an owned JS string of the form
@@ -513,15 +542,33 @@ fn resolveStr(alloc: std.mem.Allocator, id: i64, ok: bool, json: []const u8) Bri
     return std.fmt.allocPrint(alloc, "window.mer._resolve({d},{s},{s});", .{ id, if (ok) "true" else "false", json }) catch error.OutOfMemory;
 }
 
+fn resolveStrWithToken(alloc: std.mem.Allocator, token: []const u8, id: i64, ok: bool, json: []const u8) BridgeError![]u8 {
+    return std.fmt.allocPrint(alloc, "window.mer._resolve(\"{s}\",{d},{s},{s});", .{ token, id, if (ok) "true" else "false", json }) catch error.OutOfMemory;
+}
+
+fn resolveStrForCtx(ctx: *Ctx, id: i64, ok: bool, json: []const u8) BridgeError![]u8 {
+    if (ctx.bridge_token) |token| {
+        if (isValidBridgeToken(token)) return resolveStrWithToken(ctx.allocator, token, id, ok, json);
+    }
+    return resolveStr(ctx.allocator, id, ok, json);
+}
+
 fn resolveError(alloc: std.mem.Allocator, id: i64, name: []const u8) BridgeError![]u8 {
     return std.fmt.allocPrint(alloc, "window.mer._resolve({d},false,\"{s}\");", .{ id, name }) catch error.OutOfMemory;
 }
 
-// ── tests (standalone: bridge.zig only imports std) ─────────────────────────
+fn resolveErrorForCtx(ctx: *Ctx, id: i64, name: []const u8) BridgeError![]u8 {
+    if (ctx.bridge_token) |token| {
+        if (isValidBridgeToken(token)) return std.fmt.allocPrint(ctx.allocator, "window.mer._resolve(\"{s}\",{d},false,\"{s}\");", .{ token, id, name }) catch error.OutOfMemory;
+    }
+    return resolveError(ctx.allocator, id, name);
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
 const testing = std.testing;
 
 fn newCtx(alloc: std.mem.Allocator, perms: []const []const u8) Ctx {
-    return .{ .allocator = alloc, .permissions = perms };
+    return .{ .allocator = alloc, .permissions = perms, .require_bridge_token = false };
 }
 
 var custom_handler_called = false;
@@ -552,6 +599,44 @@ test "dispatch: unknown command denies by default" {
     var ctx = newCtx(alloc, &.{});
     const js = try dispatch(&ctx, "{\"cmd\":\"nope\",\"args\":null,\"id\":1}");
     try testing.expectEqualStrings("window.mer._resolve(1,false,\"UnknownCommand\");", js);
+}
+
+test "dispatch: default context requires a bridge token" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = Ctx{ .allocator = alloc, .permissions = &.{} };
+    const js = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":30}");
+    try testing.expectEqualStrings("window.mer._resolve(0,false,\"InvalidToken\");", js);
+}
+
+test "dispatch: bridge token is required when configured" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{});
+    ctx.bridge_token = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    ctx.require_bridge_token = true;
+
+    const missing = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":31}");
+    try testing.expectEqualStrings("window.mer._resolve(0,false,\"InvalidToken\");", missing);
+
+    const wrong = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":32,\"token\":\"wrong-token-wrong-token-wrong-token\"}");
+    try testing.expectEqualStrings("window.mer._resolve(0,false,\"InvalidToken\");", wrong);
+
+    const ok = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":33,\"token\":\"abcdefghijklmnopqrstuvwxyzABCDEF\"}");
+    try testing.expectEqualStrings("window.mer._resolve(\"abcdefghijklmnopqrstuvwxyzABCDEF\",33,true,{\"pong\":true});", ok);
+}
+
+test "dispatch: invalid configured bridge token fails closed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{});
+    ctx.bridge_token = "short";
+    ctx.require_bridge_token = true;
+    const js = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":34,\"token\":\"short\"}");
+    try testing.expectEqualStrings("window.mer._resolve(0,false,\"InvalidToken\");", js);
 }
 
 test "dispatch: uses custom commands stored on context" {

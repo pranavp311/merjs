@@ -44,6 +44,7 @@ Out of scope:
 - **Bridge origin validation:** the macOS backend reads the `WKScriptMessage` frame origin and rejects calls before dispatch when the origin is not allowed.
 - **WebView navigation policy:** the macOS shell installs a `WKNavigationDelegate` and cancels navigation to non-allowed origins.
 - **Payload limits:** bridge payloads over 64 KB are rejected.
+- **Session-scoped bridge token:** the native shell generates a 256-bit random capability per process, injects it into the private JS shim closure, `bridge.zig` rejects missing/invalid tokens before command lookup, and native responses must echo the token before the shim resolves a pending Promise.
 - **Embedded-NUL guard:** NSString payload byte length is compared against `UTF8String` length so NUL truncation cannot hide data from dispatch.
 - **Deny-by-default command registry:** unknown command names return `UnknownCommand`.
 - **Static custom command validation:** app-provided commands must use non-reserved names, non-empty permissions, explicit `allowed_commands`, and the same origin/permission gates as built-ins; dynamic plugin loading is not supported.
@@ -65,7 +66,7 @@ Out of scope:
 - **Universal user prompts:** OS dialogs prompt where applicable, but merjs does not yet prompt for every sensitive bridge command.
 - **Independent production audit:** a full third-party audit / pen-test has not been completed.
 
-See also `docs/native-production.md` for the macOS production release gate and `docs/native-platforms.md` for the Linux/Windows backend plan.
+See also `docs/native-production.md` for the macOS production release gate, `docs/native-platforms.md` for the Linux/Windows backend plan, and `docs/native-zero-trust.md` for the zero-trust model and remaining maturity gaps.
 
 ## Native release checklist
 
@@ -91,6 +92,7 @@ spctl --assess --type execute --verbose zig-out/<Display>.app
 
 Security smoke tests to keep in CI/manual review:
 
+- missing or wrong bridge token returns `InvalidToken` when a shell token is configured
 - unknown command returns `UnknownCommand`
 - missing permission returns `PermissionDenied`
 - unlisted command returns `CommandDenied` when `allowed_commands` is configured

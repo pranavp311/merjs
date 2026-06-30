@@ -22,7 +22,7 @@ the WebView + window + bridge + packaging layer.
 
 The shared pieces are being isolated in platform-neutral Zig (`shell.zig`, `bridge.zig`, `manifest.zig`, and `platform_commands.zig`). Platform-specific work is deliberately kept behind the WebView backend and command facade so Linux/Windows can be added without weakening the macOS bridge policy.
 
-See [`docs/native-platforms.md`](native-platforms.md) for the staged Linux/Windows implementation plan.
+See [`docs/native-platforms.md`](native-platforms.md) for the staged Linux/Windows implementation plan and [`docs/native-zero-trust.md`](native-zero-trust.md) for the zero-trust security model and remaining maturity gaps.
 
 ---
 
@@ -155,12 +155,13 @@ console.log(result); // { pong: true }
 
 Each call is:
 1. **size-limited** — payloads > 64 KB are rejected;
-2. **permission-checked** — the command's declared permission must appear in the
+2. **session-token checked** — the macOS shell generates an unguessable per-process bridge capability and the private injected shim echoes it in each envelope;
+3. **permission-checked** — the command's declared permission must appear in the
    manifest's `permissions` list (deny-by-default);
-3. **dispatched** — command name → handler via a comptime registry (same shape
+4. **dispatched** — command name → handler via a comptime registry (same shape
    as merjs route tables in `src/dispatch.zig`);
-4. **resolved** — the handler's JSON result is delivered back to the awaiting
-   Promise via `window.mer._resolve(id, ok, value)`.
+5. **resolved** — the handler's JSON result is delivered back to the awaiting
+   Promise via a token-echoing native response (`window.mer._resolve(response_token, id, ok, value)`).
 
 ### Built-in commands
 
@@ -203,7 +204,7 @@ try mer.native.Shell.run(allocator, app_manifest, &router, .{
 ```
 
 Lower-level embedders can call `mer.native.bridge.dispatchWithRegistry(ctx,
-payload, extra_commands)` directly.
+payload, extra_commands)` directly, but must provide a valid `ctx.bridge_token` and include the same token in envelopes unless they deliberately set `ctx.require_bridge_token = false` for non-WebView tests.
 
 Custom handlers must return valid JSON fragments (`null`, a string encoded with the
 bridge JSON helpers, an object, etc.). Handler output is embedded into the JS
@@ -232,9 +233,7 @@ backend checks the `WKScriptMessage` frame origin against
 `security.navigation.allowed_origins`. `shell.zig` prepends the exact runtime
 origin after the server binds its ephemeral port, so portless manifest entries
 (for example `http://127.0.0.1`) do **not** wildcard every local server port.
-Bridge dispatch then enforces the explicit command allowlist, per-command origin
-bindings, permission class, and command-specific URL/path restrictions before
-calling the platform command facade.
+The macOS shell also injects a fresh random bridge token into the private JS shim closure; direct `WKScriptMessage` posts that do not carry that token fail before registry lookup or handler execution, and native responses must echo the token before the shim resolves a pending Promise. Bridge dispatch then enforces the explicit command allowlist, per-command origin bindings, permission class, and command-specific URL/path restrictions before calling the platform command facade.
 
 ---
 
@@ -303,6 +302,7 @@ Implemented in PR #100 plus hardening follow-up:
 - static custom command registry API with reserved-prefix, permission, allowlist,
   and origin-binding validation;
 - 64 KB bridge payload cap;
+- per-process random bridge token required on shell-injected bridge envelopes;
 - embedded-NUL guard before dispatch;
 - strict global origin check from the `WKScriptMessage` frame;
 - WKWebView navigation delegate cancellation for non-allowed origins;

@@ -182,20 +182,33 @@ var g_nav_delegate: Id = null;
 
 /// The `window.mer` shim injected at document start. Provides:
 ///   window.mer.invoke(cmd, args) -> Promise
-///   window.mer._resolve(id, ok, value)  (called from Zig via evaluateJavaScript)
-const mer_shim: [*:0]const u8 =
-    "(function(){" ++
-    "if(window.mer)return;" ++
-    "var cb={},idc=0;" ++
-    "window.mer={" ++
-    "invoke:function(c,a){return new Promise(function(r,j){" ++
-    "var id=++idc;cb[id]={r:r,j:j};" ++
-    "try{var p=JSON.stringify({cmd:c,args:a||null,id:id});if(p.length>65536){delete cb[id];j('PayloadTooLarge');return;}window.webkit.messageHandlers.merInvoke.postMessage(p);}" ++
-    "catch(e){delete cb[id];j('BridgeUnavailable');}" ++
-    "});}," ++
-    "_resolve:function(id,ok,v){var h=cb[id];if(!h)return;delete cb[id];if(ok)h.r(v);else h.j(v);}" ++
-    "};" ++
-    "})();";
+///   window.mer._resolve(response_token, id, ok, value)  (called from Zig via evaluateJavaScript)
+///
+/// The native shell supplies a per-process random bridge token. It is captured in
+/// this private closure and echoed in every message envelope, so direct message
+/// posts from foreign frames or ad-hoc WebKit messages fail token verification
+/// before any command handler is considered.
+fn makeMerShim(alloc: std.mem.Allocator, token: []const u8) ![:0]u8 {
+    const shim = try std.fmt.allocPrint(alloc,
+        "(function(){{" ++
+            "if(window.mer)return;" ++
+            "var cb={{}},idc=0,t='{s}';" ++
+            "window.mer={{" ++
+            "invoke:function(c,a){{return new Promise(function(r,j){{" ++
+            "if(typeof c!=='string'){{j('InvalidCommand');return;}}" ++
+            "var id=++idc;cb[id]={{r:r,j:j}};" ++
+            "try{{var p=JSON.stringify({{cmd:c,args:(a===undefined?null:a),id:id,token:t}});var n=(typeof TextEncoder==='function')?new TextEncoder().encode(p).length:encodeURIComponent(p).replace(/%[0-9A-F]{{2}}/g,'x').length;if(n>65536){{delete cb[id];j('PayloadTooLarge');return;}}window.webkit.messageHandlers.merInvoke.postMessage(p);}}" ++
+            "catch(e){{delete cb[id];j('BridgeUnavailable');}}" ++
+            "}});}}," ++
+            "_resolve:function(rt,id,ok,v){{if(rt!==t)return;var h=cb[id];if(!h)return;delete cb[id];if(ok)h.r(v);else h.j(v);}}" ++
+            "}};" ++
+            "Object.defineProperty(window,'mer',{{value:Object.freeze(window.mer),writable:false,configurable:false}});" ++
+            "}})();",
+        .{token},
+    );
+    defer alloc.free(shim);
+    return try alloc.dupeZ(u8, shim);
+}
 
 /// IMP for `-[MerInvokeHandler userContentController:didReceiveScriptMessage:]`.
 /// Pulls the message body (the posted JSON envelope), runs bridge.dispatch, and
@@ -235,13 +248,16 @@ fn merInvokeIMP(self: Id, _cmd: Sel, ucc: Id, message: Id) callconv(.c) void {
 
     var origin_buf: [512]u8 = undefined;
     const origin = messageFrameOrigin(message, &origin_buf) orelse {
-        const js = bridge.rejectFromPayload(ctx, payload, "OriginNotAllowed") catch return;
+        // The caller has not proven an allowed origin, so never resolve a
+        // payload-selected id. Otherwise forged messages could reject unrelated
+        // in-flight promises in the trusted renderer.
+        const js = bridge.rejectFromPayload(ctx, "", "OriginNotAllowed") catch return;
         defer ctx.allocator.free(js);
         evalJs(ctx, wv, js);
         return;
     };
     if (!bridge.isOriginAllowed(ctx, origin)) {
-        const js = bridge.rejectFromPayload(ctx, payload, "OriginNotAllowed") catch return;
+        const js = bridge.rejectFromPayload(ctx, "", "OriginNotAllowed") catch return;
         defer ctx.allocator.free(js);
         evalJs(ctx, wv, js);
         return;
@@ -382,8 +398,22 @@ fn setupBridge(webview: Id, ctx: *bridge.Ctx) void {
     const config = send(webview, sel("configuration"));
     const ucc = send(config, sel("userContentController"));
 
-    // 1. Inject the shim at document start.
-    const ns_shim = sendStr(cls("NSString"), sel("stringWithUTF8String:"), mer_shim);
+    // Enforce the same origin policy at navigation time, not only when a page
+    // calls the bridge. Install this before any bridge-token checks so even a
+    // fail-closed bridge setup keeps navigation constrained.
+    if (createNavigationDelegateClass()) |delegate_class| {
+        g_nav_delegate = send(send(delegate_class, sel("alloc")), sel("init"));
+        send1v(webview, sel("setNavigationDelegate:"), g_nav_delegate);
+    }
+
+    // 1. Inject the shim at document start. A missing/invalid token means the
+    // bridge is not installed; native WebView bridges must fail closed rather
+    // than silently falling back to unauthenticated envelopes.
+    const bridge_token = ctx.bridge_token orelse return;
+    if (!bridge.isValidBridgeToken(bridge_token)) return;
+    const shim_z = makeMerShim(ctx.allocator, bridge_token) catch return;
+    defer ctx.allocator.free(shim_z);
+    const ns_shim = sendStr(cls("NSString"), sel("stringWithUTF8String:"), shim_z.ptr);
     const user_script = sendUserScriptInit(
         send(cls("WKUserScript"), sel("alloc")),
         sel("initWithSource:injectionTime:forMainFrameOnly:"),
@@ -401,13 +431,6 @@ fn setupBridge(webview: Id, ctx: *bridge.Ctx) void {
     const ns_name = sendStr(cls("NSString"), sel("stringWithUTF8String:"), name_z.ptr);
     send2v(ucc, sel("addScriptMessageHandler:name:"), handler, ns_name);
 
-    // 3. Enforce the same origin policy at navigation time, not only when a
-    // page calls the bridge. This keeps untrusted remote pages from replacing
-    // the trusted loopback UI inside the native window.
-    if (createNavigationDelegateClass()) |delegate_class| {
-        g_nav_delegate = send(send(delegate_class, sel("alloc")), sel("init"));
-        send1v(webview, sel("setNavigationDelegate:"), g_nav_delegate);
-    }
 }
 
 /// Open a native window hosting a WKWebView pointed at `url_z`. Blocks on the

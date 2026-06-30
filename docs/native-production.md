@@ -36,7 +36,8 @@ Production manifests should use explicit least privilege:
 `mer native` enforces these in two places:
 
 - the WKWebView navigation delegate cancels navigation to non-allowed origins;
-- the `window.mer.invoke()` bridge checks origin, command allowlist, command origin bindings, permission class, and command-specific URL/path restrictions.
+- the native shell injects a fresh per-process bridge token into the private JS shim;
+- the `window.mer.invoke()` bridge checks the session token, origin, command allowlist, command origin bindings, permission class, and command-specific URL/path restrictions.
 
 ## 2. Configure signing and notarization
 
@@ -147,6 +148,7 @@ Verify:
 - app window opens;
 - root route returns HTTP 200;
 - `window.mer.invoke("mer.ping", {})` returns `{ "pong": true }`;
+- an ad-hoc `window.webkit.messageHandlers.merInvoke.postMessage(JSON.stringify({cmd:"mer.ping",id:1,args:null}))` does not execute a handler or resolve/reject an existing `window.mer.invoke` promise;
 - navigation to an unlisted origin is cancelled;
 - unknown command returns `UnknownCommand`;
 - missing permission returns `PermissionDenied`;
