@@ -28,7 +28,7 @@ pub const BridgeSecurityConfig = struct {
 pub const OpenSecurityConfig = struct {
     /// URL schemes that `open.external` may hand to the OS.
     external_schemes: []const []const u8 = &.{ "http", "https", "mailto" },
-    /// Optional path roots for `open.path`. Empty preserves legacy behavior;
+    /// Optional path roots for `open.path`. Empty disables `open.path`;
     /// generated manifests set explicit roots for production apps.
     path_roots: []const []const u8 = &.{},
 };

@@ -39,7 +39,7 @@ Paste the printed snippet into `build.zig` (inside `pub fn build`), then:
 ```bash
 mer native         # dev: launch a native window against the hot-reloading server
 mer native build   # prod: build the native shell binary (ReleaseSmall)
-mer package        # unsigned local .app (macOS): zig-out/<Display>.app
+mer package        # unsigned local .app (macOS): zig-out/<Display>.app with default prefix
 mer package --sign # package + codesign (Developer ID; requires signing config)
 mer package --sign -Dmacos-signing-identity="Developer ID Application: Example, Inc. (TEAMID)"
 mer package --notarize # package + codesign + notarytool + stapler
@@ -102,7 +102,8 @@ The ObjC interop pattern (extern `objc_getClass`/`sel_registerName`/`objc_msgSen
     .capabilities = .{ "webview", "js_bridge" },
     .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
-        .navigation = .{ .allowed_origins = .{ "mer://app" } },
+        // Empty means no extra origins; the shell injects the exact runtime origin.
+        .navigation = .{ .allowed_origins = .{} },
         .bridge = .{
             // Explicit command allowlist, similar to Tauri capabilities.
             .allowed_commands = .{ "mer.ping", "window.close" },
@@ -204,11 +205,12 @@ try mer.native.Shell.run(allocator, app_manifest, &router, .{
 ```
 
 Lower-level embedders can call `mer.native.bridge.dispatchWithRegistry(ctx,
-payload, extra_commands)` directly, but must provide a valid `ctx.bridge_token` and include the same token in envelopes unless they deliberately set `ctx.require_bridge_token = false` for non-WebView tests.
+payload, extra_commands)` directly, but must provide a valid `ctx.bridge_token` and include the same token in envelopes. Setting `ctx.require_bridge_token = false` is for non-WebView tests only; the macOS shim ignores legacy no-token responses.
 
 Custom handlers must return valid JSON fragments (`null`, a string encoded with the
-bridge JSON helpers, an object, etc.). Handler output is embedded into the JS
-resolver call, so do not concatenate untrusted strings into `.ok`/`.ok_owned`
+bridge JSON helpers, an object, etc.). Dispatch validates handler output before
+embedding it in the JS resolver call and converts invalid fragments to `HandlerError`,
+but handlers should still avoid concatenating untrusted strings into `.ok`/`.ok_owned`
 without JSON encoding.
 
 Custom commands fail closed unless all of the following are true:
@@ -231,9 +233,16 @@ The native shell currently loads the app over an embedded loopback URL such as
 `http://127.0.0.1:<port>/`. Before dispatching bridge commands, the macOS
 backend checks the `WKScriptMessage` frame origin against
 `security.navigation.allowed_origins`. `shell.zig` prepends the exact runtime
-origin after the server binds its ephemeral port, so portless manifest entries
-(for example `http://127.0.0.1`) do **not** wildcard every local server port.
-The macOS shell also injects a fresh random bridge token into the private JS shim closure; direct `WKScriptMessage` posts that do not carry that token fail before registry lookup or handler execution, and native responses must echo the token before the shim resolves a pending Promise. Bridge dispatch then enforces the explicit command allowlist, per-command origin bindings, permission class, and command-specific URL/path restrictions before calling the platform command facade.
+origin after the server binds its ephemeral port, so portless manifest command-origin
+entries (for example `http://127.0.0.1`) are safe only after the global exact-origin
+check and do **not** wildcard every local server port. Bridge dispatch repeats the
+global origin check for lower-level embedders before enforcing per-command origin
+bindings. The macOS shell also injects a fresh random bridge token into the private
+JS shim closure; direct `WKScriptMessage` posts that do not carry that token fail
+before registry lookup or handler execution, and native responses must echo the
+token before the shim resolves a pending Promise. Bridge dispatch then enforces the
+explicit command allowlist, permission class, and command-specific URL/path restrictions
+before calling the platform command facade.
 
 ---
 
@@ -244,7 +253,9 @@ The macOS shell also injects a fresh random bridge token into the private JS shi
 - **Prod (`mer package`):** the SSR binary + WebView shell are built with
   `-Doptimize=ReleaseSmall`; hot reload is off; the result is a `.app` bundle
   whose `Info.plist` reflects `id` / `display_name` / `version` from the
-  manifest. Unsigned by default for fast local packaging.
+  manifest. The configured static directory (default `public/`) is copied into
+  `Contents/Resources/<static_dir>/` so Finder-launched apps do not depend on the repo CWD.
+  Unsigned by default for fast local packaging.
 
 ---
 
@@ -281,11 +292,13 @@ zig build package-notarize -Doptimize=ReleaseSmall -Dmacos-notarization-profile=
 spctl --assess --type execute --verbose zig-out/<Display>.app
 ```
 
-`package-sign` runs:
+`package-sign` requires signing identity/entitlements only and runs:
 
 ```bash
 codesign --deep --force --options runtime --timestamp --sign <identity> [--entitlements <plist>] zig-out/<Display>.app
 ```
+
+`zig-out/<Display>.app` is the default Zig prefix output; custom `zig build --prefix <dir>` writes the bundle under that prefix. The full production gate (notarization profile + update trust root + hardened manifest checks) runs for `package-notarize` and `native-prod-release`.
 
 `package-notarize` signs, zips the app with `ditto --keepParent`, submits it via
 `xcrun notarytool submit --wait`, then staples the ticket with
@@ -308,7 +321,7 @@ Implemented in PR #100 plus hardening follow-up:
 - WKWebView navigation delegate cancellation for non-allowed origins;
 - explicit command allowlist via `security.bridge.allowed_commands`;
 - per-command origin bindings via `security.bridge.command_origins`;
-- `open.external` scheme allowlist (`http`, `https`, `mailto` by default);
+- `open.external` scheme allowlist (`http`, `https`, `mailto` by default) plus strict URL structure checks for native handoff;
 - fail-closed `open.path` roots (no roots means `PathDenied`);
 - manifest-driven macOS signing/notarization hooks;
 - signed update feed/config checks (`src/native/update.zig`) for HTTPS feeds,

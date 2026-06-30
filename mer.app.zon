@@ -17,7 +17,8 @@
     .capabilities = .{ "webview", "js_bridge" },
     .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
-        .navigation = .{ .allowed_origins = .{ "mer://app" } },
+        // Empty means no extra navigation origins; the shell injects the exact runtime loopback origin.
+        .navigation = .{ .allowed_origins = .{} },
         .bridge = .{
             .allowed_commands = .{
                 "mer.ping", "mer.echo",

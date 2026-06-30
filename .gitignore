@@ -65,5 +65,5 @@ harness.trajectory.jsonl
 session-*.session.json
 .graff/
 .harness/
-PR100_NATIVE_HANDOFF.md
+PR100_*_HANDOFF.md
 codedb.snapshot

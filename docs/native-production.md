@@ -11,7 +11,9 @@ Production manifests should use explicit least privilege:
 ```zig
 .permissions = .{ "window", "clipboard", "dialog", "open" },
 .security = .{
-    .navigation = .{ .allowed_origins = .{ "mer://app" } }, // shell injects exact http://127.0.0.1:<port>
+    // Empty means no extra navigation origins; the shell injects the exact
+    // runtime http://127.0.0.1:<port> origin after binding.
+    .navigation = .{ .allowed_origins = .{} },
     .bridge = .{
         .allowed_commands = .{
             "mer.ping",
@@ -28,10 +30,13 @@ Production manifests should use explicit least privilege:
     },
     .open = .{
         .external_schemes = .{ "https", "mailto" },
-        .path_roots = .{ "public", "~/Documents/MyApp" },
+        // No shell expansion is performed; use repo-relative or absolute paths.
+        .path_roots = .{ "public", "/Users/me/Documents/MyApp" },
     },
 },
 ```
+
+Command-origin examples may omit the ephemeral port only because the shell first enforces the exact runtime origin globally and bridge dispatch repeats that global allowlist check.
 
 `mer native` enforces these in two places:
 
@@ -109,7 +114,7 @@ This fails if the manifest is missing or misconfigures:
 - native `.server.host` loopback IP-literal binding (`127.0.0.1` recommended; `localhost` is intentionally rejected)
 - `.macos.signing_identity`
 - `.macos.notarization_profile`
-- explicit non-empty `.security.navigation.allowed_origins` without loopback/localhost (`localhost`, `127.*`, `[::1]`)
+- extra `.security.navigation.allowed_origins` without loopback/localhost (`localhost`, `127.*`, `[::1]`); an empty list is valid and means only the shell-injected runtime origin is allowed
 - non-empty `.security.bridge.allowed_commands`
 - non-empty `.security.bridge.command_origins`
 - non-empty `.security.open.external_schemes`
@@ -137,6 +142,14 @@ zig build package-notarize -Doptimize=ReleaseSmall
 spctl --assess --type execute --verbose zig-out/<Display>.app
 ```
 
+`package-sign` requires a signing identity; entitlements are optional. `package-notarize` and
+`native-prod-release` run the full production gate, including notarization and
+update trust-root metadata. Paths above use Zig's default install prefix;
+custom `zig build --prefix <dir>` writes `<Display>.app` under that prefix.
+
+The package step also copies the configured static directory (default `public/`)
+into `Contents/Resources/<static_dir>/` so Finder-launched apps do not depend on the repo CWD.
+
 ## 6. Manual smoke test
 
 ```bash
@@ -154,6 +167,6 @@ Verify:
 - missing permission returns `PermissionDenied`;
 - unlisted command returns `CommandDenied`;
 - bad origin returns `OriginNotAllowed`;
-- `open.external` rejects `javascript:`;
+- `open.external` rejects `javascript:`, malformed HTTP(S), controls, backslashes, and userinfo;
 - `open.path` rejects paths outside configured roots;
 - closing the final window exits the app.

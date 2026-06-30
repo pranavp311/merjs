@@ -684,11 +684,11 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package-notarize\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-check\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-release\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "Contents/Resources") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "codesign.step.dependOn(native_prod_check_step)") == null);
 }
 
 test "CLI child processes inherit configured environment" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     try runtime.init(alloc);
     defer runtime.deinit();
@@ -697,19 +697,35 @@ test "CLI child processes inherit configured environment" {
     defer map.deinit();
     try map.put("MERJS_ENV_SENTINEL", "ok");
 
-    const synthetic_env: std.process.Environ = .{ .block = try map.createPosixBlock(alloc, .{}) };
-    defer synthetic_env.block.deinit(alloc);
+    if (builtin.os.tag == .windows) {
+        const synthetic_env: std.process.Environ = .{ .block = try map.createWindowsBlock(alloc, .{}) };
+        defer synthetic_env.block.deinit(alloc);
 
-    const previous = process_environ;
-    process_environ = synthetic_env;
-    defer process_environ = previous;
+        const previous = process_environ;
+        process_environ = synthetic_env;
+        defer process_environ = previous;
 
-    const result = try runInheritEnv(alloc, .{ .argv = &.{ "env" }, .stdout_limit = .limited(64 * 1024) });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    try std.testing.expect(result.term == .exited);
-    try std.testing.expectEqual(@as(u8, 0), result.term.exited);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "MERJS_ENV_SENTINEL=ok") != null);
+        const result = try runInheritEnv(alloc, .{ .argv = &.{ "cmd.exe", "/C", "set MERJS_ENV_SENTINEL" }, .stdout_limit = .limited(64 * 1024) });
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        try std.testing.expect(result.term == .exited);
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "MERJS_ENV_SENTINEL=ok") != null);
+    } else {
+        const synthetic_env: std.process.Environ = .{ .block = try map.createPosixBlock(alloc, .{}) };
+        defer synthetic_env.block.deinit(alloc);
+
+        const previous = process_environ;
+        process_environ = synthetic_env;
+        defer process_environ = previous;
+
+        const result = try runInheritEnv(alloc, .{ .argv = &.{ "env" }, .stdout_limit = .limited(64 * 1024) });
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        try std.testing.expect(result.term == .exited);
+        try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "MERJS_ENV_SENTINEL=ok") != null);
+    }
 }
 
 test "native build snippet uses target OS and codegen dependency" {
@@ -894,6 +910,30 @@ const native_build_snippet =
     \\                if (!@hasField(ServerT, "host")) return "127.0.0.1";
     \\                return zon.server.host;
     \\            }
+    \\            fn isSafeRelativePathLiteral(comptime path: []const u8) bool {
+    \\                if (path.len == 0 or path[0] == '/' or path[0] == '~') return false;
+    \\                var start: usize = 0;
+    \\                for (path, 0..) |c, i| {
+    \\                    if (c == ':' or c == '\\' or c <= 0x1f or c == 0x7f) return false;
+    \\                    if (c == '/') {
+    \\                        const part = path[start..i];
+    \\                        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    \\                        start = i + 1;
+    \\                    }
+    \\                }
+    \\                const last = path[start..];
+    \\                return last.len > 0 and !std.mem.eql(u8, last, ".") and !std.mem.eql(u8, last, "..");
+    \\            }
+    \\            fn zonServerStaticDir(comptime zon: anytype) []const u8 {
+    \\                const T = @TypeOf(zon);
+    \\                const value = if (!@hasField(T, "server")) "public" else blk: {
+    \\                    const ServerT = @TypeOf(zon.server);
+    \\                    if (!@hasField(ServerT, "static_dir")) break :blk "public";
+    \\                    break :blk zon.server.static_dir;
+    \\                };
+    \\                if (!isSafeRelativePathLiteral(value)) @compileError("mer.app.zon server.static_dir must be a safe relative path inside the app bundle");
+    \\                return value;
+    \\            }
     \\            fn parseIpv4ByteLiteral(comptime part: []const u8) ?u8 {
     \\                if (part.len == 0 or part.len > 3) return null;
     \\                for (part) |c| if (!std.ascii.isDigit(c)) return null;
@@ -1034,8 +1074,7 @@ const native_build_snippet =
     \\                if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
     \\                if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
     \\                if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
-    \\                if (!zonHasNavigationOrigins(zon)) msg = msg ++ "missing explicit non-empty .security.navigation.allowed_origins\\n";
-    \\                if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
+    \\                if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production extra navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     \\                if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
     \\                if (!zonHasBridgeArray(zon, "command_origins")) msg = msg ++ "missing non-empty .security.bridge.command_origins\\n";
     \\                if (!zonHasOpenArray(zon, "external_schemes")) msg = msg ++ "missing non-empty .security.open.external_schemes\\n";
@@ -1071,9 +1110,16 @@ const native_build_snippet =
     \\            .install_dir = .prefix,
     \\            .install_subdir = "",
     \\        });
+    \\        const static_assets_dir = comptime NativePackage.zonServerStaticDir(app_zon);
+    \\        const pkg_static = b.addInstallDirectory(.{
+    \\            .source_dir = b.path(static_assets_dir),
+    \\            .install_dir = .prefix,
+    \\            .install_subdir = b.fmt("{s}/Contents/Resources/{s}", .{ pkg_name, static_assets_dir }),
+    \\        });
     \\        const package_step = b.step("package", "Package native app as a .app bundle");
     \\        package_step.dependOn(&pkg_bin.step);
     \\        package_step.dependOn(&pkg_plist.step);
+    \\        package_step.dependOn(&pkg_static.step);
     \\
     \\        const app_path = b.getInstallPath(.prefix, pkg_name);
     \\        const prod_check_message = comptime NativePackage.macProdCheckMessage(app_zon);
@@ -1099,12 +1145,10 @@ const native_build_snippet =
     \\            const codesign = b.addSystemCommand(&.{ "codesign", "--deep", "--force", "--options", "runtime", "--timestamp", "--sign", identity });
     \\            if (entitlements) |path| codesign.addArgs(&.{ "--entitlements", path });
     \\            codesign.addArg(app_path);
-    \\            codesign.step.dependOn(native_prod_check_step);
     \\            codesign.step.dependOn(package_step);
     \\            package_sign_step.dependOn(&codesign.step);
     \\        } else {
-    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity' >&2; exit 1" });
-    \\            fail.step.dependOn(native_prod_check_step);
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity in mer.app.zon' >&2; exit 1" });
     \\            fail.step.dependOn(package_step);
     \\            package_sign_step.dependOn(&fail.step);
     \\        }
@@ -1115,7 +1159,7 @@ const native_build_snippet =
     \\        );
     \\        const package_notarize_step = b.step("package-notarize", "Codesign, notarize, and staple native app");
     \\        if (notarization_profile) |profile| {
-    \\            const zip_path = b.fmt("zig-out/{s}.zip", .{pkg_name});
+    \\            const zip_path = b.getInstallPath(.prefix, b.fmt("{s}.zip", .{pkg_name}));
     \\            const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
     \\            zip.step.dependOn(native_prod_check_step);
     \\            zip.step.dependOn(package_sign_step);
@@ -1125,7 +1169,7 @@ const native_build_snippet =
     \\            staple.step.dependOn(&submit.step);
     \\            package_notarize_step.dependOn(&staple.step);
     \\        } else {
-    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile' >&2; exit 1" });
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile in mer.app.zon' >&2; exit 1" });
     \\            fail.step.dependOn(native_prod_check_step);
     \\            package_notarize_step.dependOn(&fail.step);
     \\        }

@@ -95,6 +95,32 @@ fn zonServerHost(comptime zon: anytype) []const u8 {
     return zon.server.host;
 }
 
+fn isSafeRelativePathLiteral(comptime path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or path[0] == '~') return false;
+    var start: usize = 0;
+    for (path, 0..) |c, i| {
+        if (c == ':' or c == '\\' or c <= 0x1f or c == 0x7f) return false;
+        if (c == '/') {
+            const part = path[start..i];
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+            start = i + 1;
+        }
+    }
+    const last = path[start..];
+    return last.len > 0 and !std.mem.eql(u8, last, ".") and !std.mem.eql(u8, last, "..");
+}
+
+fn zonServerStaticDir(comptime zon: anytype) []const u8 {
+    const T = @TypeOf(zon);
+    const value = if (!@hasField(T, "server")) "public" else blk: {
+        const ServerT = @TypeOf(zon.server);
+        if (!@hasField(ServerT, "static_dir")) break :blk "public";
+        break :blk zon.server.static_dir;
+    };
+    if (!isSafeRelativePathLiteral(value)) @compileError("mer.app.zon server.static_dir must be a safe relative path inside the app bundle");
+    return value;
+}
+
 fn parseIpv4ByteLiteral(comptime part: []const u8) ?u8 {
     if (part.len == 0 or part.len > 3) return null;
     for (part) |c| if (!std.ascii.isDigit(c)) return null;
@@ -269,8 +295,7 @@ fn macProdCheckMessage(comptime zon: anytype) []const u8 {
     if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
     if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
     if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
-    if (!zonHasNavigationOrigins(zon)) msg = msg ++ "missing explicit non-empty .security.navigation.allowed_origins\\n";
-    if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
+    if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production extra navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
     if (!zonHasBridgeArray(zon, "command_origins")) msg = msg ++ "missing non-empty .security.bridge.command_origins\\n";
     if (!zonHasOpenArray(zon, "external_schemes")) msg = msg ++ "missing non-empty .security.open.external_schemes\\n";
@@ -753,9 +778,16 @@ pub fn build(b: *std.Build) void {
             .install_dir = .prefix,
             .install_subdir = "",
         });
+        const static_assets_dir = comptime zonServerStaticDir(app_zon);
+        const pkg_static = b.addInstallDirectory(.{
+            .source_dir = b.path(static_assets_dir),
+            .install_dir = .prefix,
+            .install_subdir = b.fmt("{s}/Contents/Resources/{s}", .{ pkg_name, static_assets_dir }),
+        });
         const package_step = b.step("package", "Package the native app as a .app bundle (macOS)");
         package_step.dependOn(&pkg_bin.step);
         package_step.dependOn(&pkg_plist.step);
+        package_step.dependOn(&pkg_static.step);
 
         const prod_check_message = comptime macProdCheckMessage(app_zon);
         const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
@@ -797,7 +829,6 @@ pub fn build(b: *std.Build) void {
             });
             if (entitlements) |path| codesign.addArgs(&.{ "--entitlements", path });
             codesign.addArg(app_path);
-            codesign.step.dependOn(native_prod_check_step);
             codesign.step.dependOn(package_step);
             package_sign_step.dependOn(&codesign.step);
         } else {
@@ -806,7 +837,6 @@ pub fn build(b: *std.Build) void {
                 "-c",
                 "echo 'mer native: package-sign needs -Dmacos-signing-identity or .macos.signing_identity in mer.app.zon' >&2; exit 1",
             });
-            fail.step.dependOn(native_prod_check_step);
             fail.step.dependOn(package_step);
             package_sign_step.dependOn(&fail.step);
         }
@@ -821,7 +851,7 @@ pub fn build(b: *std.Build) void {
         );
         const package_notarize_step = b.step("package-notarize", "Codesign, notarize, and staple the native .app bundle (macOS)");
         if (notarization_profile) |profile| {
-            const zip_path = b.fmt("zig-out/{s}.zip", .{pkg_name});
+            const zip_path = b.getInstallPath(.prefix, b.fmt("{s}.zip", .{pkg_name}));
             const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
             zip.step.dependOn(native_prod_check_step);
             zip.step.dependOn(package_sign_step);

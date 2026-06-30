@@ -19,7 +19,7 @@ This document maps the native shell/bridge work to a zero-trust security posture
 | Deny-by-default command surface | Unknown commands return `UnknownCommand`; custom commands are invalid unless they use a non-reserved app namespace and non-empty permission. |
 | Least-agency allowlisting | Production gates require non-empty `security.bridge.allowed_commands` and `security.bridge.command_origins`. Custom commands additionally require explicit allowlisting. |
 | Origin isolation | Runtime loopback origin is injected after port binding; production manifest origins must not include broad loopback/localhost entries. Navigation to non-allowed origins is cancelled. |
-| Parameter/resource boundaries | Payloads are capped at 64 KB; `open.external` is scheme-allowlisted; `open.path` fails closed without explicit roots and canonicalizes paths before opening. |
+| Parameter/resource boundaries | Payloads are capped at 64 KB; `open.external` is scheme-allowlisted and rejects malformed/native-ambiguous URLs; `open.path` fails closed without explicit roots and canonicalizes paths before opening. |
 | Supply-chain/update integrity | Update feeds require strict HTTPS, Ed25519 signatures over canonical metadata, anti-replay `metadata_version`, platform uniqueness, and artifact size/SHA-256 verification. Automatic install is deferred. |
 | Platform fail-closed | Native shell and command backend are macOS-only today; Linux/Windows stubs return `UnsupportedPlatform` until origin extraction, path canonicalization, and packaging gates are implemented. |
 | Production configuration integrity | `zig build native-prod-check` rejects missing signing/notarization/update/security hardening fields. Manifest configuration is version-controlled ZON imported at comptime. |

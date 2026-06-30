@@ -41,7 +41,7 @@ Out of scope:
 
 - **Loopback binding:** the shell binds the embedded server to `127.0.0.1` by default, uses an ephemeral port (`port = 0`), and rejects non-loopback/non-literal native `server.host` values (`localhost` is intentionally rejected; use `127.0.0.1`).
 - **Runtime origin pinning:** after the server binds, `shell.zig` prepends the exact `http://host:port` origin to the allowed origin list.
-- **Bridge origin validation:** the macOS backend reads the `WKScriptMessage` frame origin and rejects calls before dispatch when the origin is not allowed.
+- **Bridge origin validation:** the macOS backend reads the `WKScriptMessage` frame origin and rejects calls before dispatch when the origin is not allowed; bridge dispatch also enforces the global origin allowlist for lower-level embedders.
 - **WebView navigation policy:** the macOS shell installs a `WKNavigationDelegate` and cancels navigation to non-allowed origins.
 - **Payload limits:** bridge payloads over 64 KB are rejected.
 - **Session-scoped bridge token:** the native shell generates a 256-bit random capability per process, injects it into the private JS shim closure, `bridge.zig` rejects missing/invalid tokens before command lookup, and native responses must echo the token before the shim resolves a pending Promise.
@@ -51,7 +51,7 @@ Out of scope:
 - **Permission classes:** built-in commands require manifest permissions such as `clipboard`, `dialog`, `open`, and `window`.
 - **Explicit command allowlist:** `security.bridge.allowed_commands` can restrict the manifest to exact command names, similar to Tauri capabilities.
 - **Per-command origins:** `security.bridge.command_origins` can bind commands to origins with `"command|origin"` entries; when configured, commands without a matching origin rule are denied.
-- **Safer open commands:** `open.external` rejects disallowed schemes (default: `http`, `https`, `mailto`); `open.path` fails closed unless explicit path roots are configured.
+- **Safer open commands:** `open.external` rejects disallowed schemes (default: `http`, `https`, `mailto`) and malformed/native-ambiguous URLs; `open.path` fails closed unless explicit path roots are configured.
 - **macOS signing hooks:** `zig build package-sign` / `mer package --sign` run hardened-runtime `codesign`; `package-notarize` / `mer package --notarize` run `notarytool` and `stapler`.
 - **Signed update checks:** `src/native/update.zig` verifies HTTPS feed/config shape, Ed25519 signatures over canonical update metadata, SHA-256 artifact hashes, platform uniqueness, signed metadata_version anti-replay state, and rollback-window metadata before reporting an update.
 
@@ -100,5 +100,5 @@ Security smoke tests to keep in CI/manual review:
 - wrong command origin returns `OriginNotAllowed`
 - oversized payload returns `PayloadTooLarge`
 - malformed JSON returns `ParseError`
-- `open.external` rejects `javascript:` / unexpected schemes
+- `open.external` rejects `javascript:`, unexpected schemes, malformed HTTP(S), userinfo, controls, and backslashes
 - `open.path` rejects paths outside configured roots

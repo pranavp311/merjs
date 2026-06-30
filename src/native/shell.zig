@@ -54,6 +54,41 @@ fn createBridgeToken(allocator: std.mem.Allocator) ![]u8 {
     return try allocator.dupe(u8, &hex);
 }
 
+fn isSafeRelativeStaticDir(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or path[0] == '~') return false;
+    var start: usize = 0;
+    for (path, 0..) |c, i| {
+        if (c == ':' or c == '\\' or c <= 0x1f or c == 0x7f) return false;
+        if (c == '/') {
+            const part = path[start..i];
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+            start = i + 1;
+        }
+    }
+    const last = path[start..];
+    return last.len > 0 and !std.mem.eql(u8, last, ".") and !std.mem.eql(u8, last, "..");
+}
+
+fn resolvePackagedStaticDir(allocator: std.mem.Allocator, configured_static_dir: ?[]const u8) !?[]const u8 {
+    if (builtin.os.tag != .macos) return configured_static_dir;
+    const relative = configured_static_dir orelse "public";
+    if (!isSafeRelativeStaticDir(relative)) return "__mer_invalid_static_dir__";
+    const exe_path = std.process.executablePathAlloc(runtime.io, allocator) catch return configured_static_dir;
+    defer allocator.free(exe_path);
+    const macos_dir = std.fs.path.dirname(exe_path) orelse return configured_static_dir;
+    const contents_dir = std.fs.path.dirname(macos_dir) orelse return configured_static_dir;
+    const app_dir = std.fs.path.dirname(contents_dir);
+    const is_packaged_app = std.mem.eql(u8, std.fs.path.basename(contents_dir), "Contents") and
+        app_dir != null and std.mem.endsWith(u8, app_dir.?, ".app");
+    const candidate = try std.fs.path.join(allocator, &.{ contents_dir, "Resources", relative });
+    errdefer allocator.free(candidate);
+    std.Io.Dir.cwd().access(runtime.io, candidate, .{}) catch {
+        if (is_packaged_app) return "__mer_missing_packaged_static_dir__";
+        return configured_static_dir;
+    };
+    return candidate;
+}
+
 /// Options for `run`. Pass `.{}` for defaults (no raw handler and no custom commands).
 pub const RunOpts = struct {
     /// Optional raw-request handler (e.g. SSE /events). Receives the live
@@ -110,13 +145,17 @@ pub fn run(
     // The server/watcher are detached for this macOS-first shell. Closing the
     // last window terminates the process through AppKit; cooperative shutdown
     // can replace this once Server.listen has a stop signal.
+    // Runtime-owned allocations below intentionally outlive the blocking AppKit
+    // loop; replace them with an owning shell object when cooperative shutdown
+    // and multi-window lifetimes land.
+    const effective_static_dir = try resolvePackagedStaticDir(allocator, app_manifest.static_dir);
     const ctx = try allocator.create(ServerCtx);
     ctx.* = .{
         .allocator = allocator,
         .router = router,
         .manifest = app_manifest,
         .watcher = watcher_ref,
-        .static_dir = app_manifest.static_dir,
+        .static_dir = effective_static_dir,
         .raw_handler = opts.raw_handler,
     };
     const thread = try std.Thread.spawn(.{}, runServer, .{ctx});
