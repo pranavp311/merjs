@@ -52,6 +52,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return std.mem.lessThan(u8, a, b);
         }
     }.lessThan);
+    try validateUniqueRoutes(alloc, entries.items, true);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -223,43 +224,69 @@ fn toUrl(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.mem.eql(u8, rel, "index")) return alloc.dupe(u8, "/");
 
     // Build URL: "/" + rel, replacing OS separators with '/' and [name] → :name.
-    var result = try alloc.alloc(u8, rel.len + 1);
-    result[0] = '/';
+    const result_buffer = try alloc.alloc(u8, rel.len + 1);
+    errdefer alloc.free(result_buffer);
+    result_buffer[0] = '/';
     var i: usize = 0;
     var out: usize = 1;
     while (i < rel.len) : (i += 1) {
         const c = rel[i];
         if (c == '[') {
             // Replace '[name]' with ':name'.
-            result[out] = ':';
+            result_buffer[out] = ':';
             out += 1;
             i += 1; // skip '['
             while (i < rel.len and rel[i] != ']') : (i += 1) {
-                result[out] = rel[i];
+                result_buffer[out] = rel[i];
                 out += 1;
             }
             // i now points at ']' — loop increment skips it.
         } else {
-            result[out] = if (c == std.fs.path.sep) '/' else c;
+            result_buffer[out] = if (c == std.fs.path.sep) '/' else c;
             out += 1;
         }
     }
-    result = result[0..out];
+    const result = result_buffer[0..out];
 
     // Strip trailing "/index" → parent path.
     const index_suffix = "/index";
-    if (std.mem.endsWith(u8, result, index_suffix)) {
+    const final = if (std.mem.endsWith(u8, result, index_suffix)) blk: {
         const trimmed = result[0 .. result.len - index_suffix.len];
-        if (trimmed.len == 0) {
-            alloc.free(result);
-            return alloc.dupe(u8, "/");
-        }
-        const r = try alloc.dupe(u8, trimmed);
-        alloc.free(result);
-        return r;
-    }
+        break :blk if (trimmed.len == 0) "/" else trimmed;
+    } else result;
+    const owned = try alloc.dupe(u8, final);
+    alloc.free(result_buffer);
+    return owned;
+}
 
-    return result;
+fn routePatternsCollide(a: []const u8, b: []const u8) bool {
+    var a_segments = std.mem.splitScalar(u8, a, '/');
+    var b_segments = std.mem.splitScalar(u8, b, '/');
+    while (true) {
+        const a_segment = a_segments.next();
+        const b_segment = b_segments.next();
+        if (a_segment == null or b_segment == null) return a_segment == null and b_segment == null;
+        const a_dynamic = a_segment.?.len > 0 and a_segment.?[0] == ':';
+        const b_dynamic = b_segment.?.len > 0 and b_segment.?[0] == ':';
+        if (a_dynamic != b_dynamic) return false;
+        if (!a_dynamic and !std.mem.eql(u8, a_segment.?, b_segment.?)) return false;
+    }
+}
+
+fn validateUniqueRoutes(alloc: std.mem.Allocator, entries: []const []const u8, report_collision: bool) !void {
+    for (entries, 0..) |path, i| {
+        const url = try toUrl(alloc, path);
+        defer alloc.free(url);
+        for (entries[0..i]) |previous_path| {
+            const previous_url = try toUrl(alloc, previous_path);
+            if (routePatternsCollide(url, previous_url)) {
+                if (report_collision) std.debug.print("codegen: route collision: {s} ({s}) conflicts with {s} ({s})\n", .{ path, url, previous_path, previous_url });
+                alloc.free(previous_url);
+                return error.DuplicateRoute;
+            }
+            alloc.free(previous_url);
+        }
+    }
 }
 
 fn fileExists(path: []const u8) bool {
@@ -309,4 +336,24 @@ fn scanCssCandidates(
         try sources.append(alloc, content);
         try mercss_jit.scan(content, alloc, candidates);
     }
+}
+
+test "route collision detection rejects index aliases and renamed parameters" {
+    try std.testing.expect(routePatternsCollide("/foo", "/foo"));
+    try std.testing.expect(routePatternsCollide("/users/:id", "/users/:slug"));
+    try std.testing.expect(!routePatternsCollide("/users/settings", "/users/:id"));
+    try std.testing.expect(!routePatternsCollide("/users/:id/profile", "/users/:id"));
+
+    try std.testing.expectError(error.DuplicateRoute, validateUniqueRoutes(std.testing.allocator, &.{
+        "app/foo.zig",
+        "app/foo/index.zig",
+    }, false));
+    try std.testing.expectError(error.DuplicateRoute, validateUniqueRoutes(std.testing.allocator, &.{
+        "app/users/[id].zig",
+        "app/users/[slug].zig",
+    }, false));
+    try validateUniqueRoutes(std.testing.allocator, &.{
+        "app/users/settings.zig",
+        "app/users/[id].zig",
+    }, false);
 }

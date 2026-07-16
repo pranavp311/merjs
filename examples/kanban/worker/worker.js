@@ -112,37 +112,55 @@ function injectEnv(wasm, env) {
 
 const forwardedHeaders = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
 
-async function readIncomingBody(request) {
-  const value = request.headers.get("content-length");
-  if (value !== null && (!/^(0|[1-9][0-9]*)$/.test(value) ||
-      !Number.isSafeInteger(Number(value)) || Number(value) > 1024 * 1024)) {
-    await request.body?.cancel("invalid or oversized request body").catch(() => {});
-    throw new Error("invalid or oversized request body");
-  }
-  if (!request.body) return new Uint8Array();
-  const reader = request.body.getReader();
-  const chunks = [];
-  let length = 0;
-  let complete = false;
+async function readIncomingBody(request, maxDurationMs = 30000) {
+  const controller = new AbortController();
+  const abortFromRequest = () => controller.abort(request.signal?.reason);
+  if (request.signal?.aborted) abortFromRequest();
+  else request.signal?.addEventListener("abort", abortFromRequest, { once: true });
+  const timeoutError = new Error("request body deadline exceeded");
+  timeoutError.name = "TimeoutError";
+  const timeout = setTimeout(() => controller.abort(timeoutError), maxDurationMs);
   try {
-    while (true) {
-      const { done, value: chunk } = await reader.read();
-      if (done) { complete = true; break; }
-      if (chunk.byteLength > 1024 * 1024 - length) {
-        await reader.cancel("request body too large").catch(() => {});
-        throw new Error("request body too large");
-      }
-      chunks.push(chunk);
-      length += chunk.byteLength;
+    if (controller.signal.aborted) throw controller.signal.reason;
+    const value = request.headers.get("content-length");
+    if (value !== null && (!/^(0|[1-9][0-9]*)$/.test(value) ||
+        !Number.isSafeInteger(Number(value)) || Number(value) > 1024 * 1024)) {
+      await request.body?.cancel("invalid or oversized request body").catch(() => {});
+      throw new Error("invalid or oversized request body");
     }
+    if (!request.body) return new Uint8Array();
+    const reader = request.body.getReader();
+    const chunks = [];
+    let length = 0;
+    let complete = false;
+    const cancel = () => { void reader.cancel(controller.signal.reason).catch(() => {}); };
+    controller.signal.addEventListener("abort", cancel, { once: true });
+    try {
+      while (true) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        const { done, value: chunk } = await reader.read();
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (done) { complete = true; break; }
+        if (chunk.byteLength > 1024 * 1024 - length) {
+          await reader.cancel("request body too large").catch(() => {});
+          throw new Error("request body too large");
+        }
+        chunks.push(chunk);
+        length += chunk.byteLength;
+      }
+    } finally {
+      controller.signal.removeEventListener("abort", cancel);
+      if (!complete) await reader.cancel(controller.signal.reason || "request body read failed").catch(() => {});
+      reader.releaseLock();
+    }
+    const body = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+    return body;
   } finally {
-    if (!complete) await reader.cancel("request body read failed").catch(() => {});
-    reader.releaseLock();
+    clearTimeout(timeout);
+    request.signal?.removeEventListener("abort", abortFromRequest);
   }
-  const body = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
-  return body;
 }
 
 async function encodeIncomingRequest(request, url) {

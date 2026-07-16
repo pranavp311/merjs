@@ -133,6 +133,17 @@ await assert.rejects(readBoundedRequestBody({
 }, 16), /too large/);
 assert.equal(requestCanceled, 1, "streaming request overflow was not canceled immediately");
 
+let stalledRequestCanceled = 0;
+await assert.rejects(readBoundedRequestBody({
+  headers: new Headers(),
+  signal: new AbortController().signal,
+  body: new ReadableStream({
+    pull() {},
+    cancel() { stalledRequestCanceled++; },
+  }),
+}, 16, 1), /deadline exceeded/);
+assert.equal(stalledRequestCanceled, 1, "stalled request body was not canceled at its deadline");
+
 let siblingSettled = false;
 let abortObserved = false;
 await assert.rejects(runBounded([0, 1], 2, async item => {

@@ -49,11 +49,28 @@ async function readBody(message, limit, signal) {
   return body;
 }
 
+async function readRequestBody(request, limit, maxDurationMs = 30000) {
+  const controller = new AbortController();
+  const abortFromRequest = () => controller.abort(request.signal?.reason);
+  if (request.signal?.aborted) abortFromRequest();
+  else request.signal?.addEventListener("abort", abortFromRequest, { once: true });
+  const timeoutError = new Error("request body deadline exceeded");
+  timeoutError.name = "TimeoutError";
+  const timeout = setTimeout(() => controller.abort(timeoutError), maxDurationMs);
+  try {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return await readBody(request, limit, controller.signal);
+  } finally {
+    clearTimeout(timeout);
+    request.signal?.removeEventListener("abort", abortFromRequest);
+  }
+}
+
 async function encodeRequest(request) {
   const url = new URL(request.url);
   const clientIdentity = encoder.encode(request.headers.get("x-vercel-forwarded-for") || "");
   const parts = [encoder.encode(request.method), encoder.encode(url.pathname + url.search),
-    await readBody(request, MAX_BODY_BYTES), encoder.encode(request.headers.get("cookie") || ""), clientIdentity];
+    await readRequestBody(request, MAX_BODY_BYTES), encoder.encode(request.headers.get("cookie") || ""), clientIdentity];
   const forwarded = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
   const headers = forwarded.flatMap(name => {
     const value = request.headers.get(name);

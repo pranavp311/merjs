@@ -74,6 +74,8 @@ for (const adapter of [
   assert.doesNotMatch(source, /request\.arrayBuffer\(/, `${adapter}: request body is not streamed`);
   assert.match(source, /\^\(0\|\[1-9\]/, `${adapter}: canonical Content-Length validation missing`);
   assert.match(source, /\.cancel\(/, `${adapter}: oversized body is not canceled`);
+  assert.match(source, /deadline exceeded/, `${adapter}: incoming body has no deadline`);
+  assert.match(source, /\.signal|signal\?/, `${adapter}: incoming body ignores request cancellation`);
 }
 
 for (const adapter of [

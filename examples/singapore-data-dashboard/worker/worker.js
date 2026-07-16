@@ -55,37 +55,55 @@ function injectEnv(wasm, env) {
 const resolverScript = "(()=>{for(const s of document.querySelectorAll('template[data-mer-resolve]')){for(const p of document.querySelectorAll('[data-mer-placeholder]')){if(p.getAttribute('data-mer-placeholder')===s.getAttribute('data-mer-resolve')){p.replaceWith(s.content);s.remove();break}}}})();";
 const forwardedHeaders = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
 
-async function readIncomingBody(request, limit = 1024 * 1024) {
-  const value = request.headers.get("content-length");
-  if (value !== null && (!/^(0|[1-9][0-9]*)$/.test(value) ||
-      !Number.isSafeInteger(Number(value)) || Number(value) > limit)) {
-    await request.body?.cancel("invalid or oversized request body").catch(() => {});
-    throw new Error("invalid or oversized request body");
-  }
-  if (!request.body) return new Uint8Array();
-  const reader = request.body.getReader();
-  const chunks = [];
-  let length = 0;
-  let complete = false;
+async function readIncomingBody(message, limit = 1024 * 1024, maxDurationMs = 30000) {
+  const controller = new AbortController();
+  const abortFromMessage = () => controller.abort(message.signal?.reason);
+  if (message.signal?.aborted) abortFromMessage();
+  else message.signal?.addEventListener("abort", abortFromMessage, { once: true });
+  const timeoutError = new Error("body deadline exceeded");
+  timeoutError.name = "TimeoutError";
+  const timeout = setTimeout(() => controller.abort(timeoutError), maxDurationMs);
   try {
-    while (true) {
-      const { done, value: chunk } = await reader.read();
-      if (done) { complete = true; break; }
-      if (chunk.byteLength > limit - length) {
-        await reader.cancel("request body too large").catch(() => {});
-        throw new Error("request body too large");
-      }
-      chunks.push(chunk);
-      length += chunk.byteLength;
+    if (controller.signal.aborted) throw controller.signal.reason;
+    const value = message.headers.get("content-length");
+    if (value !== null && (!/^(0|[1-9][0-9]*)$/.test(value) ||
+        !Number.isSafeInteger(Number(value)) || Number(value) > limit)) {
+      await message.body?.cancel("invalid or oversized body").catch(() => {});
+      throw new Error("invalid or oversized body");
     }
+    if (!message.body) return new Uint8Array();
+    const reader = message.body.getReader();
+    const chunks = [];
+    let length = 0;
+    let complete = false;
+    const cancel = () => { void reader.cancel(controller.signal.reason).catch(() => {}); };
+    controller.signal.addEventListener("abort", cancel, { once: true });
+    try {
+      while (true) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        const { done, value: chunk } = await reader.read();
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (done) { complete = true; break; }
+        if (chunk.byteLength > limit - length) {
+          await reader.cancel("body too large").catch(() => {});
+          throw new Error("body too large");
+        }
+        chunks.push(chunk);
+        length += chunk.byteLength;
+      }
+    } finally {
+      controller.signal.removeEventListener("abort", cancel);
+      if (!complete) await reader.cancel(controller.signal.reason || "body read failed").catch(() => {});
+      reader.releaseLock();
+    }
+    const body = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+    return body;
   } finally {
-    if (!complete) await reader.cancel("request body read failed").catch(() => {});
-    reader.releaseLock();
+    clearTimeout(timeout);
+    message.signal?.removeEventListener("abort", abortFromMessage);
   }
-  const body = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
-  return body;
 }
 
 async function encodeIncomingRequest(request, url) {

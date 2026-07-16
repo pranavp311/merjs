@@ -61,14 +61,27 @@ async function readStreamBounded(body, limit, message, signal) {
   return bytes;
 }
 
-export async function readBoundedRequestBody(request, limit) {
+export async function readBoundedRequestBody(request, limit, maxDurationMs = 30000) {
+  const controller = new AbortController();
+  const abortFromRequest = () => controller.abort(request.signal?.reason);
+  if (request.signal?.aborted) abortFromRequest();
+  else request.signal?.addEventListener("abort", abortFromRequest, { once: true });
+  const timeoutError = new Error("request body deadline exceeded");
+  timeoutError.name = "TimeoutError";
+  const timeout = setTimeout(() => controller.abort(timeoutError), maxDurationMs);
   try {
-    boundedContentLength(request.headers, limit, "request body");
-  } catch (error) {
-    await request.body?.cancel(error.message).catch(() => {});
-    throw error;
+    if (controller.signal.aborted) throw controller.signal.reason;
+    try {
+      boundedContentLength(request.headers, limit, "request body");
+    } catch (error) {
+      await request.body?.cancel(error.message).catch(() => {});
+      throw error;
+    }
+    return await readStreamBounded(request.body, limit, "request body", controller.signal);
+  } finally {
+    clearTimeout(timeout);
+    request.signal?.removeEventListener("abort", abortFromRequest);
   }
-  return readStreamBounded(request.body, limit, "request body");
 }
 
 export async function readBoundedBody(response, limit, signal) {
