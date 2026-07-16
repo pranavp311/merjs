@@ -51,6 +51,7 @@ assert.ok(!existsSync(join(root, "examples/site/worker/worker/wrangler.toml")), 
 
 const vercelConfig = JSON.parse(readFileSync(join(root, "examples/vercel-edge/vercel.json"), "utf8"));
 assert.deepEqual(vercelConfig.rewrites, [{ source: "/(.*)", destination: "/api" }]);
+assert.ok(!("buildCommand" in vercelConfig), "Vercel deployment unexpectedly requires a remote Zig toolchain");
 assert.ok(existsSync(join(root, "examples/vercel-edge/merjs.wasm")), "Vercel deployment is missing merjs.wasm");
 const vercelAdapter = readFileSync(join(root, "examples/vercel-edge/api/index.js"), "utf8");
 assert.match(vercelAdapter, /new WebAssembly\.Instance\(wasmModule, \{\}\)/, "Vercel WASM is not request-local");

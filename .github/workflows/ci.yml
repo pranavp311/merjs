@@ -51,6 +51,8 @@ jobs:
           zig build cli -Dtarget=x86_64-linux -Doptimize=ReleaseSmall
           zig build cli -Dtarget=aarch64-linux -Doptimize=ReleaseSmall
           zig build worker
+          cmp examples/site/worker/worker/merjs.wasm examples/vercel-edge/merjs.wasm
+          git diff --exit-code -- examples/vercel-edge/merjs.wasm
           zig build sgdata-worker
           zig build worker-example-kanban
           zig build wasm

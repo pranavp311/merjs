@@ -6,15 +6,16 @@ as Cloudflare Workers.
 
 ## Setup
 
-1. Build the WASM binary:
+1. The current `merjs.wasm` deployment artifact is versioned with this example.
+   When framework routes or Worker runtime code change, regenerate and verify it:
 
 ```bash
 cd ../..
 zig build worker
-# Generates both the Cloudflare and examples/vercel-edge/merjs.wasm outputs.
+cmp examples/site/worker/worker/merjs.wasm examples/vercel-edge/merjs.wasm
 ```
 
-2. Deploy:
+2. Deploy (the remote Vercel build does not require Zig):
 
 ```bash
 cd examples/vercel-edge

@@ -311,6 +311,32 @@ pub fn isCommandAllowed(ctx: *Ctx, name: []const u8) bool {
     return false;
 }
 
+fn isLoopbackOriginHost(host: []const u8) bool {
+    const normalized = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        host[1 .. host.len - 1]
+    else
+        host;
+    if (std.ascii.eqlIgnoreCase(normalized, "::1")) return true;
+
+    var parts = std.mem.splitScalar(u8, normalized, '.');
+    var count: usize = 0;
+    var first: u8 = 0;
+    while (parts.next()) |part| {
+        if (part.len == 0 or part.len > 3) return false;
+        for (part) |c| if (!std.ascii.isDigit(c)) return false;
+        const value = std.fmt.parseInt(u8, part, 10) catch return false;
+        if (count == 0) first = value;
+        count += 1;
+        if (count > 4) return false;
+    }
+    return count == 4 and first == 127;
+}
+
+fn commandOriginHostsEqual(actual: []const u8, allowed: []const u8, globally_constrained: bool) bool {
+    return std.ascii.eqlIgnoreCase(actual, allowed) or
+        (globally_constrained and isLoopbackOriginHost(actual) and isLoopbackOriginHost(allowed));
+}
+
 pub fn isCommandOriginAllowed(ctx: *Ctx, name: []const u8) bool {
     const origin = ctx.current_origin orelse return ctx.command_origins.len == 0;
     const actual = parseOrigin(origin) orelse return false;
@@ -322,7 +348,10 @@ pub fn isCommandOriginAllowed(ctx: *Ctx, name: []const u8) bool {
         saw_rule_for_command = true;
         const allowed = parseOrigin(entry[sep + 1 ..]) orelse continue;
         if (!std.ascii.eqlIgnoreCase(actual.scheme, allowed.scheme)) continue;
-        if (!std.ascii.eqlIgnoreCase(actual.host, allowed.host)) continue;
+        // The global exact-origin check has already constrained the frame to
+        // this app's ephemeral runtime origin. Treat IPv4/IPv6 loopback host
+        // spellings as equivalent for generated portless command policies.
+        if (!commandOriginHostsEqual(actual.host, allowed.host, ctx.allowed_origins.len != 0)) continue;
         // Command-origin entries may omit the port for ephemeral loopback apps.
         // The platform backend has already enforced the strict global origin,
         // so this does not expand bridge access beyond the loaded app origin.
@@ -889,6 +918,21 @@ test "dispatchWithRegistry: global origin allowlist is enforced in bridge dispat
     ctx.command_origins = &.{"mer.ping|http://127.0.0.1"};
     const js = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":28}");
     try testing.expectEqualStrings("window.mer._resolve(28,false,\"OriginNotAllowed\");", js);
+}
+
+test "dispatchWithRegistry: generated IPv4 command origins allow an exact IPv6 runtime" {
+    try testing.expect(commandOriginHostsEqual("[::1]", "127.0.0.1", true));
+    try testing.expect(!commandOriginHostsEqual("[::1]", "127.0.0.1", false));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var ctx = newCtx(alloc, &.{});
+    ctx.allowed_origins = &.{"http://[::1]:4444"};
+    ctx.current_origin = "http://[::1]:4444";
+    ctx.command_origins = &.{"mer.ping|http://127.0.0.1"};
+    const js = try dispatch(&ctx, "{\"cmd\":\"mer.ping\",\"args\":null,\"id\":30}");
+    try testing.expectEqualStrings("window.mer._resolve(30,true,{\"pong\":true});", js);
 }
 
 test "dispatchWithRegistry: portless command origins require global origin allowlist" {
