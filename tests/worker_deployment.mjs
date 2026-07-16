@@ -61,6 +61,7 @@ assert.match(vercelAdapter, /wasm\.response_done\(\)/, "Vercel adapter does not 
 assert.match(vercelAdapter, /collect_fetch_urls/, "Vercel adapter omits fetch collection/replay");
 assert.match(vercelAdapter, /x-vercel-forwarded-for/, "Vercel adapter omits trusted client identity");
 assert.match(vercelAdapter, /__mer_set_env_status/, "Vercel adapter omits environment injection");
+assert.doesNotMatch(vercelAdapter, /count\s*>=\s*\d+/, "Vercel adapter rejects valid environments by variable count");
 
 for (const adapter of [
   "examples/kanban/worker/worker.js",

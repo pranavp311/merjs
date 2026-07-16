@@ -187,14 +187,13 @@ async function replayFetches(wasm, requestPtr, requestLength, snapshot) {
 function injectEnvironment(wasm) {
   if (typeof wasm.__mer_set_env_status !== "function") throw new Error("environment injection unavailable");
   const bindings = typeof process !== "undefined" && process.env ? process.env : {};
-  let count = 0;
   let totalBytes = 0;
   for (const [key, value] of Object.entries(bindings)) {
     if (typeof value !== "string") continue;
     const keyBytes = encoder.encode(key);
     const valueBytes = encoder.encode(value);
     if (!keyBytes.length || keyBytes.length > 256 || valueBytes.length > 64 * 1024 ||
-        count >= 256 || totalBytes + keyBytes.length + valueBytes.length > 1024 * 1024)
+        totalBytes + keyBytes.length + valueBytes.length > 1024 * 1024)
       throw new Error("environment bindings exceed limits");
     const keyPtr = wasm.alloc(keyBytes.length);
     const valuePtr = valueBytes.length ? wasm.alloc(valueBytes.length) : 0;
@@ -209,7 +208,6 @@ function injectEnvironment(wasm) {
       if (keyPtr) wasm.dealloc(keyPtr, keyBytes.length);
       if (valueBytes.length && valuePtr) wasm.dealloc(valuePtr, valueBytes.length);
     }
-    count++;
     totalBytes += keyBytes.length + valueBytes.length;
   }
 }
