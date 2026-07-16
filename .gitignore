@@ -16,6 +16,8 @@ public/counter.wasm
 public/synth.wasm
 examples/site/public/counter.wasm
 examples/site/public/synth.wasm
+mer.zip
+merjs.zip
 dist/
 
 # Cloudflare Workers — compiled WASM output

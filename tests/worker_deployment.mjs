@@ -61,6 +61,7 @@ assert.match(vercelAdapter, /wasm\.response_done\(\)/, "Vercel adapter does not 
 assert.match(vercelAdapter, /collect_fetch_urls/, "Vercel adapter omits fetch collection/replay");
 assert.match(vercelAdapter, /x-vercel-forwarded-for/, "Vercel adapter omits trusted client identity");
 assert.match(vercelAdapter, /__mer_set_env_status/, "Vercel adapter omits environment injection");
+assert.match(vercelAdapter, /replayFetches\([\s\S]*request\.signal\)/, "Vercel fetch replay ignores client disconnects");
 assert.doesNotMatch(vercelAdapter, /count\s*>=\s*\d+/, "Vercel adapter rejects valid environments by variable count");
 assert.match(vercelAdapter, /await reader\.read\(\);\n\s+if \(signal\?\.aborted\)/, "Vercel body reads accept abort-driven truncation");
 
@@ -100,6 +101,7 @@ for (const adapter of [
   assert.match(source, /raceWithSignal\(workPromise/, `${adapter}: AI deadline does not bound the caller response`);
   assert.match(source, /workPromise\.finally\(\(\) => \{ aiActive--; \}\)/, `${adapter}: AI concurrency releases before work settles`);
   assert.match(source, /request\.body\?\.cancel\("AI request rejected"\)/, `${adapter}: rejected AI uploads are not canceled`);
+  assert.match(source, /request\.signal\?\.addEventListener\("abort", abortFromRequest/, `${adapter}: AI work ignores client disconnects after upload`);
   assert.doesNotMatch(source, /await [A-Za-z]+(?:Res)?\.(?:json|text)\(\)/, `${adapter}: AI upstream response is buffered without a byte cap`);
 }
 
@@ -114,6 +116,8 @@ for (const adapter of [
 
 const siteAdapter = readFileSync(join(root, "examples/site/worker/worker/worker.js"), "utf8");
 assert.match(siteAdapter, /readBoundedBody\(\{[\s\S]*body: obj\.body,[\s\S]*MAX_CORPUS_JSON_BYTES, signal\)/, "site R2 corpus read is not bounded");
+assert.match(siteAdapter, /raceWithSignal\(getPromise, signal\)/, "site R2 acquisition can outlive its AI deadline");
+assert.match(siteAdapter, /externalSignal: request\.signal/, "site fetch replay ignores client disconnects");
 assert.match(siteAdapter, /obj\?\.body\?\.cancel\("AI deadline exceeded"\)/, "site abandons an R2 body that resolves after its deadline");
 assert.match(siteAdapter, /cachedChunks\.expiresAt > now/, "site corpus cache never revalidates");
 assert.match(siteAdapter, /GREP_CHUNKS_CAPACITY - totalLen - 4/, "site grep corpus can exceed WASM capacity");

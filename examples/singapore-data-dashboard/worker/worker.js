@@ -196,10 +196,15 @@ async function admitAi(request, env, work) {
   aiActive++;
   aiMinuteCount++;
   const controller = new AbortController();
+  const abortFromRequest = () => controller.abort(request.signal?.reason);
+  if (request.signal?.aborted) abortFromRequest();
+  else request.signal?.addEventListener("abort", abortFromRequest, { once: true });
   const timeoutError = new Error("AI deadline exceeded");
   timeoutError.name = "TimeoutError";
   const timeout = setTimeout(() => controller.abort(timeoutError), 15000);
-  const workPromise = Promise.resolve().then(() => work(controller.signal, admission));
+  const workPromise = controller.signal.aborted
+    ? Promise.reject(controller.signal.reason)
+    : Promise.resolve().then(() => work(controller.signal, admission));
   // Keep the strict concurrency slot charged until the underlying operation
   // actually settles, even if the caller-facing deadline wins the race.
   void workPromise.finally(() => { aiActive--; }).catch(() => {});
@@ -207,7 +212,10 @@ async function admitAi(request, env, work) {
   catch (error) {
     if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
     return jsonResp({ error: error?.name === "TimeoutError" ? "AI request timed out" : "AI upstream unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
-  } finally { clearTimeout(timeout); }
+  } finally {
+    clearTimeout(timeout);
+    request.signal?.removeEventListener("abort", abortFromRequest);
+  }
 }
 
 async function readAiJson(request, deadlineSignal) {

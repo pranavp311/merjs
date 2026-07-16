@@ -131,11 +131,15 @@ export async function collectFetchRounds(options) {
     maxRequests,
     maxRequestBytes,
     maxDurationMs = 30000,
+    externalSignal,
     restore,
     collect,
     fetchRound,
   } = options;
   const controller = new AbortController();
+  const abortFromExternal = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) abortFromExternal();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
   const timeout = setTimeout(
     () => controller.abort(new Error("fetch protocol deadline exceeded")),
     maxDurationMs,
@@ -145,7 +149,9 @@ export async function collectFetchRounds(options) {
   let requestBytes = 0;
 
   try {
+    if (controller.signal.aborted) throw controller.signal.reason;
     for (let round = 0; round < maxRounds; round++) {
+      if (controller.signal.aborted) throw controller.signal.reason;
       // Round zero starts from the application snapshot and has no protocol
       // state yet. Later rounds restore only validated, versioned state.
       if (expectedState.byteLength !== 0 || results.length !== 0)
@@ -178,5 +184,6 @@ export async function collectFetchRounds(options) {
     throw error;
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
   }
 }

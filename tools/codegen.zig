@@ -157,6 +157,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
+fn isComponentPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "components/") or
+        std.mem.startsWith(u8, path, "components\\") or
+        std.mem.indexOf(u8, path, "/components/") != null or
+        std.mem.indexOf(u8, path, "\\components\\") != null;
+}
+
 /// Scan source_dir/ for *.zig files, appending "logical_dir/file.zig" to entries.
 fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), source_dir: []const u8, logical_dir: []const u8) !void {
     var d = std.Io.Dir.cwd().openDir(runtime.io, source_dir, .{ .iterate = true }) catch return;
@@ -170,6 +177,8 @@ fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), source_dir: 
         if (std.mem.eql(u8, entry.path, "layout.zig")) continue;
         // Skip 404.zig — it's an error handler, not a regular route.
         if (std.mem.eql(u8, entry.path, "404.zig")) continue;
+        // app/components contains reusable modules, not file-based pages.
+        if (std.mem.eql(u8, logical_dir, "app") and isComponentPath(entry.path)) continue;
         const full = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ logical_dir, entry.path });
         try entries.append(alloc, full);
     }
@@ -354,6 +363,13 @@ fn scanCssCandidates(
         try sources.append(alloc, content);
         try mercss_jit.scan(content, alloc, candidates);
     }
+}
+
+test "component directories are excluded from app routes" {
+    try std.testing.expect(isComponentPath("components/button.zig"));
+    try std.testing.expect(isComponentPath("admin/components/card.zig"));
+    try std.testing.expect(isComponentPath("components\\button.zig"));
+    try std.testing.expect(!isComponentPath("component-library.zig"));
 }
 
 test "route collision detection rejects index aliases and renamed parameters" {

@@ -171,15 +171,20 @@ function restore(wasm, snapshot, expected, results) {
   for (const result of results) provide(wasm, result);
 }
 
-async function replayFetches(wasm, requestPtr, requestLength, snapshot) {
+async function replayFetches(wasm, requestPtr, requestLength, snapshot, externalSignal) {
   const results = [];
   let expected = new Uint8Array();
   let requestBytes = 0;
   let responseBytes = 0;
   const controller = new AbortController();
+  const abortFromExternal = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) abortFromExternal();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
   const timeout = setTimeout(() => controller.abort(new Error("fetch deadline exceeded")), 30000);
   try {
+    if (controller.signal.aborted) throw controller.signal.reason;
     for (let round = 0; round <= MAX_FETCH_REQUESTS; round++) {
+      if (controller.signal.aborted) throw controller.signal.reason;
       if (expected.length || results.length) restore(wasm, snapshot, expected, results);
       const ptr = wasm.collect_fetch_urls(requestPtr, requestLength);
       const length = wasm.collect_urls_len();
@@ -199,7 +204,10 @@ async function replayFetches(wasm, requestPtr, requestLength, snapshot) {
       }
     }
     throw new Error("fetch round limit exceeded");
-  } finally { clearTimeout(timeout); }
+  } finally {
+    clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
+  }
 }
 
 function injectEnvironment(wasm) {
@@ -253,7 +261,7 @@ export default async function handler(request) {
   new Uint8Array(wasm.memory.buffer).set(encoded, requestPtr);
   try {
     try {
-      await replayFetches(wasm, requestPtr, encoded.length, new Uint8Array(wasm.memory.buffer).slice());
+      await replayFetches(wasm, requestPtr, encoded.length, new Uint8Array(wasm.memory.buffer).slice(), request.signal);
     } catch (_) {
       return edgeResponse(request, "Fetch Bridge Error", { status: 502 });
     }

@@ -160,7 +160,16 @@ async function getChunks(env, signal) {
   if (signal.aborted) throw signal.reason;
   const now = Date.now();
   if (cachedChunks && cachedChunks.expiresAt > now) return cachedChunks.value;
-  const obj = await env.BUCKET.get("budget2026/all_chunks.json");
+  const getPromise = Promise.resolve().then(() => env.BUCKET.get("budget2026/all_chunks.json"));
+  let obj;
+  try {
+    obj = await raceWithSignal(getPromise, signal);
+  } catch (error) {
+    // The platform API has no explicit AbortSignal parameter. If it resolves
+    // after our deadline, cancel the body without keeping the AI slot charged.
+    void getPromise.then(late => late?.body?.cancel("AI deadline exceeded")).catch(() => {});
+    throw error;
+  }
   if (signal.aborted) {
     await obj?.body?.cancel("AI deadline exceeded").catch(() => {});
     throw signal.reason;
@@ -285,10 +294,15 @@ async function admitAi(request, env, work) {
   aiActive++;
   aiMinuteCount++;
   const controller = new AbortController();
+  const abortFromRequest = () => controller.abort(request.signal?.reason);
+  if (request.signal?.aborted) abortFromRequest();
+  else request.signal?.addEventListener("abort", abortFromRequest, { once: true });
   const timeoutError = new Error("AI deadline exceeded");
   timeoutError.name = "TimeoutError";
   const timeout = setTimeout(() => controller.abort(timeoutError), 15000);
-  const workPromise = Promise.resolve().then(() => work(controller.signal, admission));
+  const workPromise = controller.signal.aborted
+    ? Promise.reject(controller.signal.reason)
+    : Promise.resolve().then(() => work(controller.signal, admission));
   // Keep the strict concurrency slot charged until the underlying operation
   // actually settles, even if the caller-facing deadline wins the race.
   void workPromise.finally(() => { aiActive--; }).catch(() => {});
@@ -296,7 +310,10 @@ async function admitAi(request, env, work) {
   catch (error) {
     if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
     return jsonResp({ error: error?.name === "TimeoutError" ? "AI request timed out" : "AI upstream unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
-  } finally { clearTimeout(timeout); }
+  } finally {
+    clearTimeout(timeout);
+    request.signal?.removeEventListener("abort", abortFromRequest);
+  }
 }
 
 async function readAiJson(request, deadlineSignal) {
@@ -683,6 +700,7 @@ async function handleRequest(request, env) {
         maxRequests: MAX_FETCH_REQUESTS,
         maxRequestBytes: MAX_FETCH_REQUEST_BYTES,
         maxDurationMs: FETCH_PROTOCOL_TIMEOUT_MS,
+        externalSignal: request.signal,
         restore: (expectedState, results) => restoreFetchState(wasm, applicationState, expectedState, results),
         collect: firstId => {
           const requestsPtr = wasm.collect_fetch_urls(ptr, encoded.length);

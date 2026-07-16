@@ -93,6 +93,29 @@ await assert.rejects(collectFetchRounds({
 }), /deadline exceeded/);
 assert.equal(deadlineSignal.aborted, true, "protocol deadline did not abort the shared signal");
 
+const externalController = new AbortController();
+const externallyCanceled = collectFetchRounds({
+  maxRounds: 1,
+  maxRequests: 1,
+  maxRequestBytes: 1,
+  externalSignal: externalController.signal,
+  restore() {},
+  collect() {
+    return {
+      errorCode: 0,
+      requestBytes: 0,
+      expectedState: new Uint8Array(),
+      requests: [{ id: 0 }],
+    };
+  },
+  async fetchRound(_requests, _results, signal) {
+    await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+    throw signal.reason;
+  },
+});
+externalController.abort(new Error("client disconnected"));
+await assert.rejects(externallyCanceled, /client disconnected/);
+
 let canceled = 0;
 const bodyController = new AbortController();
 const response = {

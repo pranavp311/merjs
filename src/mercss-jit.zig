@@ -248,6 +248,7 @@ pub const DesignSystem = struct {
 
         // Static-display utilities.
         try self.putUtility("flex", emitFlex);
+        try self.putUtility("flex-wrap", emitFlexWrap);
         try self.putUtility("grid", emitGrid);
         try self.putUtility("block", emitBlock);
         try self.putUtility("hidden", emitHidden);
@@ -292,6 +293,9 @@ pub const DesignSystem = struct {
 
 fn emitFlex(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try sink.appendSlice(alloc, "display:flex");
+}
+fn emitFlexWrap(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try sink.appendSlice(alloc, "flex-wrap:wrap");
 }
 fn emitGrid(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try sink.appendSlice(alloc, "display:grid");
@@ -476,7 +480,24 @@ pub fn compile(
         var cand = (try parseCandidate(alloc, raw)) orelse continue;
         defer cand.deinit(alloc);
 
-        const emit = ds.utilities.get(cand.utility) orelse continue;
+        // Prefer an exact registered utility name before interpreting the last
+        // hyphenated segment as a value (for example, `flex-wrap`).
+        var exact_utility: ?[]u8 = null;
+        defer if (exact_utility) |name| alloc.free(name);
+        var resolved_emit: ?UtilityFn = null;
+        switch (cand.value) {
+            .named => |value_name| {
+                const name = try std.fmt.allocPrint(alloc, "{s}-{s}", .{ cand.utility, value_name });
+                exact_utility = name;
+                if (ds.utilities.get(name)) |emit| {
+                    cand.utility = name;
+                    cand.value = .none;
+                    resolved_emit = emit;
+                }
+            },
+            else => {},
+        }
+        const emit = resolved_emit orelse ds.utilities.get(cand.utility) orelse continue;
 
         // Resolve all variants up front; skip the rule if any are unknown.
         pseudos.clearRetainingCapacity();
@@ -625,13 +646,15 @@ test "compile: end-to-end basic" {
     defer ds.deinit();
     try ds.loadDefaults();
 
-    const candidates = [_][]const u8{ "flex", "p-4", "bg-brand-500", "text-sm", "rounded-lg" };
+    const candidates = [_][]const u8{ "flex", "flex-wrap", "p-4", "bg-brand-500", "text-sm", "rounded-lg" };
     const css = try compile(alloc, &ds, &candidates);
     defer alloc.free(css);
 
     try std.testing.expect(std.mem.indexOf(u8, css, ":root {") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, "--color-brand-500: #e8251f") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".flex { display:flex }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, ".flex-wrap { flex-wrap:wrap }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, ".flex-wrap { display:flex }") == null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".p-4 { padding:calc(var(--spacing) * 4) }") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".bg-brand-500 { background-color:var(--color-brand-500) }") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".text-sm { font-size:var(--text-sm) }") != null);

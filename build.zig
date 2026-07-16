@@ -532,7 +532,7 @@ pub fn build(b: *std.Build) void {
     codegen_test_mod.addImport("mercss_jit", mercss_jit_mod);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = codegen_test_mod })).step);
     // Run inline tests in individual framework source files.
-    for ([_][]const u8{ "src/css.zig", "src/env.zig", "src/fetch.zig", "src/session.zig", "src/telemetry.zig", "src/mer-worker.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
+    for ([_][]const u8{ "src/css.zig", "src/env.zig", "src/fetch.zig", "src/session.zig", "src/telemetry.zig", "src/mer-worker.zig", "src/mercss-jit.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
         const file_test_mod = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
