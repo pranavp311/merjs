@@ -262,14 +262,22 @@ fn toUrl(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 fn routePatternsCollide(a: []const u8, b: []const u8) bool {
     var a_segments = std.mem.splitScalar(u8, a, '/');
     var b_segments = std.mem.splitScalar(u8, b, '/');
+    var a_has_dynamic = false;
+    var b_has_dynamic = false;
     while (true) {
         const a_segment = a_segments.next();
         const b_segment = b_segments.next();
-        if (a_segment == null or b_segment == null) return a_segment == null and b_segment == null;
+        if (a_segment == null or b_segment == null) {
+            if (a_segment != null or b_segment != null) return false;
+            // A fully static route has deterministic exact-map precedence over
+            // a dynamic route. Two dynamic patterns must not intersect.
+            return a_has_dynamic == b_has_dynamic;
+        }
         const a_dynamic = a_segment.?.len > 0 and a_segment.?[0] == ':';
         const b_dynamic = b_segment.?.len > 0 and b_segment.?[0] == ':';
-        if (a_dynamic != b_dynamic) return false;
-        if (!a_dynamic and !std.mem.eql(u8, a_segment.?, b_segment.?)) return false;
+        a_has_dynamic = a_has_dynamic or a_dynamic;
+        b_has_dynamic = b_has_dynamic or b_dynamic;
+        if (!a_dynamic and !b_dynamic and !std.mem.eql(u8, a_segment.?, b_segment.?)) return false;
     }
 }
 
@@ -352,6 +360,8 @@ test "route collision detection rejects index aliases and renamed parameters" {
     try std.testing.expect(routePatternsCollide("/foo", "/foo"));
     try std.testing.expect(routePatternsCollide("/users/:id", "/users/:slug"));
     try std.testing.expect(!routePatternsCollide("/users/settings", "/users/:id"));
+    try std.testing.expect(routePatternsCollide("/users/:id/edit", "/users/new/:tab"));
+    try std.testing.expect(!routePatternsCollide("/users/:id/edit", "/accounts/new/:tab"));
     try std.testing.expect(!routePatternsCollide("/users/:id/profile", "/users/:id"));
 
     try std.testing.expectError(error.DuplicateRoute, validateUniqueRoutes(std.testing.allocator, &.{
@@ -365,6 +375,10 @@ test "route collision detection rejects index aliases and renamed parameters" {
     try std.testing.expectError(error.DuplicateIdentifier, validateUniqueRoutes(std.testing.allocator, &.{
         "app/foo-bar.zig",
         "app/foo_bar.zig",
+    }, false));
+    try std.testing.expectError(error.DuplicateRoute, validateUniqueRoutes(std.testing.allocator, &.{
+        "app/users/[id]/edit.zig",
+        "app/users/new/[tab].zig",
     }, false));
     try validateUniqueRoutes(std.testing.allocator, &.{
         "app/users/settings.zig",
