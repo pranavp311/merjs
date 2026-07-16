@@ -54,6 +54,7 @@ jobs:
           cmp examples/site/worker/worker/merjs.wasm examples/vercel-edge/merjs.wasm
           git diff --exit-code -- examples/vercel-edge/merjs.wasm
           zig build sgdata-worker
+          git diff --exit-code -- src/generated/routes.zig examples/singapore-data-dashboard/src/generated/routes.zig
           zig build worker-example-kanban
           zig build wasm
           zig build prod

@@ -50,8 +50,9 @@ async function readBody(message, limit, signal) {
 
 async function encodeRequest(request) {
   const url = new URL(request.url);
+  const clientIdentity = encoder.encode(request.headers.get("x-vercel-forwarded-for") || "");
   const parts = [encoder.encode(request.method), encoder.encode(url.pathname + url.search),
-    await readBody(request, MAX_BODY_BYTES), encoder.encode(request.headers.get("cookie") || ""), new Uint8Array()];
+    await readBody(request, MAX_BODY_BYTES), encoder.encode(request.headers.get("cookie") || ""), clientIdentity];
   const forwarded = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
   const headers = forwarded.flatMap(name => {
     const value = request.headers.get(name);
@@ -60,8 +61,9 @@ async function encodeRequest(request) {
   const headerBytes = headers.reduce((n, [name, value]) => n + 8 + name.length + value.length, 0);
   const total = 24 + parts.reduce((n, part) => n + part.length, 0) + headerBytes;
   if (!parts[0].length || parts[0].length > 16 || !parts[1].length || parts[1].length > 16 * 1024 ||
-      parts[2].length > MAX_BODY_BYTES || parts[3].length > 16 * 1024 || headerBytes > 64 * 1024 ||
-      headers.length > 16 || total > 2 * 1024 * 1024) throw new Error("request metadata too large");
+      parts[2].length > MAX_BODY_BYTES || parts[3].length > 16 * 1024 || parts[4].length > 256 ||
+      headerBytes > 64 * 1024 || headers.length > 16 || total > 2 * 1024 * 1024)
+    throw new Error("request metadata too large");
   const bytes = new Uint8Array(total);
   const view = new DataView(bytes.buffer);
   parts.forEach((part, index) => view.setUint32(index * 4, part.length, true));
@@ -182,36 +184,73 @@ async function replayFetches(wasm, requestPtr, requestLength, snapshot) {
   } finally { clearTimeout(timeout); }
 }
 
+function injectEnvironment(wasm) {
+  if (typeof wasm.__mer_set_env_status !== "function") throw new Error("environment injection unavailable");
+  const bindings = typeof process !== "undefined" && process.env ? process.env : {};
+  let count = 0;
+  let totalBytes = 0;
+  for (const [key, value] of Object.entries(bindings)) {
+    if (typeof value !== "string") continue;
+    const keyBytes = encoder.encode(key);
+    const valueBytes = encoder.encode(value);
+    if (!keyBytes.length || keyBytes.length > 256 || valueBytes.length > 64 * 1024 ||
+        count >= 256 || totalBytes + keyBytes.length + valueBytes.length > 1024 * 1024)
+      throw new Error("environment bindings exceed limits");
+    const keyPtr = wasm.alloc(keyBytes.length);
+    const valuePtr = valueBytes.length ? wasm.alloc(valueBytes.length) : 0;
+    try {
+      if (!keyPtr || (valueBytes.length && !valuePtr)) throw new Error("environment allocation failed");
+      const memory = new Uint8Array(wasm.memory.buffer);
+      memory.set(keyBytes, keyPtr);
+      if (valueBytes.length) memory.set(valueBytes, valuePtr);
+      if (wasm.__mer_set_env_status(keyPtr, keyBytes.length, valuePtr || 0, valueBytes.length) !== 0)
+        throw new Error("environment injection failed");
+    } finally {
+      if (keyPtr) wasm.dealloc(keyPtr, keyBytes.length);
+      if (valueBytes.length && valuePtr) wasm.dealloc(valuePtr, valueBytes.length);
+    }
+    count++;
+    totalBytes += keyBytes.length + valueBytes.length;
+  }
+}
+
+function edgeResponse(request, body, init = {}) {
+  const status = init.status ?? 200;
+  const responseBody = request.method === "HEAD" || status === 204 || status === 205 || status === 304 ? null : body;
+  return new Response(responseBody, init);
+}
+
 export default async function handler(request) {
   let wasm;
   try {
     // All allocator, router, bridge, and response state is request-local.
     wasm = new WebAssembly.Instance(wasmModule, {}).exports;
     wasm.init();
-  } catch (_) { return new Response("WASM initialization failed", { status: 500 }); }
+    injectEnvironment(wasm);
+  } catch (_) { return edgeResponse(request, "WASM initialization failed", { status: 500 }); }
 
   let encoded;
   try { encoded = await encodeRequest(request); }
-  catch (_) { return new Response("Request Too Large", { status: 413 }); }
+  catch (_) { return edgeResponse(request, "Request Too Large", { status: 413 }); }
   const requestPtr = wasm.alloc(encoded.length);
-  if (!requestPtr) return new Response("WASM alloc failed", { status: 500 });
+  if (!requestPtr) return edgeResponse(request, "WASM alloc failed", { status: 500 });
   new Uint8Array(wasm.memory.buffer).set(encoded, requestPtr);
   try {
     try {
       await replayFetches(wasm, requestPtr, encoded.length, new Uint8Array(wasm.memory.buffer).slice());
     } catch (_) {
-      return new Response("Fetch Bridge Error", { status: 502 });
+      return edgeResponse(request, "Fetch Bridge Error", { status: 502 });
     }
     const responsePtr = wasm.handle(requestPtr, encoded.length);
     if (wasm.fetch_protocol_error() !== 0) {
       if (responsePtr) wasm.response_done();
-      return new Response("Fetch Bridge Error", { status: 502 });
+      return edgeResponse(request, "Fetch Bridge Error", { status: 502 });
     }
-    if (!responsePtr) return new Response("Not Found", { status: 404 });
+    if (!responsePtr) return edgeResponse(request, "Not Found", { status: 404 });
     try {
       const response = decodeResponse(new Uint8Array(wasm.memory.buffer, responsePtr, wasm.response_len()));
-      return new Response(response.body, { status: response.status, headers: response.headers });
+      return edgeResponse(request, response.body, { status: response.status, headers: response.headers });
     } finally { wasm.response_done(); }
-  } catch (_) { return new Response("Internal Server Error", { status: 500 }); }
+  } catch (_) { return edgeResponse(request, "Internal Server Error", { status: 500 }); }
   finally { wasm.dealloc(requestPtr, encoded.length); }
 }

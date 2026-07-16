@@ -348,7 +348,14 @@ function workerResponse(body, init = {}) {
   } else {
     new Headers(init.headers || {}).forEach((value, name) => headers.append(name, value));
   }
-  return new Response(body, { ...init, headers });
+  const status = init.status ?? 200;
+  const responseBody = status === 204 || status === 205 || status === 304 ? null : body;
+  return new Response(responseBody, { ...init, headers });
+}
+
+function finalizeWorkerResponse(request, response) {
+  if (request.method !== "HEAD" || response.body === null) return response;
+  return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
 const RESPONSE_MAGIC = 0x3152454d;
@@ -505,9 +512,9 @@ async function handleRequest(request, env) {
 export default {
   async fetch(request, env, _ctx) {
     try {
-      return await handleRequest(request, env);
+      return finalizeWorkerResponse(request, await handleRequest(request, env));
     } catch (_) {
-      return workerResponse("Internal Server Error", { status: 500 });
+      return finalizeWorkerResponse(request, workerResponse("Internal Server Error", { status: 500 }));
     }
   },
 };

@@ -29,6 +29,10 @@ vercel
 - Incoming bodies are streamed with a 1 MiB cap, and `mer.fetch` calls use the
   bounded iterative collect/replay protocol.
 - Responses are copied before `response_done()` releases WASM-owned memory.
+- Vercel's platform-controlled `x-vercel-forwarded-for` value supplies the
+  trusted client identity used by authentication/rate limiting.
+- String-valued Vercel `process.env` bindings are copied into each request-local
+  WASM instance through the bounded environment ABI.
 - All application requests are rewritten to `/api` via `vercel.json`; existing
   files in a `public/` directory are served statically by Vercel first.
 

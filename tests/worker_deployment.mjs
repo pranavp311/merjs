@@ -59,6 +59,8 @@ assert.doesNotMatch(vercelAdapter, /let instance\s*=|request\.arrayBuffer\(/, "V
 assert.match(vercelAdapter, /0x3152454d/, "Vercel adapter does not validate MER1");
 assert.match(vercelAdapter, /wasm\.response_done\(\)/, "Vercel adapter does not release response memory");
 assert.match(vercelAdapter, /collect_fetch_urls/, "Vercel adapter omits fetch collection/replay");
+assert.match(vercelAdapter, /x-vercel-forwarded-for/, "Vercel adapter omits trusted client identity");
+assert.match(vercelAdapter, /__mer_set_env_status/, "Vercel adapter omits environment injection");
 
 for (const adapter of [
   "examples/kanban/worker/worker.js",
@@ -70,6 +72,17 @@ for (const adapter of [
   assert.doesNotMatch(source, /request\.arrayBuffer\(/, `${adapter}: request body is not streamed`);
   assert.match(source, /\^\(0\|\[1-9\]/, `${adapter}: canonical Content-Length validation missing`);
   assert.match(source, /\.cancel\(/, `${adapter}: oversized body is not canceled`);
+}
+
+for (const adapter of [
+  "examples/kanban/worker/worker.js",
+  "examples/singapore-data-dashboard/worker/worker.js",
+  "examples/site/worker/worker/worker.js",
+  "examples/vercel-edge/api/index.js",
+]) {
+  const source = readFileSync(join(root, adapter), "utf8");
+  assert.match(source, /status === 204 \|\| status === 205 \|\| status === 304/, `${adapter}: bodyless statuses are not enforced`);
+  assert.match(source, /request\.method === "HEAD"|request\.method !== "HEAD"/, `${adapter}: HEAD responses retain bodies`);
 }
 
 const singaporeAdapter = readFileSync(join(root, "examples/singapore-data-dashboard/worker/worker.js"), "utf8");
