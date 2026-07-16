@@ -238,23 +238,42 @@ async function admitAi(request, env, work) {
   } finally { clearTimeout(timeout); aiActive--; }
 }
 
-async function readAiJson(request) {
+async function readAiJson(request, deadlineSignal) {
   if (!request.body) throw new Error("missing body");
+  const controller = new AbortController();
+  const abortFromRequest = () => controller.abort(request.signal?.reason);
+  const abortFromDeadline = () => controller.abort(deadlineSignal?.reason);
+  if (request.signal?.aborted) abortFromRequest();
+  else request.signal?.addEventListener("abort", abortFromRequest, { once: true });
+  if (deadlineSignal?.aborted) abortFromDeadline();
+  else deadlineSignal?.addEventListener("abort", abortFromDeadline, { once: true });
+
   const reader = request.body.getReader();
   const chunks = [];
   let length = 0;
+  let complete = false;
+  const cancel = () => { void reader.cancel(controller.signal.reason).catch(() => {}); };
+  controller.signal.addEventListener("abort", cancel, { once: true });
   try {
     while (true) {
+      if (controller.signal.aborted) throw controller.signal.reason;
       const { done, value } = await reader.read();
-      if (done) break;
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (done) { complete = true; break; }
       if (value.byteLength > 8192 - length) {
-        await reader.cancel("body too large");
+        await reader.cancel("body too large").catch(() => {});
         throw new Error("body too large");
       }
       chunks.push(value);
       length += value.byteLength;
     }
-  } finally { reader.releaseLock(); }
+  } finally {
+    controller.signal.removeEventListener("abort", cancel);
+    request.signal?.removeEventListener("abort", abortFromRequest);
+    deadlineSignal?.removeEventListener("abort", abortFromDeadline);
+    if (!complete) await reader.cancel(controller.signal.reason || "AI body read failed").catch(() => {});
+    reader.releaseLock();
+  }
   const bytes = new Uint8Array(length);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
@@ -263,7 +282,7 @@ async function readAiJson(request) {
 
 async function handleBudgetAi(request, env, signal, admission) {
   let body;
-  try { body = await readAiJson(request); } catch { return jsonResp({ error: "Invalid or oversized JSON" }, 400); }
+  try { body = await readAiJson(request, signal); } catch { return jsonResp({ error: "Invalid or oversized JSON" }, 400); }
   const question = body?.question;
   if (typeof question !== "string" || !question.trim() || question.length > 512)
     return jsonResp({ error: "question must be 1-512 characters" }, 400);
@@ -350,7 +369,7 @@ async function handleBudgetAi(request, env, signal, admission) {
 
 async function handleBudgetSuggestions(request, env, signal, admission) {
   let body;
-  try { body = await readAiJson(request); } catch { return jsonResp({ error: "Invalid or oversized JSON" }, 400); }
+  try { body = await readAiJson(request, signal); } catch { return jsonResp({ error: "Invalid or oversized JSON" }, 400); }
   const { question, answer = "" } = body ?? {};
   if (typeof question !== "string" || !question.trim() || question.length > 512 || typeof answer !== "string" || answer.length > 2000)
     return jsonResp({ error: "invalid suggestion input" }, 400);

@@ -89,6 +89,16 @@ for (const adapter of [
   assert.match(source, /request\.method === "HEAD"|request\.method !== "HEAD"/, `${adapter}: HEAD responses retain bodies`);
 }
 
+for (const adapter of [
+  "examples/singapore-data-dashboard/worker/worker.js",
+  "examples/site/worker/worker/worker.js",
+]) {
+  const source = readFileSync(join(root, adapter), "utf8");
+  assert.match(source, /readAiJson\(request, deadlineSignal\)/, `${adapter}: AI body reader omits its deadline`);
+  assert.match(source, /readAiJson\(request, signal\)/, `${adapter}: AI handler drops its admission signal`);
+  assert.match(source, /await reader\.read\(\);\n\s+if \(controller\.signal\.aborted\)/, `${adapter}: AI body accepts abort-driven truncation`);
+}
+
 const singaporeAdapter = readFileSync(join(root, "examples/singapore-data-dashboard/worker/worker.js"), "utf8");
 assert.match(singaporeAdapter, /request\.method !== "GET"/, "collections route does not enforce GET");
 assert.match(singaporeAdapter, /headers: \{ "x-api-key": env\.SG_DATA_API_KEY \}/, "collections API key is not server-side");
