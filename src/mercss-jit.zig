@@ -627,7 +627,13 @@ pub fn compile(
                 }
                 if (best) |name| {
                     cand.utility = name;
-                    cand.value = if (name.len == full.len) .none else .{ .named = full[name.len + 1 ..] };
+                    cand.value = if (name.len == full.len) .none else blk: {
+                        const remainder = full[name.len + 1 ..];
+                        break :blk if (remainder.len >= 2 and remainder[0] == '[' and remainder[remainder.len - 1] == ']')
+                            .{ .arbitrary = remainder[1 .. remainder.len - 1] }
+                        else
+                            .{ .named = remainder };
+                    };
                     resolved_emit = ds.utilities.get(name).?;
                 }
             },
@@ -850,11 +856,13 @@ test "compile: arbitrary value emitted verbatim" {
     defer ds.deinit();
     try ds.loadDefaults();
 
-    const candidates = [_][]const u8{ "w-[42px]", "bg-[#abcdef]" };
+    const candidates = [_][]const u8{ "w-[42px]", "max-w-[42px]", "space-y-[2px]", "bg-[#abcdef]" };
     const css = try compile(alloc, &ds, &candidates);
     defer alloc.free(css);
 
     try std.testing.expect(std.mem.indexOf(u8, css, ".w-\\[42px\\] { width:42px }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, ".max-w-\\[42px\\] { max-width:42px }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, ".space-y-\\[2px\\] { display:flex;flex-direction:column;gap:2px }") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".bg-\\[\\#abcdef\\] { background-color:#abcdef }") != null);
 }
 
