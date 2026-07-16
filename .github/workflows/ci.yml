@@ -50,6 +50,8 @@ jobs:
           zig build cli -Dtarget=x86_64-macos -Doptimize=ReleaseSmall
           zig build cli -Dtarget=x86_64-linux -Doptimize=ReleaseSmall
           zig build cli -Dtarget=aarch64-linux -Doptimize=ReleaseSmall
+          # Restore a host-runnable CLI for the generated-scaffold probe below.
+          zig build cli
           zig build worker
           cmp examples/site/worker/worker/merjs.wasm examples/vercel-edge/merjs.wasm
           git diff --exit-code -- examples/vercel-edge/merjs.wasm
@@ -141,6 +143,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$revision"
           zig-out/bin/mer init "$scaffold" --merjs-path ".."
           grep -F '.path = ".."' "$scaffold/build.zig.zon"
+          grep -F 'app/_mercss.css' "$scaffold/.gitignore"
+          grep -F '@embedFile("_mercss.css")' "$scaffold/app/layout.zig"
           (cd "$scaffold" && zig build test)
 
       - name: Build the checked-in UI showcase consumer

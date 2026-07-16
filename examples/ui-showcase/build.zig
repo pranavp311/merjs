@@ -92,6 +92,9 @@ fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Modu
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
         if (std.mem.eql(u8, entry.path, "layout.zig")) continue;
+        if (std.mem.eql(u8, dir, "app") and
+            (std.mem.startsWith(u8, entry.path, "components/") or
+                std.mem.startsWith(u8, entry.path, "components\\"))) continue;
         const file_path = b.fmt("{s}/{s}", .{ dir, entry.path });
         const import_name = b.fmt("{s}/{s}", .{ dir, entry.path[0 .. entry.path.len - 4] });
         const route_mod = b.createModule(.{ .root_source_file = b.path(file_path) });

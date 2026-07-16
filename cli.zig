@@ -234,8 +234,9 @@ const build_zig_template =
     \\    addDirModules(b, test_mod, mer_mod, "app");
     \\    addDirModules(b, test_mod, mer_mod, "api");
     \\    addRoutesModule(b, test_mod, mer_mod);
-    \\    const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_mod }));
-    \\    run_tests.step.dependOn(&run_codegen.step);
+    \\    const test_artifact = b.addTest(.{ .root_module = test_mod });
+    \\    test_artifact.step.dependOn(&run_codegen.step);
+    \\    const run_tests = b.addRunArtifact(test_artifact);
     \\    b.step("test", "Compile the starter app").dependOn(&run_tests.step);
     \\}
     \\
@@ -666,6 +667,7 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
             \\.zig-cache/
             \\src/generated/*
             \\!src/generated/.gitkeep
+            \\app/_mercss.css
             \\tools/*
             \\!tools/codegen.zig
             \\dist/
@@ -743,7 +745,7 @@ test "projectNameForZon clamps long names to 32 chars" {
 
 test "build_zig_template exposes a starter test step" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "b.step(\"test\", \"Compile the starter app\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "run_tests.step.dependOn(&run_codegen.step);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "test_artifact.step.dependOn(&run_codegen.step);") != null);
 }
 
 test "build_zig_template uses local codegen entrypoint" {
