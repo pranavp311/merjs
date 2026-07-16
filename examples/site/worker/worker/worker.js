@@ -160,16 +160,10 @@ async function getChunks(env, signal) {
   if (signal.aborted) throw signal.reason;
   const now = Date.now();
   if (cachedChunks && cachedChunks.expiresAt > now) return cachedChunks.value;
-  const getPromise = Promise.resolve().then(() => env.BUCKET.get("budget2026/all_chunks.json"));
-  let obj;
-  try {
-    obj = await raceWithSignal(getPromise, signal);
-  } catch (error) {
-    // The platform API has no explicit AbortSignal parameter. If it resolves
-    // after our deadline, cancel the body without keeping the AI slot charged.
-    void getPromise.then(late => late?.body?.cancel("AI deadline exceeded")).catch(() => {});
-    throw error;
-  }
+  // R2 acquisition has no AbortSignal parameter. Await its real settlement so
+  // the strict aiActive slot remains charged; the caller response is still
+  // bounded by admitAi's signal race. Cancel any body that arrives too late.
+  const obj = await env.BUCKET.get("budget2026/all_chunks.json");
   if (signal.aborted) {
     await obj?.body?.cancel("AI deadline exceeded").catch(() => {});
     throw signal.reason;

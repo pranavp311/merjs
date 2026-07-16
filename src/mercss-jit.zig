@@ -223,10 +223,23 @@ pub const DesignSystem = struct {
 
         // Slate (neutral).
         try self.putToken("--color-slate-50", "#f8fafc");
+        try self.putToken("--color-slate-100", "#f1f5f9");
         try self.putToken("--color-slate-200", "#e2e8f0");
+        try self.putToken("--color-slate-300", "#cbd5e1");
+        try self.putToken("--color-slate-400", "#94a3b8");
         try self.putToken("--color-slate-500", "#64748b");
+        try self.putToken("--color-slate-600", "#475569");
         try self.putToken("--color-slate-700", "#334155");
+        try self.putToken("--color-slate-800", "#1e293b");
         try self.putToken("--color-slate-900", "#0f172a");
+        try self.putToken("--color-slate-950", "#020617");
+
+        try self.putToken("--color-red-50", "#fef2f2");
+        try self.putToken("--color-red-200", "#fecaca");
+        try self.putToken("--color-red-500", "#ef4444");
+        try self.putToken("--color-red-600", "#dc2626");
+        try self.putToken("--color-red-700", "#b91c1c");
+        try self.putToken("--color-red-900", "#7f1d1d");
 
         try self.putToken("--color-white", "#ffffff");
         try self.putToken("--color-black", "#000000");
@@ -245,24 +258,42 @@ pub const DesignSystem = struct {
         try self.putToken("--text-lg", "1.125rem");
         try self.putToken("--text-xl", "1.25rem");
         try self.putToken("--text-2xl", "1.5rem");
+        try self.putToken("--text-3xl", "1.875rem");
+        try self.putToken("--text-4xl", "2.25rem");
 
         // Static-display utilities.
         try self.putUtility("flex", emitFlex);
+        try self.putUtility("inline-flex", emitInlineFlex);
         try self.putUtility("flex-wrap", emitFlexWrap);
         try self.putUtility("grid", emitGrid);
         try self.putUtility("block", emitBlock);
         try self.putUtility("hidden", emitHidden);
+        try self.putUtility("relative", emitRelative);
+        try self.putUtility("items", emitItems);
+        try self.putUtility("justify", emitJustify);
+        try self.putUtility("transition-colors", emitTransitionColors);
+        try self.putUtility("pointer-events", emitPointerEvents);
+        try self.putUtility("opacity", emitOpacity);
+        try self.putUtility("outline", emitOutline);
+        try self.putUtility("ring", emitRing);
+        try self.putUtility("underline", emitUnderline);
+        try self.putUtility("underline-offset", emitUnderlineOffset);
+        try self.putUtility("shadow", emitShadow);
 
         // Spacing.
         try self.putUtility("p", emitP);
         try self.putUtility("px", emitPx);
         try self.putUtility("py", emitPy);
         try self.putUtility("m", emitM);
+        try self.putUtility("mb", emitMb);
+        try self.putUtility("mx", emitMx);
         try self.putUtility("gap", emitGap);
+        try self.putUtility("space-y", emitSpaceY);
 
         // Sizing.
         try self.putUtility("w", emitW);
         try self.putUtility("h", emitH);
+        try self.putUtility("max-w", emitMaxW);
 
         // Color & border.
         try self.putUtility("bg", emitBg);
@@ -278,6 +309,8 @@ pub const DesignSystem = struct {
         // Variants.
         try self.putVariant("hover", .{ .pseudo = ":hover" });
         try self.putVariant("focus", .{ .pseudo = ":focus" });
+        try self.putVariant("focus-visible", .{ .pseudo = ":focus-visible" });
+        try self.putVariant("placeholder", .{ .pseudo = "::placeholder" });
         try self.putVariant("active", .{ .pseudo = ":active" });
         try self.putVariant("disabled", .{ .pseudo = ":disabled" });
         try self.putVariant("md", .{ .media = "(min-width: 768px)" });
@@ -294,6 +327,9 @@ pub const DesignSystem = struct {
 fn emitFlex(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try sink.appendSlice(alloc, "display:flex");
 }
+fn emitInlineFlex(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try sink.appendSlice(alloc, "display:inline-flex");
+}
 fn emitFlexWrap(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try sink.appendSlice(alloc, "flex-wrap:wrap");
 }
@@ -305,6 +341,65 @@ fn emitBlock(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.A
 }
 fn emitHidden(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try sink.appendSlice(alloc, "display:none");
+}
+fn emitRelative(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try sink.appendSlice(alloc, "position:relative");
+}
+fn emitItems(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| try sink.print(alloc, "align-items:{s}", .{v}),
+        else => {},
+    }
+}
+fn emitJustify(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| try sink.print(alloc, "justify-content:{s}", .{v}),
+        else => {},
+    }
+}
+fn emitTransitionColors(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try sink.appendSlice(alloc, "transition-property:color,background-color,border-color,box-shadow");
+}
+fn emitPointerEvents(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| try sink.print(alloc, "pointer-events:{s}", .{v}),
+        else => {},
+    }
+}
+fn emitOpacity(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| {
+            if (std.mem.eql(u8, v, "0")) try sink.appendSlice(alloc, "opacity:0") else if (std.mem.eql(u8, v, "50")) try sink.appendSlice(alloc, "opacity:0.5") else if (std.mem.eql(u8, v, "100")) try sink.appendSlice(alloc, "opacity:1");
+        },
+        else => {},
+    }
+}
+fn emitOutline(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| if (std.mem.eql(u8, v, "none")) try sink.appendSlice(alloc, "outline:2px solid transparent;outline-offset:2px"),
+        else => {},
+    }
+}
+fn emitRing(ds: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| {
+            if (try tryColorRef(ds, "--mer-ring-color", v, sink, alloc)) return;
+            try sink.print(alloc, "box-shadow:0 0 0 calc(var(--spacing) * {s}) var(--mer-ring-color,currentColor)", .{v});
+        },
+        else => {},
+    }
+}
+fn emitUnderline(_: *const DesignSystem, _: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try sink.appendSlice(alloc, "text-decoration-line:underline");
+}
+fn emitUnderlineOffset(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try writeSpacing("text-underline-offset", c.value, sink, alloc);
+}
+fn emitShadow(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .named => |v| if (std.mem.eql(u8, v, "sm")) try sink.appendSlice(alloc, "box-shadow:0 1px 2px 0 rgb(0 0 0 / 0.05)"),
+        else => {},
+    }
 }
 
 fn writeSpacing(prop: []const u8, value: Value, sink: *Sink, alloc: std.mem.Allocator) !void {
@@ -335,8 +430,27 @@ fn emitPy(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allo
 fn emitM(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try writeSpacing("margin", c.value, sink, alloc);
 }
+fn emitMb(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    try writeSpacing("margin-bottom", c.value, sink, alloc);
+}
+fn emitMx(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .arbitrary => |v| try sink.print(alloc, "margin-left:{s};margin-right:{s}", .{ v, v }),
+        .named => |v| {
+            if (std.mem.eql(u8, v, "auto")) try sink.appendSlice(alloc, "margin-left:auto;margin-right:auto") else try sink.print(alloc, "margin-left:calc(var(--spacing) * {s});margin-right:calc(var(--spacing) * {s})", .{ v, v });
+        },
+        .none => {},
+    }
+}
 fn emitGap(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     try writeSpacing("gap", c.value, sink, alloc);
+}
+fn emitSpaceY(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .arbitrary => |v| try sink.print(alloc, "display:flex;flex-direction:column;gap:{s}", .{v}),
+        .named => |v| try sink.print(alloc, "display:flex;flex-direction:column;gap:calc(var(--spacing) * {s})", .{v}),
+        .none => {},
+    }
 }
 
 fn emitW(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
@@ -364,10 +478,22 @@ fn emitH(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Alloc
     }
 }
 
+fn emitMaxW(_: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
+    switch (c.value) {
+        .arbitrary => |v| try sink.print(alloc, "max-width:{s}", .{v}),
+        .named => |v| {
+            if (std.mem.eql(u8, v, "md")) try sink.appendSlice(alloc, "max-width:28rem") else if (std.mem.eql(u8, v, "4xl")) try sink.appendSlice(alloc, "max-width:56rem") else if (std.mem.eql(u8, v, "full")) try sink.appendSlice(alloc, "max-width:100%");
+        },
+        .none => {},
+    }
+}
+
 fn emitBg(ds: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     switch (c.value) {
         .arbitrary => |v| try sink.print(alloc, "background-color:{s}", .{v}),
-        .named => |v| try emitColorRef(ds, "background-color", v, sink, alloc),
+        .named => |v| {
+            if (std.mem.eql(u8, v, "transparent")) try sink.appendSlice(alloc, "background-color:transparent") else try emitColorRef(ds, "background-color", v, sink, alloc);
+        },
         .none => {},
     }
 }
@@ -385,7 +511,9 @@ fn emitText(ds: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.A
 fn emitBorder(ds: *const DesignSystem, c: Candidate, sink: *Sink, alloc: std.mem.Allocator) !void {
     switch (c.value) {
         .arbitrary => |v| try sink.print(alloc, "border:1px solid {s}", .{v}),
-        .named => |v| try emitColorRef(ds, "border-color", v, sink, alloc),
+        .named => |v| {
+            if (std.mem.eql(u8, v, "transparent")) try sink.appendSlice(alloc, "border-color:transparent") else try emitColorRef(ds, "border-color", v, sink, alloc);
+        },
         .none => try sink.appendSlice(alloc, "border-width:1px;border-style:solid"),
     }
 }
@@ -436,7 +564,7 @@ fn tryColorRef(
 }
 
 fn isSizeName(s: []const u8) bool {
-    const sizes = [_][]const u8{ "xs", "sm", "base", "lg", "xl", "2xl" };
+    const sizes = [_][]const u8{ "xs", "sm", "base", "lg", "xl", "2xl", "3xl", "4xl" };
     for (sizes) |sz| if (std.mem.eql(u8, s, sz)) return true;
     return false;
 }
@@ -480,19 +608,27 @@ pub fn compile(
         var cand = (try parseCandidate(alloc, raw)) orelse continue;
         defer cand.deinit(alloc);
 
-        // Prefer an exact registered utility name before interpreting the last
-        // hyphenated segment as a value (for example, `flex-wrap`).
-        var exact_utility: ?[]u8 = null;
-        defer if (exact_utility) |name| alloc.free(name);
+        // Resolve the longest registered utility prefix before interpreting
+        // remaining hyphenated segments as a value (`flex-wrap`, `space-y-4`).
+        var reconstructed: ?[]u8 = null;
+        defer if (reconstructed) |name| alloc.free(name);
         var resolved_emit: ?UtilityFn = null;
         switch (cand.value) {
             .named => |value_name| {
-                const name = try std.fmt.allocPrint(alloc, "{s}-{s}", .{ cand.utility, value_name });
-                exact_utility = name;
-                if (ds.utilities.get(name)) |emit| {
+                const full = try std.fmt.allocPrint(alloc, "{s}-{s}", .{ cand.utility, value_name });
+                reconstructed = full;
+                var best: ?[]const u8 = null;
+                var utility_it = ds.utilities.iterator();
+                while (utility_it.next()) |entry| {
+                    const name = entry.key_ptr.*;
+                    const matches = std.mem.eql(u8, full, name) or
+                        (full.len > name.len and full[name.len] == '-' and std.mem.startsWith(u8, full, name));
+                    if (matches and (best == null or name.len > best.?.len)) best = name;
+                }
+                if (best) |name| {
                     cand.utility = name;
-                    cand.value = .none;
-                    resolved_emit = emit;
+                    cand.value = if (name.len == full.len) .none else .{ .named = full[name.len + 1 ..] };
+                    resolved_emit = ds.utilities.get(name).?;
                 }
             },
             else => {},
@@ -659,6 +795,36 @@ test "compile: end-to-end basic" {
     try std.testing.expect(std.mem.indexOf(u8, css, ".bg-brand-500 { background-color:var(--color-brand-500) }") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".text-sm { font-size:var(--text-sm) }") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".rounded-lg { border-radius:var(--radius-lg) }") != null);
+}
+
+test "compile: showcase dynamic utility safelist" {
+    const alloc = std.testing.allocator;
+    var ds = DesignSystem.init(alloc);
+    defer ds.deinit();
+    try ds.loadDefaults();
+
+    const candidates = [_][]const u8{
+        "inline-flex",                "items-center",         "justify-center",               "transition-colors",
+        "focus-visible:outline-none", "focus-visible:ring-2", "focus-visible:ring-slate-400", "disabled:pointer-events-none",
+        "disabled:opacity-50",        "bg-red-600",           "hover:bg-red-700",             "bg-slate-100",
+        "hover:bg-slate-800",         "shadow-sm",            "space-y-4",                    "max-w-4xl",
+        "mx-auto",                    "mb-4",                 "text-4xl",
+    };
+    const css = try compile(alloc, &ds, &candidates);
+    defer alloc.free(css);
+
+    inline for (.{
+        "display:inline-flex",
+        "align-items:center",
+        "justify-content:center",
+        "background-color:var(--color-red-600)",
+        "background-color:var(--color-slate-100)",
+        "opacity:0.5",
+        "box-shadow:0 1px 2px",
+        "max-width:56rem",
+        "margin-left:auto",
+        "font-size:var(--text-4xl)",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, css, needle) != null);
 }
 
 test "compile: dedupes repeated candidates" {

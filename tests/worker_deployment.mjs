@@ -116,7 +116,7 @@ for (const adapter of [
 
 const siteAdapter = readFileSync(join(root, "examples/site/worker/worker/worker.js"), "utf8");
 assert.match(siteAdapter, /readBoundedBody\(\{[\s\S]*body: obj\.body,[\s\S]*MAX_CORPUS_JSON_BYTES, signal\)/, "site R2 corpus read is not bounded");
-assert.match(siteAdapter, /raceWithSignal\(getPromise, signal\)/, "site R2 acquisition can outlive its AI deadline");
+assert.match(siteAdapter, /const obj = await env\.BUCKET\.get/, "site R2 acquisition is not tracked through real settlement");
 assert.match(siteAdapter, /externalSignal: request\.signal/, "site fetch replay ignores client disconnects");
 assert.match(siteAdapter, /obj\?\.body\?\.cancel\("AI deadline exceeded"\)/, "site abandons an R2 body that resolves after its deadline");
 assert.match(siteAdapter, /cachedChunks\.expiresAt > now/, "site corpus cache never revalidates");
