@@ -74,8 +74,26 @@ pub fn splitRequestTarget(head_target: []const u8) TargetMetadata {
     };
 }
 
-pub fn shouldTrySpaFallback(static_dir: ?[]const u8, has_route: bool, has_framed_body: bool) bool {
-    return static_dir != null and !has_route and !has_framed_body;
+pub fn copyRequestTarget(alloc: std.mem.Allocator, head_target: []const u8) !TargetMetadata {
+    const parsed = splitRequestTarget(head_target);
+    const raw_target = try alloc.dupe(u8, parsed.raw_target);
+    errdefer alloc.free(raw_target);
+    const path = try alloc.dupe(u8, parsed.path);
+    errdefer alloc.free(path);
+    const query_string = try alloc.dupe(u8, parsed.query_string);
+    return .{ .raw_target = raw_target, .path = path, .query_string = query_string };
+}
+
+pub fn isStaticMethod(method: std.http.Method) bool {
+    return method == .GET or method == .HEAD;
+}
+
+pub fn shouldTryStaticFiles(has_exact_route: bool, method: std.http.Method, has_framed_body: bool) bool {
+    return !has_exact_route and isStaticMethod(method) and !has_framed_body;
+}
+
+pub fn shouldTrySpaFallback(static_dir: ?[]const u8, has_route: bool, method: std.http.Method, has_framed_body: bool) bool {
+    return static_dir != null and shouldTryStaticFiles(has_route, method, has_framed_body);
 }
 
 pub const Config = struct {
@@ -280,10 +298,13 @@ fn serveRequest(
     // `std_req.head.target` is borrowed from std.http's head buffer. Zig 0.16
     // invalidates that string memory when the body reader is initialized, so
     // copy target-derived slices before any framed body is read.
-    const target_meta = splitRequestTarget(std_req.head.target);
-    const raw_target = try alloc.dupe(u8, target_meta.raw_target);
-    const path = try alloc.dupe(u8, target_meta.path);
-    const query_string = try alloc.dupe(u8, target_meta.query_string);
+    const target_meta = try copyRequestTarget(alloc, std_req.head.target);
+    const raw_target = target_meta.raw_target;
+    const path = target_meta.path;
+    const query_string = target_meta.query_string;
+    const std_method = std_req.head.method;
+    const request_method = mer.Method.fromStd(std_method);
+    const has_framed_body = requestHasFramedBody(std_req);
 
     // Raw handler hook (checked first) — lets apps register long-lived
     // endpoints (SSE, websockets) that must own the connection.
@@ -303,11 +324,11 @@ fn serveRequest(
 
     // Debug endpoint — shows registered routes, config, hints.
     if (dev and std.mem.eql(u8, path, "/_mer/debug")) {
-        if (requestHasFramedBody(std_req)) _ = try readRequestBody(alloc, std_req);
+        if (has_framed_body) _ = try readRequestBody(alloc, std_req);
         const route_infos = alloc.alloc(dev_mod.RouteDebugInfo, router.routes.len) catch return error.OutOfMemory;
         for (router.routes, 0..) |route, i| route_infos[i] = .{ .path = route.path };
         const response = try dev_mod.serveDebug(alloc, route_infos, router.exact_map.count(), router.dynamic_routes.len, query_string, mer.version);
-        try sendResponse(std_req, response);
+        try sendResponse(std_req, response, std_method == .HEAD);
         return;
     }
 
@@ -321,10 +342,13 @@ fn serveRequest(
         }
     }
 
-    // Static files are checked before routes so real assets (e.g. /favicon.ico)
-    // are not swallowed by broad dynamic routes. SPA history fallback is handled
-    // later, after route lookup, so it cannot shadow API/page routes.
-    if (!requestHasFramedBody(std_req)) {
+    const has_exact_route = router.hasExactRoute(path);
+    const has_route = router.findRoute(path) != null;
+
+    // Exact routes win over static files, while physical assets still win over
+    // broad dynamic routes such as /:slug. SPA fallback remains behind every
+    // route match below, including dynamic routes.
+    if (shouldTryStaticFiles(has_exact_route, std_method, has_framed_body)) {
         if (static_dir) |d| {
             if (std.mem.eql(u8, path, "/")) {
                 if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
@@ -334,13 +358,12 @@ fn serveRequest(
 
     // Pre-rendered pages from dist/ (SSG) should win in production even when a
     // registered route exists for the path.
-    if (!dev and !requestHasFramedBody(std_req)) {
+    if (!dev and isStaticMethod(std_method) and !has_framed_body) {
         if (tryServePrerendered(alloc, std_req, path, io)) |_| return;
     }
 
-    const has_route = router.findRoute(path) != null;
     // SPA history fallback only after proving no backend route matches.
-    if (shouldTrySpaFallback(static_dir, has_route, requestHasFramedBody(std_req))) {
+    if (shouldTrySpaFallback(static_dir, has_route, std_method, has_framed_body)) {
         if (static_dir) |d| {
             if (static.tryServe(alloc, std_req, path, io, .{ .dir = d, .spa = true })) |_| return;
         }
@@ -358,7 +381,7 @@ fn serveRequest(
 
     const body_bytes: []const u8 = try readRequestBody(alloc, std_req);
 
-    var req = mer.Request.init(alloc, mer.Method.fromStd(std_req.head.method), path);
+    var req = mer.Request.init(alloc, request_method, path);
     req.query_string = query_string;
     req.body = body_bytes;
     req.cookies_raw = cookies_raw;
@@ -385,6 +408,11 @@ fn serveRequest(
                         .extra_headers = &fixed,
                     },
                 });
+                if (std_method == .HEAD) {
+                    markTtfb();
+                    try bw.end();
+                    return;
+                }
 
                 // Flush layout head immediately — browser starts rendering shell.
                 // Flush layout head immediately — browser starts rendering shell.
@@ -434,6 +462,11 @@ fn serveRequest(
                 .extra_headers = &fixed,
             },
         });
+        if (std_method == .HEAD) {
+            markTtfb();
+            try bw.end();
+            return;
+        }
         try bw.writer.writeAll(result.head);
         markTtfb();
         try bw.flush();
@@ -455,9 +488,8 @@ fn serveRequest(
     }
     defer if (owned_body) |b| alloc.free(b);
 
-    try sendResponse(std_req, response);
+    try sendResponse(std_req, response, std_method == .HEAD);
 }
-
 
 fn requestHasFramedBody(std_req: *const std.http.Server.Request) bool {
     return switch (std_req.head.transfer_encoding) {
@@ -504,7 +536,7 @@ fn streamFlushImpl(ctx: *anyopaque) void {
 /// Maximum number of Set-Cookie headers we emit per response.
 const MAX_COOKIES = 8;
 
-fn sendResponse(std_req: *std.http.Server.Request, response: mer.Response) !void {
+fn sendResponse(std_req: *std.http.Server.Request, response: mer.Response, is_head: bool) !void {
     // Format Set-Cookie header values on the stack.
     var cookie_val_bufs: [MAX_COOKIES][512]u8 = undefined;
     var cookie_headers: [MAX_COOKIES]std.http.Header = undefined;
@@ -552,7 +584,7 @@ fn sendResponse(std_req: *std.http.Server.Request, response: mer.Response) !void
         },
     });
     markTtfb();
-    try bw.writer.writeAll(response.body);
+    if (!is_head) try bw.writer.writeAll(response.body);
     try bw.end();
 }
 
@@ -563,18 +595,15 @@ fn tryServePrerendered(
     url_path: []const u8,
     io: std.Io,
 ) ?void {
-    if (std.mem.indexOf(u8, url_path, "..") != null) return null;
-
-    const fs_path = if (std.mem.eql(u8, url_path, "/"))
-        std.fmt.allocPrint(alloc, "dist/index.html", .{}) catch return null
+    const file_name = if (std.mem.eql(u8, url_path, "/"))
+        alloc.dupe(u8, "index.html") catch return null
     else blk: {
         const rel = if (url_path.len > 0 and url_path[0] == '/') url_path[1..] else url_path;
-        break :blk std.fmt.allocPrint(alloc, "dist/{s}.html", .{rel}) catch return null;
+        break :blk std.fmt.allocPrint(alloc, "{s}.html", .{rel}) catch return null;
     };
-    defer alloc.free(fs_path);
+    defer alloc.free(file_name);
 
-    const file_content = std.Io.Dir.cwd().readFileAlloc(io, fs_path, alloc, .limited(10 * 1024 * 1024)) catch return null;
-    const body = file_content;
+    const body = static.readContainedFile(alloc, io, "dist", file_name) orelse return null;
 
     const fixed = [1]std.http.Header{
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },
@@ -588,14 +617,24 @@ fn tryServePrerendered(
             .extra_headers = &fixed,
         },
     }) catch return null;
-    bw.writer.writeAll(body) catch return null;
+    if (std_req.head.method != .HEAD) bw.writer.writeAll(body) catch return null;
     bw.end() catch return null;
 
     return {};
 }
 
-test "splitRequestTarget preserves metadata before body reads" {
-    const meta = splitRequestTarget("/api/echo?name=mer&debug=1");
+test "copied request target survives source invalidation during body reads" {
+    const alloc = std.testing.allocator;
+    var head_buffer = "/api/echo?name=mer&debug=1".*;
+    const meta = try copyRequestTarget(alloc, &head_buffer);
+    defer alloc.free(meta.raw_target);
+    defer alloc.free(meta.path);
+    defer alloc.free(meta.query_string);
+
+    // Initializing std.http's body reader reuses its head buffer. Overwriting
+    // this stand-in proves all target-derived request metadata is independently
+    // owned before that body read occurs.
+    @memset(&head_buffer, 'x');
     try std.testing.expectEqualStrings("/api/echo?name=mer&debug=1", meta.raw_target);
     try std.testing.expectEqualStrings("/api/echo", meta.path);
     try std.testing.expectEqualStrings("name=mer&debug=1", meta.query_string);
@@ -605,9 +644,18 @@ test "splitRequestTarget preserves metadata before body reads" {
     try std.testing.expectEqualStrings("", empty_query.query_string);
 }
 
-test "SPA static fallback does not shadow real routes or request bodies" {
-    try std.testing.expect(!shouldTrySpaFallback("dist", true, false));
-    try std.testing.expect(!shouldTrySpaFallback("dist", false, true));
-    try std.testing.expect(!shouldTrySpaFallback(null, false, false));
-    try std.testing.expect(shouldTrySpaFallback("dist", false, false));
+test "static files and SPA fallback do not shadow routes, methods, or request bodies" {
+    try std.testing.expect(!shouldTryStaticFiles(true, .GET, false));
+    try std.testing.expect(!shouldTryStaticFiles(false, .POST, false));
+    try std.testing.expect(!shouldTryStaticFiles(false, .DELETE, false));
+    try std.testing.expect(!shouldTryStaticFiles(false, .GET, true));
+    try std.testing.expect(shouldTryStaticFiles(false, .GET, false));
+    try std.testing.expect(shouldTryStaticFiles(false, .HEAD, false));
+    try std.testing.expect(!shouldTrySpaFallback("dist", true, .GET, false));
+    try std.testing.expect(!shouldTrySpaFallback("dist", false, .POST, false));
+    try std.testing.expect(!shouldTrySpaFallback("dist", false, .DELETE, false));
+    try std.testing.expect(!shouldTrySpaFallback("dist", false, .GET, true));
+    try std.testing.expect(!shouldTrySpaFallback(null, false, .GET, false));
+    try std.testing.expect(shouldTrySpaFallback("dist", false, .GET, false));
+    try std.testing.expect(shouldTrySpaFallback("dist", false, .HEAD, false));
 }

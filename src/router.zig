@@ -58,6 +58,13 @@ pub const Router = struct {
         self.allocator.free(self.dynamic_routes);
     }
 
+    /// Return true only for a concrete route path, excluding dynamic matches.
+    /// A trailing slash uses the same fallback as findRoute.
+    pub fn hasExactRoute(self: Router, path_arg: []const u8) bool {
+        if (self.exact_map.contains(path_arg)) return true;
+        return path_arg.len > 1 and path_arg[path_arg.len - 1] == '/' and self.exact_map.contains(path_arg[0 .. path_arg.len - 1]);
+    }
+
     /// Find a route by path (exact or dynamic match). Returns null if not found.
     pub fn findRoute(self: Router, path_arg: []const u8) ?Route {
         if (self.exact_map.get(path_arg)) |idx| return self.routes[idx];
@@ -171,6 +178,20 @@ test "Router.init: separates exact and dynamic routes" {
     // 2 exact routes in the hash map, 2 dynamic routes
     try std.testing.expectEqual(@as(u32, 2), router.exact_map.count());
     try std.testing.expectEqual(@as(usize, 2), router.dynamic_routes.len);
+}
+
+test "Router.hasExactRoute excludes dynamic matches" {
+    const routes = [_]Route{
+        .{ .path = "/about", .render = dummyRender },
+        .{ .path = "/:slug", .render = dummyRender },
+    };
+    var router = Router.init(std.testing.allocator, &routes);
+    defer router.deinit();
+
+    try std.testing.expect(router.hasExactRoute("/about"));
+    try std.testing.expect(router.hasExactRoute("/about/"));
+    try std.testing.expect(!router.hasExactRoute("/favicon.ico"));
+    try std.testing.expect(router.findRoute("/favicon.ico") != null);
 }
 
 test "Router.findRoute: exact match" {

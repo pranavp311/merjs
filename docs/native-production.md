@@ -109,6 +109,10 @@ mer native doctor
 zig build native-prod-check
 ```
 
+Both forms accept `-Dmacos-signing-identity=...` and
+`-Dmacos-notarization-profile=...` when credentials are intentionally kept out
+of `mer.app.zon`.
+
 This fails if the manifest is missing or misconfigures:
 
 - native `.server.host` loopback IP-literal binding (`127.0.0.1` recommended; `localhost` is intentionally rejected)
@@ -143,12 +147,18 @@ spctl --assess --type execute --verbose zig-out/<Display>.app
 ```
 
 `package-sign` requires a signing identity; entitlements are optional. `package-notarize` and
-`native-prod-release` run the full production gate, including notarization and
-update trust-root metadata. Paths above use Zig's default install prefix;
-custom `zig build --prefix <dir>` writes `<Display>.app` under that prefix.
+`native-prod-release` run the full production gate before signing, including notarization and
+update trust-root metadata. Signing identity, entitlements, and notarization profile may come
+from `mer.app.zon` or the corresponding `-Dmacos-*` options, so credentials do not need to be
+committed. Paths above use Zig's default install prefix; custom `zig build --prefix <dir>` writes
+`<Display>.app` under that prefix.
 
 The package step also copies the configured static directory (default `public/`)
 into `Contents/Resources/<static_dir>/` so Finder-launched apps do not depend on the repo CWD.
+The static root must resolve inside the project, and nested symlinks are rejected to prevent
+packaging files outside the configured asset root. Production release packaging removes any
+previous `.app` after the gate passes, then rebuilds it so deleted assets cannot survive into a
+signed release.
 
 ## 6. Manual smoke test
 

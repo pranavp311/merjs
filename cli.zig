@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (args.len >= 3 and std.mem.eql(u8, args[2], "build")) {
             try cmdNativeBuild(alloc);
         } else if (args.len >= 3 and std.mem.eql(u8, args[2], "doctor")) {
-            try cmdNativeDoctor(alloc);
+            try cmdNativeDoctor(alloc, args[3..]);
         } else {
             try cmdNative(alloc, args[2..]);
         }
@@ -685,7 +685,70 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-check\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-prod-release\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "Contents/Resources") != null);
-    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "codesign.step.dependOn(native_prod_check_step)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "static_dir must resolve inside the project") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "static_dir must not contain nested symlinks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_clean.step.dependOn(native_prod_check_step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_pkg_bin.step.dependOn(&release_clean.step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_codesign.step.dependOn(release_package_step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "zip.step.dependOn(&release_codesign.step)") != null);
+}
+
+test "ZON string field parser ignores commented stale values" {
+    const content =
+        \\// .display_name = "Old Name",
+        \\  .display_name = "New Name",
+    ;
+    const value = (try zonStringFieldFromContent(std.testing.allocator, content, "display_name")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("New Name", value);
+}
+
+test "package mode selection is order independent and monotonic" {
+    try std.testing.expectEqual(PackageMode.release, try selectPackageMode(&.{ "--release", "--sign" }));
+    try std.testing.expectEqual(PackageMode.release, try selectPackageMode(&.{ "--sign", "--release" }));
+    try std.testing.expectEqual(PackageMode.notarize, try selectPackageMode(&.{ "--notarize", "--sign" }));
+    try std.testing.expectEqual(PackageMode.notarize, try selectPackageMode(&.{ "--sign", "--notarize" }));
+    try std.testing.expectEqual(PackageMode.release, try selectPackageMode(&.{ "-Dmacos-signing-identity=test", "--release" }));
+    try std.testing.expectError(error.UnknownPackageOption, selectPackageMode(&.{"--unknown"}));
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+    try appendPackageBuildArgv(std.testing.allocator, &argv, "/fake/zig", .release, &.{
+        "-Dmacos-signing-identity=test",
+        "-Dmacos-notarization-profile=profile",
+    });
+    const expected = [_][]const u8{
+        "/fake/zig",
+        "build",
+        "native-prod-release",
+        "-Doptimize=ReleaseSmall",
+        "-Dmacos-signing-identity=test",
+        "-Dmacos-notarization-profile=profile",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "native doctor forwards credential build options" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+    try appendNativeDoctorArgv(std.testing.allocator, &argv, "/fake/zig", &.{
+        "-Dmacos-signing-identity=test",
+        "-Dmacos-notarization-profile=profile",
+    });
+    const expected = [_][]const u8{
+        "/fake/zig",
+        "build",
+        "native-prod-check",
+        "-Dmacos-signing-identity=test",
+        "-Dmacos-notarization-profile=profile",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| try std.testing.expectEqualStrings(want, got);
+
+    var invalid: std.ArrayList([]const u8) = .empty;
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnknownDoctorOption, appendNativeDoctorArgv(std.testing.allocator, &invalid, "/fake/zig", &.{"--release"}));
 }
 
 test "CLI child processes inherit configured environment" {
@@ -711,6 +774,13 @@ test "CLI child processes inherit configured environment" {
         try std.testing.expect(result.term == .exited);
         try std.testing.expectEqual(@as(u8, 0), result.term.exited);
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "MERJS_ENV_SENTINEL=ok") != null);
+
+        const spawn_term = try spawnWaitInheritEnv(alloc, .{
+            .argv = &.{ "cmd.exe", "/C", "if \"%MERJS_ENV_SENTINEL%\"==\"ok\" (exit 0) else (exit 1)" },
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        try std.testing.expectEqual(@as(u8, 0), spawn_term.exited);
     } else {
         const synthetic_env: std.process.Environ = .{ .block = try map.createPosixBlock(alloc, .{}) };
         defer synthetic_env.block.deinit(alloc);
@@ -719,12 +789,19 @@ test "CLI child processes inherit configured environment" {
         process_environ = synthetic_env;
         defer process_environ = previous;
 
-        const result = try runInheritEnv(alloc, .{ .argv = &.{ "env" }, .stdout_limit = .limited(64 * 1024) });
+        const result = try runInheritEnv(alloc, .{ .argv = &.{"env"}, .stdout_limit = .limited(64 * 1024) });
         defer alloc.free(result.stdout);
         defer alloc.free(result.stderr);
         try std.testing.expect(result.term == .exited);
         try std.testing.expectEqual(@as(u8, 0), result.term.exited);
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "MERJS_ENV_SENTINEL=ok") != null);
+
+        const spawn_term = try spawnWaitInheritEnv(alloc, .{
+            .argv = &.{ "/bin/sh", "-c", "test \"$MERJS_ENV_SENTINEL\" = ok" },
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        try std.testing.expectEqual(@as(u8, 0), spawn_term.exited);
     }
 }
 
@@ -1071,8 +1148,6 @@ const native_build_snippet =
     \\            }
     \\            fn macProdCheckMessage(comptime zon: anytype) []const u8 {
     \\                comptime var msg: []const u8 = "";
-    \\                if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
-    \\                if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
     \\                if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
     \\                if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production extra navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     \\                if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
@@ -1116,22 +1191,16 @@ const native_build_snippet =
     \\            .install_dir = .prefix,
     \\            .install_subdir = b.fmt("{s}/Contents/Resources/{s}", .{ pkg_name, static_assets_dir }),
     \\        });
+    \\        const project_root_path = b.path(".").getPath(b);
+    \\        const static_assets_path = b.path(static_assets_dir).getPath(b);
+    \\        const check_static_links = b.addSystemCommand(&.{ "sh", "-c", "root=$(cd \"$1\" && pwd -P) || exit 1; assets=$(cd \"$2\" && pwd -P) || exit 1; case \"$assets\" in \"$root\"|\"$root\"/*) ;; *) echo 'mer native: static_dir must resolve inside the project' >&2; exit 1;; esac; if find \"$2\"/ -type l -print -quit | grep -q .; then echo 'mer native: static_dir must not contain nested symlinks' >&2; exit 1; fi", "sh", project_root_path, static_assets_path });
+    \\        pkg_static.step.dependOn(&check_static_links.step);
     \\        const package_step = b.step("package", "Package native app as a .app bundle");
     \\        package_step.dependOn(&pkg_bin.step);
     \\        package_step.dependOn(&pkg_plist.step);
     \\        package_step.dependOn(&pkg_static.step);
     \\
     \\        const app_path = b.getInstallPath(.prefix, pkg_name);
-    \\        const prod_check_message = comptime NativePackage.macProdCheckMessage(app_zon);
-    \\        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
-    \\        if (prod_check_message.len == 0) {
-    \\            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
-    \\            native_prod_check_step.dependOn(&ok.step);
-    \\        } else {
-    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", b.fmt("printf 'mer native: macOS production manifest is incomplete:\\n{s}' >&2; exit 1", .{prod_check_message}) });
-    \\            native_prod_check_step.dependOn(&fail.step);
-    \\        }
-    \\
     \\        const signing_identity = NativePackage.firstNonEmpty(
     \\            b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
     \\            NativePackage.zonMacosString(app_zon, "signing_identity"),
@@ -1140,6 +1209,41 @@ const native_build_snippet =
     \\            b.option([]const u8, "macos-entitlements", "macOS entitlements plist for package-sign"),
     \\            NativePackage.zonMacosString(app_zon, "entitlements"),
     \\        );
+    \\        const notarization_profile = NativePackage.firstNonEmpty(
+    \\            b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
+    \\            NativePackage.zonMacosString(app_zon, "notarization_profile"),
+    \\        );
+    \\        const prod_check_message = comptime NativePackage.macProdCheckMessage(app_zon);
+    \\        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
+    \\        if (prod_check_message.len == 0 and signing_identity != null and notarization_profile != null) {
+    \\            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
+    \\            native_prod_check_step.dependOn(&ok.step);
+    \\        } else {
+    \\            var message: []const u8 = prod_check_message;
+    \\            if (signing_identity == null) message = b.fmt("{s}missing macOS signing identity (-Dmacos-signing-identity or .macos.signing_identity)\\n", .{message});
+    \\            if (notarization_profile == null) message = b.fmt("{s}missing macOS notarization profile (-Dmacos-notarization-profile or .macos.notarization_profile)\\n", .{message});
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", b.fmt("printf 'mer native: macOS production manifest is incomplete:\\n{s}' >&2; exit 1", .{message}) });
+    \\            native_prod_check_step.dependOn(&fail.step);
+    \\        }
+    \\
+    \\        const release_clean = b.addSystemCommand(&.{ "rm", "-rf", app_path });
+    \\        release_clean.step.dependOn(native_prod_check_step);
+    \\        const release_pkg_bin = b.addInstallFile(native_exe.getEmittedBin(), b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}));
+    \\        release_pkg_bin.step.dependOn(&release_clean.step);
+    \\        const release_pkg_plist = b.addInstallDirectory(.{ .source_dir = plist.getDirectory(), .install_dir = .prefix, .install_subdir = "" });
+    \\        release_pkg_plist.step.dependOn(&release_clean.step);
+    \\        const release_pkg_static = b.addInstallDirectory(.{
+    \\            .source_dir = b.path(static_assets_dir),
+    \\            .install_dir = .prefix,
+    \\            .install_subdir = b.fmt("{s}/Contents/Resources/{s}", .{ pkg_name, static_assets_dir }),
+    \\        });
+    \\        release_pkg_static.step.dependOn(&release_clean.step);
+    \\        release_pkg_static.step.dependOn(&check_static_links.step);
+    \\        const release_package_step = b.step("package-release-gated", "Package native app after production checks");
+    \\        release_package_step.dependOn(&release_pkg_bin.step);
+    \\        release_package_step.dependOn(&release_pkg_plist.step);
+    \\        release_package_step.dependOn(&release_pkg_static.step);
+    \\
     \\        const package_sign_step = b.step("package-sign", "Package and codesign native app");
     \\        if (signing_identity) |identity| {
     \\            const codesign = b.addSystemCommand(&.{ "codesign", "--deep", "--force", "--options", "runtime", "--timestamp", "--sign", identity });
@@ -1153,23 +1257,22 @@ const native_build_snippet =
     \\            package_sign_step.dependOn(&fail.step);
     \\        }
     \\
-    \\        const notarization_profile = NativePackage.firstNonEmpty(
-    \\            b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
-    \\            NativePackage.zonMacosString(app_zon, "notarization_profile"),
-    \\        );
     \\        const package_notarize_step = b.step("package-notarize", "Codesign, notarize, and staple native app");
-    \\        if (notarization_profile) |profile| {
+    \\        if (signing_identity != null and notarization_profile != null) {
+    \\            const release_codesign = b.addSystemCommand(&.{ "codesign", "--deep", "--force", "--options", "runtime", "--timestamp", "--sign", signing_identity.? });
+    \\            if (entitlements) |path| release_codesign.addArgs(&.{ "--entitlements", path });
+    \\            release_codesign.addArg(app_path);
+    \\            release_codesign.step.dependOn(release_package_step);
     \\            const zip_path = b.getInstallPath(.prefix, b.fmt("{s}.zip", .{pkg_name}));
     \\            const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
-    \\            zip.step.dependOn(native_prod_check_step);
-    \\            zip.step.dependOn(package_sign_step);
-    \\            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", profile, "--wait" });
+    \\            zip.step.dependOn(&release_codesign.step);
+    \\            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", notarization_profile.?, "--wait" });
     \\            submit.step.dependOn(&zip.step);
     \\            const staple = b.addSystemCommand(&.{ "xcrun", "stapler", "staple", app_path });
     \\            staple.step.dependOn(&submit.step);
     \\            package_notarize_step.dependOn(&staple.step);
     \\        } else {
-    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile in mer.app.zon' >&2; exit 1" });
+    \\            const fail = b.addSystemCommand(&.{ "sh", "-c", "exit 1" });
     \\            fail.step.dependOn(native_prod_check_step);
     \\            package_notarize_step.dependOn(&fail.step);
     \\        }
@@ -1178,44 +1281,51 @@ const native_build_snippet =
     \\    }
 ;
 
+fn zonStringFieldFromContent(alloc: std.mem.Allocator, content: []const u8, field: []const u8) !?[]u8 {
+    const needle = try std.fmt.allocPrint(alloc, ".{s}", .{field});
+    defer alloc.free(needle);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, needle)) continue;
+        const after_field = std.mem.trim(u8, trimmed[needle.len..], " \t\r");
+        if (after_field.len == 0 or after_field[0] != '=') continue;
+        const after_eq = std.mem.trim(u8, after_field[1..], " \t\r");
+        if (after_eq.len == 0 or after_eq[0] != '"') return null;
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        var i: usize = 1;
+        while (i < after_eq.len) : (i += 1) {
+            const c = after_eq[i];
+            if (c == '"') return try out.toOwnedSlice(alloc);
+            if (c != '\\') {
+                try out.append(alloc, c);
+                continue;
+            }
+
+            i += 1;
+            if (i >= after_eq.len) return null;
+            try out.append(alloc, switch (after_eq[i]) {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                else => after_eq[i],
+            });
+        }
+        return null;
+    }
+    return null;
+}
+
 fn readZonStringField(alloc: std.mem.Allocator, field: []const u8) !?[]u8 {
     const content = std.Io.Dir.cwd().readFileAlloc(runtime.io, "mer.app.zon", alloc, .limited(64 * 1024)) catch return null;
     defer alloc.free(content);
-
-    const needle = try std.fmt.allocPrint(alloc, ".{s}", .{field});
-    defer alloc.free(needle);
-    const idx = std.mem.indexOf(u8, content, needle) orelse return null;
-    const after_field = content[idx + needle.len ..];
-    const eq = std.mem.indexOfScalar(u8, after_field, '=') orelse return null;
-    const after_eq = std.mem.trim(u8, after_field[eq + 1 ..], " \t\r\n");
-    if (after_eq.len == 0 or after_eq[0] != '"') return null;
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-
-    var i: usize = 1;
-    while (i < after_eq.len) : (i += 1) {
-        const c = after_eq[i];
-        if (c == '"') return try out.toOwnedSlice(alloc);
-        if (c != '\\') {
-            try out.append(alloc, c);
-            continue;
-        }
-
-        i += 1;
-        if (i >= after_eq.len) return null;
-        try out.append(alloc, switch (after_eq[i]) {
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            '\\' => '\\',
-            '"' => '"',
-            '\'' => '\'',
-            else => after_eq[i],
-        });
-    }
-
-    return null;
+    return zonStringFieldFromContent(alloc, content, field);
 }
 
 fn safeBundleComponent(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -1320,7 +1430,20 @@ fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
     print("mer: native binary built → zig-out/bin/mernative\n", .{});
 }
 
-fn cmdNativeDoctor(alloc: std.mem.Allocator) !void {
+fn appendNativeDoctorArgv(
+    alloc: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    zig_exe: []const u8,
+    extra_args: []const []const u8,
+) error{ UnknownDoctorOption, OutOfMemory }!void {
+    try argv.appendSlice(alloc, &.{ zig_exe, "build", "native-prod-check" });
+    for (extra_args) |arg| {
+        if (!std.mem.startsWith(u8, arg, "-D")) return error.UnknownDoctorOption;
+        try argv.append(alloc, arg);
+    }
+}
+
+fn cmdNativeDoctor(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
@@ -1332,9 +1455,19 @@ fn cmdNativeDoctor(alloc: std.mem.Allocator) !void {
     const zig_exe = try resolveInPath(alloc, "zig");
     defer alloc.free(zig_exe);
 
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    appendNativeDoctorArgv(alloc, &argv, zig_exe, extra_args) catch |err| switch (err) {
+        error.UnknownDoctorOption => {
+            print("mer: native doctor accepts only -D build options\n", .{});
+            std.process.exit(1);
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
     print("mer: checking macOS native production manifest...\n", .{});
     const term = try spawnWaitInheritEnv(alloc, .{
-        .argv = &.{ zig_exe, "build", "native-prod-check" },
+        .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     });
@@ -1343,6 +1476,51 @@ fn cmdNativeDoctor(alloc: std.mem.Allocator) !void {
         print("mer: native production check failed\n", .{});
         std.process.exit(1);
     }
+}
+
+const PackageMode = enum {
+    package,
+    sign,
+    notarize,
+    release,
+
+    fn buildStep(self: PackageMode) []const u8 {
+        return switch (self) {
+            .package => "package",
+            .sign => "package-sign",
+            .notarize => "package-notarize",
+            .release => "native-prod-release",
+        };
+    }
+};
+
+fn selectPackageMode(args: []const []const u8) error{UnknownPackageOption}!PackageMode {
+    var selected: PackageMode = .package;
+    for (args) |arg| {
+        const candidate: PackageMode = if (std.mem.eql(u8, arg, "--sign"))
+            .sign
+        else if (std.mem.eql(u8, arg, "--notarize"))
+            .notarize
+        else if (std.mem.eql(u8, arg, "--release"))
+            .release
+        else if (std.mem.startsWith(u8, arg, "-D"))
+            continue
+        else
+            return error.UnknownPackageOption;
+        if (@intFromEnum(candidate) > @intFromEnum(selected)) selected = candidate;
+    }
+    return selected;
+}
+
+fn appendPackageBuildArgv(
+    alloc: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    zig_exe: []const u8,
+    mode: PackageMode,
+    build_opts: []const []const u8,
+) !void {
+    try argv.appendSlice(alloc, &.{ zig_exe, "build", mode.buildStep(), "-Doptimize=ReleaseSmall" });
+    try argv.appendSlice(alloc, build_opts);
 }
 
 fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
@@ -1357,28 +1535,25 @@ fn cmdPackage(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     const zig_exe = try resolveInPath(alloc, "zig");
     defer alloc.free(zig_exe);
 
-    var build_step: []const u8 = "package";
+    var package_mode: PackageMode = .package;
     var build_opts: std.ArrayList([]const u8) = .empty;
     defer build_opts.deinit(alloc);
     for (extra_args) |arg| {
-        if (std.mem.eql(u8, arg, "--sign")) {
-            if (!std.mem.eql(u8, build_step, "package-notarize")) build_step = "package-sign";
-        } else if (std.mem.eql(u8, arg, "--notarize")) {
-            build_step = "package-notarize";
-        } else if (std.mem.eql(u8, arg, "--release")) {
-            build_step = "native-prod-release";
-        } else if (std.mem.startsWith(u8, arg, "-D")) {
+        if (std.mem.startsWith(u8, arg, "-D")) {
             try build_opts.append(alloc, arg);
-        } else {
+            continue;
+        }
+        const candidate = selectPackageMode(&.{arg}) catch {
             print("mer: unknown package option '{s}'\n  usage: mer package [--sign|--notarize|--release] [-Dmacos-signing-identity=...] [-Dmacos-notarization-profile=...]\n", .{arg});
             std.process.exit(1);
-        }
+        };
+        if (@intFromEnum(candidate) > @intFromEnum(package_mode)) package_mode = candidate;
     }
+    const build_step = package_mode.buildStep();
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    try argv.appendSlice(alloc, &.{ zig_exe, "build", build_step, "-Doptimize=ReleaseSmall" });
-    try argv.appendSlice(alloc, build_opts.items);
+    try appendPackageBuildArgv(alloc, &argv, zig_exe, package_mode, build_opts.items);
 
     print("mer: running zig build {s}...\n", .{build_step});
     const term = try spawnWaitInheritEnv(alloc, .{

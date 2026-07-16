@@ -10,7 +10,7 @@ model — an unusually clean fit for merjs because the framework *already owns*
 the HTTP server, routing, SSR, and hot-reload transport. The shell only adds
 the WebView + window + bridge + packaging layer.
 
-> PR #100 is rebased to the latest published release (`v0.2.5`) and ships macOS first. Linux (WebKitGTK) and Windows (WebView2) are planned.
+> PR #100 is based on the latest `main` branch and ships macOS first. Linux (WebKitGTK) and Windows (WebView2) are planned.
 
 ## Platform status
 
@@ -298,7 +298,9 @@ spctl --assess --type execute --verbose zig-out/<Display>.app
 codesign --deep --force --options runtime --timestamp --sign <identity> [--entitlements <plist>] zig-out/<Display>.app
 ```
 
-`zig-out/<Display>.app` is the default Zig prefix output; custom `zig build --prefix <dir>` writes the bundle under that prefix. The full production gate (notarization profile + update trust root + hardened manifest checks) runs for `package-notarize` and `native-prod-release`.
+`zig-out/<Display>.app` is the default Zig prefix output; custom `zig build --prefix <dir>` writes the bundle under that prefix. The full production gate (signing identity + notarization profile + update trust root + hardened manifest checks) runs before any signing side effect for `package-notarize` and `native-prod-release`. Signing/notarization values supplied through `-Dmacos-*` options satisfy the same gate as manifest values.
+
+Packaging requires the static root to resolve inside the project and rejects nested symlinks rather than risk copying files from outside the asset root into the bundle. Production release packaging clears the previous `.app` after the gate passes so removed assets cannot survive into the signed bundle.
 
 `package-notarize` signs, zips the app with `ditto --keepParent`, submits it via
 `xcrun notarytool submit --wait`, then staples the ticket with

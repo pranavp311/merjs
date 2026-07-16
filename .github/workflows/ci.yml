@@ -20,10 +20,17 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Build merjs
+      - name: Build and test Linux compatibility matrix
         run: |
-          zig build codegen
-          zig build
+          zig version
+          zig build test
+          zig build cli
+          zig build worker
+          zig build wasm
+          zig build prod
+
+      - name: Build merjs
+        run: zig build
 
       - name: Verify binary
         run: test -f zig-out/bin/merjs

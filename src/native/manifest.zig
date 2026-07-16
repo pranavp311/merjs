@@ -85,11 +85,12 @@ pub fn fromZon(comptime zon: anytype) Manifest {
 
     // server{} block is optional; default to embedded loopback on port 0.
     const has_server = @hasField(T, "server");
-    const server_mode = if (has_server) zon.server.mode else "embedded";
-    const host = if (has_server) zon.server.host else "127.0.0.1";
-    const port: u16 = if (has_server) zon.server.port else 0;
-    const watch_dir = if (has_server and @hasField(@TypeOf(zon.server), "watch_dir")) zon.server.watch_dir else "app";
-    const static_dir: ?[]const u8 = if (has_server and @hasField(@TypeOf(zon.server), "static_dir")) zon.server.static_dir else null;
+    const ServerT = if (has_server) @TypeOf(zon.server) else struct {};
+    const server_mode = if (has_server and @hasField(ServerT, "mode")) zon.server.mode else "embedded";
+    const host = if (has_server and @hasField(ServerT, "host")) zon.server.host else "127.0.0.1";
+    const port: u16 = if (has_server and @hasField(ServerT, "port")) zon.server.port else 0;
+    const watch_dir = if (has_server and @hasField(ServerT, "watch_dir")) zon.server.watch_dir else "app";
+    const static_dir: ?[]const u8 = if (has_server and @hasField(ServerT, "static_dir")) zon.server.static_dir else null;
 
     // First window drives the shell. windows[] is required.
     const win = zon.windows[0];
@@ -315,14 +316,14 @@ test "fromZon parses native security hardening blocks" {
         .version = "0.1.0",
         .web_engine = "system",
         .security = .{
-            .navigation = .{ .allowed_origins = .{ "http://127.0.0.1" } },
+            .navigation = .{ .allowed_origins = .{"http://127.0.0.1"} },
             .bridge = .{
                 .allowed_commands = .{ "mer.ping", "window.close" },
-                .command_origins = .{ "window.close|http://127.0.0.1" },
+                .command_origins = .{"window.close|http://127.0.0.1"},
             },
             .open = .{
-                .external_schemes = .{ "https" },
-                .path_roots = .{ "/tmp/test" },
+                .external_schemes = .{"https"},
+                .path_roots = .{"/tmp/test"},
             },
         },
         .macos = .{
@@ -346,8 +347,12 @@ test "fromZon parses native security hardening blocks" {
     try std.testing.expectEqualStrings("https", parsed.security.open.external_schemes[0]);
     try std.testing.expectEqualStrings("/tmp/test", parsed.security.open.path_roots[0]);
     try std.testing.expectEqualStrings("Developer ID Application: Example (TEAMID)", parsed.macos.signing_identity.?);
+    try std.testing.expectEqualStrings("TEAMID", parsed.macos.team_id.?);
+    try std.testing.expectEqualStrings("native/entitlements.plist", parsed.macos.entitlements.?);
     try std.testing.expectEqualStrings("merjs-notary", parsed.macos.notarization_profile.?);
     try std.testing.expectEqualStrings("github-releases", parsed.update.provider.?);
+    try std.testing.expectEqualStrings("https://example.com/update.json", parsed.update.feed_url.?);
+    try std.testing.expectEqualStrings("ed25519:example", parsed.update.public_key.?);
 }
 
 test "fromZon defaults omitted window fields" {
@@ -367,4 +372,67 @@ test "fromZon defaults omitted window fields" {
     try std.testing.expectEqual(@as(u32, 1024), parsed.window.width);
     try std.testing.expectEqual(@as(u32, 720), parsed.window.height);
     try std.testing.expectEqualStrings("app", parsed.watch_dir);
+}
+
+test "fromZon applies complete minimal manifest defaults" {
+    const parsed = fromZon(.{
+        .id = "com.example.minimal",
+        .name = "minimal",
+        .display_name = "Minimal",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .windows = .{.{}},
+    });
+    try std.testing.expectEqualStrings("embedded", parsed.server_mode);
+    try std.testing.expectEqualStrings("127.0.0.1", parsed.host);
+    try std.testing.expectEqual(@as(u16, 0), parsed.port);
+    try std.testing.expectEqualStrings("app", parsed.watch_dir);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.static_dir);
+    try std.testing.expect(!parsed.dev);
+    try std.testing.expectEqual(@as(usize, 0), parsed.permissions.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.capabilities.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.security.allowed_origins.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.security.bridge.allowed_commands.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.security.bridge.command_origins.len);
+    try std.testing.expectEqualStrings("http", parsed.security.open.external_schemes[0]);
+    try std.testing.expectEqualStrings("https", parsed.security.open.external_schemes[1]);
+    try std.testing.expectEqualStrings("mailto", parsed.security.open.external_schemes[2]);
+    try std.testing.expectEqual(@as(usize, 0), parsed.security.open.path_roots.len);
+    try std.testing.expect(parsed.macos.signing_identity == null);
+    try std.testing.expect(parsed.macos.team_id == null);
+    try std.testing.expect(parsed.macos.entitlements == null);
+    try std.testing.expect(parsed.macos.notarization_profile == null);
+    try std.testing.expect(parsed.update.provider == null);
+    try std.testing.expect(parsed.update.feed_url == null);
+    try std.testing.expect(parsed.update.public_key == null);
+}
+
+test "fromZon defaults omitted fields inside a partial server block" {
+    const parsed = fromZon(.{
+        .id = "com.example.partial-server",
+        .name = "partial-server",
+        .display_name = "Partial Server",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .server = .{ .mode = "dev" },
+        .windows = .{.{}},
+    });
+    try std.testing.expectEqualStrings("dev", parsed.server_mode);
+    try std.testing.expectEqualStrings("127.0.0.1", parsed.host);
+    try std.testing.expectEqual(@as(u16, 0), parsed.port);
+    try std.testing.expectEqualStrings("app", parsed.watch_dir);
+    try std.testing.expect(parsed.static_dir == null);
+}
+
+test "fromZon parses explicit static directory" {
+    const parsed = fromZon(.{
+        .id = "com.example.static",
+        .name = "static",
+        .display_name = "Static",
+        .version = "0.1.0",
+        .web_engine = "system",
+        .server = .{ .mode = "embedded", .host = "127.0.0.1", .port = 0, .static_dir = "dist" },
+        .windows = .{.{}},
+    });
+    try std.testing.expectEqualStrings("dist", parsed.static_dir.?);
 }

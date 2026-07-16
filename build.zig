@@ -292,8 +292,6 @@ fn zonHasOpenArray(comptime zon: anytype, comptime field: []const u8) bool {
 
 fn macProdCheckMessage(comptime zon: anytype) []const u8 {
     comptime var msg: []const u8 = "";
-    if (nonEmpty(zonMacosString(zon, "signing_identity")) == null) msg = msg ++ "missing .macos.signing_identity\\n";
-    if (nonEmpty(zonMacosString(zon, "notarization_profile")) == null) msg = msg ++ "missing .macos.notarization_profile\\n";
     if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
     if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production extra navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
@@ -784,28 +782,22 @@ pub fn build(b: *std.Build) void {
             .install_dir = .prefix,
             .install_subdir = b.fmt("{s}/Contents/Resources/{s}", .{ pkg_name, static_assets_dir }),
         });
+        const project_root_path = b.path(".").getPath(b);
+        const static_assets_path = b.path(static_assets_dir).getPath(b);
+        const check_static_links = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            "root=$(cd \"$1\" && pwd -P) || exit 1; assets=$(cd \"$2\" && pwd -P) || exit 1; case \"$assets\" in \"$root\"|\"$root\"/*) ;; *) echo 'mer native: static_dir must resolve inside the project' >&2; exit 1;; esac; if find \"$2\"/ -type l -print -quit | grep -q .; then echo 'mer native: static_dir must not contain nested symlinks' >&2; exit 1; fi",
+            "sh",
+            project_root_path,
+            static_assets_path,
+        });
+        pkg_static.step.dependOn(&check_static_links.step);
         const package_step = b.step("package", "Package the native app as a .app bundle (macOS)");
         package_step.dependOn(&pkg_bin.step);
         package_step.dependOn(&pkg_plist.step);
         package_step.dependOn(&pkg_static.step);
 
-        const prod_check_message = comptime macProdCheckMessage(app_zon);
-        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
-        if (prod_check_message.len == 0) {
-            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
-            native_prod_check_step.dependOn(&ok.step);
-        } else {
-            const fail = b.addSystemCommand(&.{
-                "sh",
-                "-c",
-                b.fmt("printf 'mer native: macOS production manifest is incomplete:\n{s}' >&2; exit 1", .{prod_check_message}),
-            });
-            native_prod_check_step.dependOn(&fail.step);
-        }
-
-        // `package-sign` — optional Developer ID signing. Unsigned local
-        // packages remain the default; this step is explicit like Tauri's
-        // macOS bundle signing path.
         const app_path = b.getInstallPath(.prefix, pkg_name);
         const signing_identity = firstNonEmpty(
             b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
@@ -815,6 +807,62 @@ pub fn build(b: *std.Build) void {
             b.option([]const u8, "macos-entitlements", "macOS entitlements plist for package-sign"),
             zonMacosString(app_zon, "entitlements"),
         );
+        const notarization_profile = firstNonEmpty(
+            b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
+            zonMacosString(app_zon, "notarization_profile"),
+        );
+
+        // Resolve command-line overrides before constructing the production
+        // gate so release credentials can stay out of the checked-in manifest.
+        const prod_check_message = comptime macProdCheckMessage(app_zon);
+        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
+        if (prod_check_message.len == 0 and signing_identity != null and notarization_profile != null) {
+            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
+            native_prod_check_step.dependOn(&ok.step);
+        } else {
+            var message: []const u8 = prod_check_message;
+            if (signing_identity == null) message = b.fmt("{s}missing macOS signing identity (-Dmacos-signing-identity or .macos.signing_identity)\n", .{message});
+            if (notarization_profile == null) message = b.fmt("{s}missing macOS notarization profile (-Dmacos-notarization-profile or .macos.notarization_profile)\n", .{message});
+            const fail = b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                b.fmt("printf 'mer native: macOS production manifest is incomplete:\n{s}' >&2; exit 1", .{message}),
+            });
+            native_prod_check_step.dependOn(&fail.step);
+        }
+
+        // Production release packaging is a separate graph from the local
+        // `package` target so a failed gate cannot overwrite an existing app.
+        // Start from an empty bundle so removed assets cannot survive and be
+        // signed into a later release.
+        const release_clean = b.addSystemCommand(&.{ "rm", "-rf", app_path });
+        release_clean.step.dependOn(native_prod_check_step);
+        const release_pkg_bin = b.addInstallFile(
+            native_exe.getEmittedBin(),
+            b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}),
+        );
+        release_pkg_bin.step.dependOn(&release_clean.step);
+        const release_pkg_plist = b.addInstallDirectory(.{
+            .source_dir = plist.getDirectory(),
+            .install_dir = .prefix,
+            .install_subdir = "",
+        });
+        release_pkg_plist.step.dependOn(&release_clean.step);
+        const release_pkg_static = b.addInstallDirectory(.{
+            .source_dir = b.path(static_assets_dir),
+            .install_dir = .prefix,
+            .install_subdir = b.fmt("{s}/Contents/Resources/{s}", .{ pkg_name, static_assets_dir }),
+        });
+        release_pkg_static.step.dependOn(&release_clean.step);
+        release_pkg_static.step.dependOn(&check_static_links.step);
+        const release_package_step = b.step("package-release-gated", "Package native app after production checks");
+        release_package_step.dependOn(&release_pkg_bin.step);
+        release_package_step.dependOn(&release_pkg_plist.step);
+        release_package_step.dependOn(&release_pkg_static.step);
+
+        // `package-sign` — optional Developer ID signing. Unsigned local
+        // packages remain the default; this step is explicit like Tauri's
+        // macOS bundle signing path.
         const package_sign_step = b.step("package-sign", "Package and codesign the native .app bundle (macOS)");
         if (signing_identity) |identity| {
             const codesign = b.addSystemCommand(&.{
@@ -841,31 +889,36 @@ pub fn build(b: *std.Build) void {
             package_sign_step.dependOn(&fail.step);
         }
 
-        // `package-notarize` — sign, zip, submit, and staple. Credentials stay
-        // in the developer's keychain profile; merjs never stores passwords.
-        // The production manifest gate is a hard precondition for every
-        // notarization side-effect command.
-        const notarization_profile = firstNonEmpty(
-            b.option([]const u8, "macos-notarization-profile", "xcrun notarytool keychain profile for package-notarize"),
-            zonMacosString(app_zon, "notarization_profile"),
-        );
+        // `package-notarize` uses a distinct signing node whose dependencies
+        // guarantee gate -> sign -> zip -> submit -> staple. The standalone
+        // `package-sign` target intentionally remains usable for local signing
+        // without requiring update/notarization production metadata.
         const package_notarize_step = b.step("package-notarize", "Codesign, notarize, and staple the native .app bundle (macOS)");
-        if (notarization_profile) |profile| {
+        if (signing_identity != null and notarization_profile != null) {
+            const release_codesign = b.addSystemCommand(&.{
+                "codesign",
+                "--deep",
+                "--force",
+                "--options",
+                "runtime",
+                "--timestamp",
+                "--sign",
+                signing_identity.?,
+            });
+            if (entitlements) |path| release_codesign.addArgs(&.{ "--entitlements", path });
+            release_codesign.addArg(app_path);
+            release_codesign.step.dependOn(release_package_step);
+
             const zip_path = b.getInstallPath(.prefix, b.fmt("{s}.zip", .{pkg_name}));
             const zip = b.addSystemCommand(&.{ "ditto", "-c", "-k", "--keepParent", app_path, zip_path });
-            zip.step.dependOn(native_prod_check_step);
-            zip.step.dependOn(package_sign_step);
-            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", profile, "--wait" });
+            zip.step.dependOn(&release_codesign.step);
+            const submit = b.addSystemCommand(&.{ "xcrun", "notarytool", "submit", zip_path, "--keychain-profile", notarization_profile.?, "--wait" });
             submit.step.dependOn(&zip.step);
             const staple = b.addSystemCommand(&.{ "xcrun", "stapler", "staple", app_path });
             staple.step.dependOn(&submit.step);
             package_notarize_step.dependOn(&staple.step);
         } else {
-            const fail = b.addSystemCommand(&.{
-                "sh",
-                "-c",
-                "echo 'mer native: package-notarize needs -Dmacos-notarization-profile or .macos.notarization_profile in mer.app.zon' >&2; exit 1",
-            });
+            const fail = b.addSystemCommand(&.{ "sh", "-c", "exit 1" });
             fail.step.dependOn(native_prod_check_step);
             package_notarize_step.dependOn(&fail.step);
         }
