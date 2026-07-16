@@ -143,11 +143,27 @@ let aiActive = 0;
 let aiMinute = 0;
 let aiMinuteCount = 0;
 
+async function rejectAiRequest(request, data, status) {
+  await request.body?.cancel("AI request rejected").catch(() => {});
+  return jsonResp(data, status);
+}
+
+async function raceWithSignal(promise, signal) {
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason || new Error("AI deadline exceeded"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { return await Promise.race([promise, aborted]); }
+  finally { signal.removeEventListener("abort", onAbort); }
+}
+
 async function admitAi(request, env, work) {
   if (!env.AI_BEARER_TOKEN)
-    return jsonResp({ error: "AI controls are not configured" }, 503);
+    return rejectAiRequest(request, { error: "AI controls are not configured" }, 503);
   if (request.headers.get("authorization") !== `Bearer ${env.AI_BEARER_TOKEN}`)
-    return jsonResp({ error: "Unauthorized" }, 401);
+    return rejectAiRequest(request, { error: "Unauthorized" }, 401);
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null && (!/^(0|[1-9][0-9]*)$/.test(contentLength) ||
       !Number.isSafeInteger(Number(contentLength)) || Number(contentLength) > 8192)) {
@@ -157,21 +173,23 @@ async function admitAi(request, env, work) {
   let admission;
   try { admission = createAiAdmission(request, env); }
   catch (error) {
-    return jsonResp({ error: error.message }, error instanceof AiAdmissionError ? error.status : 503);
+    return rejectAiRequest(request, { error: error.message }, error instanceof AiAdmissionError ? error.status : 503);
   }
   const minute = Math.floor(Date.now() / 60000);
   if (minute !== aiMinute) { aiMinute = minute; aiMinuteCount = 0; }
   // These isolate-local limits are defense-in-depth only; the shared gate is authoritative.
   if (aiActive >= AI_MAX_CONCURRENCY || aiMinuteCount >= AI_MAX_PER_MINUTE)
-    return jsonResp({ error: "AI capacity exceeded" }, 429);
+    return rejectAiRequest(request, { error: "AI capacity exceeded" }, 429);
   aiActive++;
   aiMinuteCount++;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  try { return await work(controller.signal, admission); }
+  const timeoutError = new Error("AI deadline exceeded");
+  timeoutError.name = "TimeoutError";
+  const timeout = setTimeout(() => controller.abort(timeoutError), 15000);
+  try { return await raceWithSignal(Promise.resolve().then(() => work(controller.signal, admission)), controller.signal); }
   catch (error) {
     if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
-    return jsonResp({ error: "AI upstream unavailable" }, 502);
+    return jsonResp({ error: error?.name === "TimeoutError" ? "AI request timed out" : "AI upstream unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
   } finally { clearTimeout(timeout); aiActive--; }
 }
 

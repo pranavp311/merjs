@@ -142,21 +142,46 @@ function jsonResp(data, status = 200) {
 
 // ── R2 grep search (WASM-powered, no embeddings) ──────────────────────────────
 
+const GREP_QUERY_CAPACITY = 4096;
+const GREP_CHUNKS_CAPACITY = 1024 * 1024;
+const MAX_CORPUS_JSON_BYTES = 1024 * 1024;
+const MAX_CORPUS_CHUNKS = 8192;
 let cachedChunks = null;
 
-async function getChunks(env) {
+async function getChunks(env, signal) {
+  if (signal.aborted) throw signal.reason;
   if (cachedChunks) return cachedChunks;
   const obj = await env.BUCKET.get("budget2026/all_chunks.json");
+  if (signal.aborted) throw signal.reason;
   if (!obj) return [];
-  cachedChunks = JSON.parse(await obj.text());
+  const objectSize = Number(obj.size);
+  if (!Number.isSafeInteger(objectSize) || objectSize < 0 || objectSize > MAX_CORPUS_JSON_BYTES) {
+    await obj.body?.cancel("corpus too large").catch(() => {});
+    throw new Error("corpus too large");
+  }
+  const bytes = await readBoundedBody({
+    headers: new Headers({ "content-length": String(objectSize) }),
+    body: obj.body,
+  }, MAX_CORPUS_JSON_BYTES, signal);
+  const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  if (!Array.isArray(parsed) || parsed.length > MAX_CORPUS_CHUNKS ||
+      parsed.some(chunk => chunk === null || typeof chunk !== "object" || typeof chunk.text !== "string"))
+    throw new Error("invalid corpus");
+  cachedChunks = parsed;
   return cachedChunks;
 }
 
 // Pack chunk texts into length-prefixed binary for WASM: [u32-LE len][text]...
 function packChunks(chunks) {
   const encoder = new TextEncoder();
-  const encoded = chunks.map(c => encoder.encode(c.text));
-  const totalLen = encoded.reduce((sum, e) => sum + 4 + e.length, 0);
+  const encoded = [];
+  let totalLen = 0;
+  for (const chunk of chunks) {
+    const text = encoder.encode(chunk.text);
+    if (text.length > GREP_CHUNKS_CAPACITY - totalLen - 4) throw new Error("corpus exceeds grep capacity");
+    encoded.push(text);
+    totalLen += 4 + text.length;
+  }
   const buf = new Uint8Array(totalLen);
   let off = 0;
   for (const e of encoded) {
@@ -178,12 +203,14 @@ async function grepChunks(chunks, query) {
 
   // Write query into WASM memory
   const qBytes = encoder.encode(query);
+  if (qBytes.length > GREP_QUERY_CAPACITY) throw new Error("query exceeds grep capacity");
   const qPtr = grep.get_query_ptr();
   const mem = new Uint8Array(grep.memory.buffer);
   mem.set(qBytes, qPtr);
 
   // Pack and write chunks into WASM memory
   const packed = packChunks(chunks);
+  if (packed.length > GREP_CHUNKS_CAPACITY) throw new Error("corpus exceeds grep capacity");
   const cPtr = grep.get_chunks_ptr();
   mem.set(packed, cPtr);
 
@@ -206,11 +233,27 @@ let aiActive = 0;
 let aiMinute = 0;
 let aiMinuteCount = 0;
 
+async function rejectAiRequest(request, data, status) {
+  await request.body?.cancel("AI request rejected").catch(() => {});
+  return jsonResp(data, status);
+}
+
+async function raceWithSignal(promise, signal) {
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason || new Error("AI deadline exceeded"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { return await Promise.race([promise, aborted]); }
+  finally { signal.removeEventListener("abort", onAbort); }
+}
+
 async function admitAi(request, env, work) {
   if (!env.AI_BEARER_TOKEN)
-    return jsonResp({ error: "AI controls are not configured" }, 503);
+    return rejectAiRequest(request, { error: "AI controls are not configured" }, 503);
   if (request.headers.get("authorization") !== `Bearer ${env.AI_BEARER_TOKEN}`)
-    return jsonResp({ error: "Unauthorized" }, 401);
+    return rejectAiRequest(request, { error: "Unauthorized" }, 401);
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null && (!/^(0|[1-9][0-9]*)$/.test(contentLength) ||
       !Number.isSafeInteger(Number(contentLength)) || Number(contentLength) > 8192)) {
@@ -220,21 +263,23 @@ async function admitAi(request, env, work) {
   let admission;
   try { admission = createAiAdmission(request, env); }
   catch (error) {
-    return jsonResp({ error: error.message }, error instanceof AiAdmissionError ? error.status : 503);
+    return rejectAiRequest(request, { error: error.message }, error instanceof AiAdmissionError ? error.status : 503);
   }
   const minute = Math.floor(Date.now() / 60000);
   if (minute !== aiMinute) { aiMinute = minute; aiMinuteCount = 0; }
   // These isolate-local limits are defense-in-depth only; the shared gate is authoritative.
   if (aiActive >= AI_MAX_CONCURRENCY || aiMinuteCount >= AI_MAX_PER_MINUTE)
-    return jsonResp({ error: "AI capacity exceeded" }, 429);
+    return rejectAiRequest(request, { error: "AI capacity exceeded" }, 429);
   aiActive++;
   aiMinuteCount++;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  try { return await work(controller.signal, admission); }
+  const timeoutError = new Error("AI deadline exceeded");
+  timeoutError.name = "TimeoutError";
+  const timeout = setTimeout(() => controller.abort(timeoutError), 15000);
+  try { return await raceWithSignal(Promise.resolve().then(() => work(controller.signal, admission)), controller.signal); }
   catch (error) {
     if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
-    return jsonResp({ error: "AI upstream unavailable" }, 502);
+    return jsonResp({ error: error?.name === "TimeoutError" ? "AI request timed out" : "AI upstream unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
   } finally { clearTimeout(timeout); aiActive--; }
 }
 
@@ -314,7 +359,7 @@ async function handleBudgetAi(request, env, signal, admission) {
   } catch { /* fall back to raw question */ }
 
   // Step 2: Grep R2 chunks
-  const chunks = await getChunks(env);
+  const chunks = await getChunks(env, signal);
   const matched = await grepChunks(chunks, searchQuery);
 
   let context = "";
