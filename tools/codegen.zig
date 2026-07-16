@@ -277,7 +277,17 @@ fn validateUniqueRoutes(alloc: std.mem.Allocator, entries: []const []const u8, r
     for (entries, 0..) |path, i| {
         const url = try toUrl(alloc, path);
         defer alloc.free(url);
+        const ident = try toIdent(alloc, path);
+        defer alloc.free(ident);
         for (entries[0..i]) |previous_path| {
+            const previous_ident = try toIdent(alloc, previous_path);
+            if (std.mem.eql(u8, ident, previous_ident)) {
+                if (report_collision) std.debug.print("codegen: identifier collision: {s} and {s} both emit {s}\n", .{ path, previous_path, ident });
+                alloc.free(previous_ident);
+                return error.DuplicateIdentifier;
+            }
+            alloc.free(previous_ident);
+
             const previous_url = try toUrl(alloc, previous_path);
             if (routePatternsCollide(url, previous_url)) {
                 if (report_collision) std.debug.print("codegen: route collision: {s} ({s}) conflicts with {s} ({s})\n", .{ path, url, previous_path, previous_url });
@@ -351,6 +361,10 @@ test "route collision detection rejects index aliases and renamed parameters" {
     try std.testing.expectError(error.DuplicateRoute, validateUniqueRoutes(std.testing.allocator, &.{
         "app/users/[id].zig",
         "app/users/[slug].zig",
+    }, false));
+    try std.testing.expectError(error.DuplicateIdentifier, validateUniqueRoutes(std.testing.allocator, &.{
+        "app/foo-bar.zig",
+        "app/foo_bar.zig",
     }, false));
     try validateUniqueRoutes(std.testing.allocator, &.{
         "app/users/settings.zig",
