@@ -172,10 +172,10 @@ responses use `no-store`.
 |                        | **merjs**                  | **Next.js**                    |
 | ---------------------- | -------------------------- | ------------------------------ |
 <!-- BENCH:START -->
-| Requests/sec (wrk)    | **195.18 req/s**     | **2757.41 req/s**          |
-| Avg latency           | **40.85ms 2.31ms**           | **72.04ms 191.42ms**                |
-| RAM usage (under load) | **4.8 MB**        | **71.7 MB**             |
-| Build time             | **22461 ms**                | **30139 ms**                   |
+| Requests/sec (wrk)    | **195.09 req/s**     | **2448.68 req/s**          |
+| Avg latency           | **40.86ms 2.19ms**           | **76.24ms 192.32ms**                |
+| RAM usage (under load) | **6.4 MB**        | **71.5 MB**             |
+| Build time             | **23350 ms**                | **37854 ms**                   |
 <!-- BENCH:END -->
 
 > merjs is an early experiment — Next.js is mature and production-grade. Local and CI numbers differ due to hardware (Apple Silicon vs shared GitHub Actions VM).
