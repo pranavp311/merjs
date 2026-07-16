@@ -48,3 +48,31 @@ for (const deployment of deployments) {
 }
 
 assert.ok(!existsSync(join(root, "examples/site/worker/worker/wrangler.toml")), "site has a duplicate nested Wrangler config");
+
+const vercelConfig = JSON.parse(readFileSync(join(root, "examples/vercel-edge/vercel.json"), "utf8"));
+assert.deepEqual(vercelConfig.rewrites, [{ source: "/(.*)", destination: "/api" }]);
+assert.ok(existsSync(join(root, "examples/vercel-edge/merjs.wasm")), "Vercel deployment is missing merjs.wasm");
+const vercelAdapter = readFileSync(join(root, "examples/vercel-edge/api/index.js"), "utf8");
+assert.match(vercelAdapter, /new WebAssembly\.Instance\(wasmModule, \{\}\)/, "Vercel WASM is not request-local");
+assert.doesNotMatch(vercelAdapter, /let instance\s*=|request\.arrayBuffer\(/, "Vercel adapter retains state or buffers requests");
+assert.match(vercelAdapter, /0x3152454d/, "Vercel adapter does not validate MER1");
+assert.match(vercelAdapter, /wasm\.response_done\(\)/, "Vercel adapter does not release response memory");
+assert.match(vercelAdapter, /collect_fetch_urls/, "Vercel adapter omits fetch collection/replay");
+
+for (const adapter of [
+  "examples/kanban/worker/worker.js",
+  "examples/singapore-data-dashboard/worker/worker.js",
+  "examples/site/worker/worker/fetch-bridge.js",
+  "examples/vercel-edge/api/index.js",
+]) {
+  const source = readFileSync(join(root, adapter), "utf8");
+  assert.doesNotMatch(source, /request\.arrayBuffer\(/, `${adapter}: request body is not streamed`);
+  assert.match(source, /\^\(0\|\[1-9\]/, `${adapter}: canonical Content-Length validation missing`);
+  assert.match(source, /\.cancel\(/, `${adapter}: oversized body is not canceled`);
+}
+
+const singaporeAdapter = readFileSync(join(root, "examples/singapore-data-dashboard/worker/worker.js"), "utf8");
+assert.match(singaporeAdapter, /request\.method !== "GET"/, "collections route does not enforce GET");
+assert.match(singaporeAdapter, /headers: \{ "x-api-key": env\.SG_DATA_API_KEY \}/, "collections API key is not server-side");
+assert.match(singaporeAdapter, /upstream\.searchParams\.set/, "collections query is not safely encoded");
+assert.match(singaporeAdapter, /readIncomingBody\(response, 1024 \* 1024\)/, "collections response is not bounded");

@@ -18,11 +18,65 @@ export async function runBounded(items, concurrency, worker, onError) {
   if (firstError !== undefined) throw firstError;
 }
 
+function boundedContentLength(headers, limit, message) {
+  const value = headers.get("content-length");
+  if (value === null) return;
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) throw new Error(`invalid ${message} content-length`);
+  const length = Number(value);
+  if (!Number.isSafeInteger(length) || length > limit) throw new Error(`${message} too large`);
+}
+
+async function readStreamBounded(body, limit, message, signal) {
+  if (!body) return new Uint8Array();
+  const reader = body.getReader();
+  const chunks = [];
+  let length = 0;
+  let complete = false;
+  const cancel = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    while (true) {
+      if (signal?.aborted) throw signal.reason;
+      const { done, value } = await reader.read();
+      if (signal?.aborted) throw signal.reason;
+      if (done) { complete = true; break; }
+      if (value.byteLength > limit - length) {
+        await reader.cancel(`${message} too large`).catch(() => {});
+        throw new Error(`${message} too large`);
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    if (!complete) await reader.cancel(signal?.reason || `${message} read failed`).catch(() => {});
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+export async function readBoundedRequestBody(request, limit) {
+  try {
+    boundedContentLength(request.headers, limit, "request body");
+  } catch (error) {
+    await request.body?.cancel(error.message).catch(() => {});
+    throw error;
+  }
+  return readStreamBounded(request.body, limit, "request body");
+}
+
 export async function readBoundedBody(response, limit, signal) {
-  const contentLength = response.headers.get("content-length");
-  if (contentLength !== null && Number(contentLength) > limit) {
-    await response.body?.cancel("fetch response too large").catch(() => {});
-    throw new Error("fetch response too large");
+  try {
+    boundedContentLength(response.headers, limit, "fetch response");
+  } catch (error) {
+    await response.body?.cancel(error.message).catch(() => {});
+    throw error;
   }
   if (!response.body) return new Uint8Array();
 
@@ -56,6 +110,7 @@ export async function readBoundedBody(response, limit, signal) {
   }
   return body;
 }
+
 
 export async function collectFetchRounds(options) {
   const {

@@ -334,6 +334,10 @@ fn pathWithinProject(path: []const u8, project: []const u8) bool {
         project[project.len - 1] == '/' or path[project.len] == '/';
 }
 
+fn configuredRootRequiresProjectContainment(dir: []const u8) bool {
+    return !std.fs.path.isAbsolute(dir);
+}
+
 fn openedDirIsInsideProject(dir: std.Io.Dir, io: std.Io) bool {
     var project_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const project_len = std.Io.Dir.cwd().realPath(io, &project_buf) catch return false;
@@ -389,9 +393,10 @@ fn materializeContainedFile(
 
     var current = std.Io.Dir.cwd().openDir(io, dir, .{}) catch |err| return openFailure(err);
     defer current.close(io);
-    // A top-level symlink is allowed only when it resolves within the project
-    // (the merjs repo intentionally maps public -> examples/site/public).
-    if (!openedDirIsInsideProject(current, io)) return .not_found;
+    // Absolute configured roots are trusted (for example, packaged .app
+    // resources). Relative roots may follow a top-level symlink only when it
+    // resolves within the project (public -> examples/site/public is intentional).
+    if (configuredRootRequiresProjectContainment(dir) and !openedDirIsInsideProject(current, io)) return .not_found;
 
     var parts = std.mem.splitScalar(u8, rel, '/');
     var component = parts.next() orelse return .not_found;
@@ -881,7 +886,16 @@ test "static relative paths reject traversal and ambiguous separators" {
     try std.testing.expect(!isSafeRelativePath("assets\\app.js"));
 }
 
-test "static file reads reject contained and escaping symlinks" {
+test "trusted absolute static roots may be outside cwd" {
+    try std.testing.expect(configuredRootRequiresProjectContainment("public"));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(!configuredRootRequiresProjectContainment("C:\\Applications\\Mer.app\\Resources\\public"));
+    } else {
+        try std.testing.expect(!configuredRootRequiresProjectContainment("/Applications/Mer.app/Contents/Resources/public"));
+    }
+}
+
+test "relative static roots reject contained and escaping symlinks" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;

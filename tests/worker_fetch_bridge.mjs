@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { collectFetchRounds, readBoundedBody, runBounded } from "../examples/site/worker/worker/fetch-bridge.js";
+import { collectFetchRounds, readBoundedBody, readBoundedRequestBody, runBounded } from "../examples/site/worker/worker/fetch-bridge.js";
 
 const encoder = new TextEncoder();
 let restored = [];
@@ -113,6 +113,25 @@ await assert.rejects(readBoundedBody({
   body: new ReadableStream({ cancel() { oversizedCanceled++; } }),
 }, 16), /too large/);
 assert.equal(oversizedCanceled, 1, "oversized content-length body was not canceled");
+
+for (const contentLength of ["01", "+1", "1.0", "1, 1", "9007199254740992"]) {
+  let invalidCanceled = 0;
+  await assert.rejects(readBoundedRequestBody({
+    headers: new Headers({ "content-length": contentLength }),
+    body: new ReadableStream({ cancel() { invalidCanceled++; } }),
+  }, 16), /content-length|too large/);
+  assert.equal(invalidCanceled, 1, `${contentLength}: invalid request body was not canceled`);
+}
+
+let requestCanceled = 0;
+await assert.rejects(readBoundedRequestBody({
+  headers: new Headers(),
+  body: new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(17)); },
+    cancel() { requestCanceled++; },
+  }),
+}, 16), /too large/);
+assert.equal(requestCanceled, 1, "streaming request overflow was not canceled immediately");
 
 let siblingSettled = false;
 let abortObserved = false;

@@ -11,7 +11,7 @@ as Cloudflare Workers.
 ```bash
 cd ../..
 zig build worker
-cp examples/site/worker/merjs.wasm examples/vercel-edge/merjs.wasm
+# Generates both the Cloudflare and examples/vercel-edge/merjs.wasm outputs.
 ```
 
 2. Deploy:
@@ -23,13 +23,17 @@ vercel
 
 ## How it works
 
-- `api/index.js` — Edge Function that loads `merjs.wasm` and routes requests
-  through the WASM binary using the shared-memory protocol
-- All requests are rewritten to `/api` via `vercel.json`
-- The WASM binary contains the full SSR router, page handlers, and API routes
+- `api/index.js` creates a request-local WASM instance and uses the bounded
+  binary request and versioned `MER1` response ABI.
+- Incoming bodies are streamed with a 1 MiB cap, and `mer.fetch` calls use the
+  bounded iterative collect/replay protocol.
+- Responses are copied before `response_done()` releases WASM-owned memory.
+- All application requests are rewritten to `/api` via `vercel.json`; existing
+  files in a `public/` directory are served statically by Vercel first.
 
 ## Limitations
 
-- Static assets must be served separately (Vercel static hosting or CDN)
-- No hot reload in edge mode
-- WASM memory limit applies (default ~128MB on Vercel Edge)
+- Static assets are not embedded in WASM; place them in `public/` or a CDN.
+- No hot reload in edge mode.
+- WASM memory and Edge Function duration limits apply; fetch replay also has
+  explicit request, response-byte, round, and 30-second deadline bounds.

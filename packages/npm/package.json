@@ -30,7 +30,6 @@
   },
   "scripts": {
     "postinstall": "node install.js",
-    "preuninstall": "node uninstall.js",
     "test": "node --test"
   },
   "engines": {

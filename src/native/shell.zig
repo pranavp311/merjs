@@ -63,6 +63,19 @@ fn createBridgeToken(allocator: std.mem.Allocator) ![]u8 {
     return try allocator.dupe(u8, &hex);
 }
 
+fn normalizeBindHost(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
+}
+
+fn formatUrlHost(buf: []u8, host: []const u8) ![]const u8 {
+    const normalized = normalizeBindHost(host);
+    if (std.mem.indexOfScalar(u8, normalized, ':') != null) {
+        return try std.fmt.bufPrint(buf, "[{s}]", .{normalized});
+    }
+    return try std.fmt.bufPrint(buf, "{s}", .{normalized});
+}
+
 fn isSafeRelativeStaticDir(path: []const u8) bool {
     if (path.len == 0 or path[0] == '/' or path[0] == '~') return false;
     var start: usize = 0;
@@ -78,27 +91,54 @@ fn isSafeRelativeStaticDir(path: []const u8) bool {
     return last.len > 0 and !std.mem.eql(u8, last, ".") and !std.mem.eql(u8, last, "..");
 }
 
-fn resolvePackagedStaticDir(allocator: std.mem.Allocator, configured_static_dir: ?[]const u8) !?[]u8 {
-    if (builtin.os.tag != .macos) return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
+fn packagedResourcesDirFromExePath(allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
+    const macos_dir = std.fs.path.dirname(exe_path) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(macos_dir), "MacOS")) return null;
+    const contents_dir = std.fs.path.dirname(macos_dir) orelse return null;
+    const app_dir = std.fs.path.dirname(contents_dir) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(contents_dir), "Contents") or
+        !std.mem.endsWith(u8, app_dir, ".app")) return null;
+    return try std.fs.path.join(allocator, &.{ contents_dir, "Resources" });
+}
+
+fn resolvePackagedResourcesDir(allocator: std.mem.Allocator) !?[]u8 {
+    if (builtin.os.tag != .macos) return null;
+    const exe_path = std.process.executablePathAlloc(runtime.io, allocator) catch return null;
+    defer allocator.free(exe_path);
+    return try packagedResourcesDirFromExePath(allocator, exe_path);
+}
+
+fn resolvePackagedStaticDir(allocator: std.mem.Allocator, configured_static_dir: ?[]const u8, resources_dir: ?[]const u8) !?[]u8 {
+    const base = resources_dir orelse return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
     const relative = configured_static_dir orelse "public";
     if (!isSafeRelativeStaticDir(relative)) return try allocator.dupe(u8, "__mer_invalid_static_dir__");
-    const exe_path = std.process.executablePathAlloc(runtime.io, allocator) catch
-        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
-    defer allocator.free(exe_path);
-    const macos_dir = std.fs.path.dirname(exe_path) orelse
-        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
-    const contents_dir = std.fs.path.dirname(macos_dir) orelse
-        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
-    const app_dir = std.fs.path.dirname(contents_dir);
-    const is_packaged_app = std.mem.eql(u8, std.fs.path.basename(contents_dir), "Contents") and
-        app_dir != null and std.mem.endsWith(u8, app_dir.?, ".app");
-    const candidate = try std.fs.path.join(allocator, &.{ contents_dir, "Resources", relative });
+    const candidate = try std.fs.path.join(allocator, &.{ base, relative });
     std.Io.Dir.cwd().access(runtime.io, candidate, .{}) catch {
         allocator.free(candidate);
-        if (is_packaged_app) return try allocator.dupe(u8, "__mer_missing_packaged_static_dir__");
-        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
+        return try allocator.dupe(u8, "__mer_missing_packaged_static_dir__");
     };
     return candidate;
+}
+
+fn resolveOpenPathRoots(allocator: std.mem.Allocator, roots: []const []const u8, resources_dir: ?[]const u8) ![][]const u8 {
+    const resolved = try allocator.alloc([]const u8, roots.len);
+    errdefer allocator.free(resolved);
+    var initialized: usize = 0;
+    errdefer for (resolved[0..initialized]) |root| allocator.free(root);
+
+    for (roots, 0..) |root, i| {
+        resolved[i] = if (resources_dir) |base|
+            if (root.len == 0 or std.fs.path.isAbsolute(root)) try allocator.dupe(u8, root) else try std.fs.path.join(allocator, &.{ base, root })
+        else
+            try allocator.dupe(u8, root);
+        initialized += 1;
+    }
+    return resolved;
+}
+
+fn freeOpenPathRoots(allocator: std.mem.Allocator, roots: []const []const u8) void {
+    for (roots) |root| allocator.free(root);
+    allocator.free(roots);
 }
 
 /// Options for `run`. Pass `.{}` for defaults (no raw handler and no custom commands).
@@ -140,6 +180,7 @@ pub fn run(
         log.err("native server host '{s}' is not loopback; use 127.0.0.1 for the hardened native shell", .{app_manifest.host});
         return error.UnsafeNativeHost;
     }
+    const bind_host = normalizeBindHost(app_manifest.host);
 
     try update.validateFeedConfig(app_manifest.update);
 
@@ -160,7 +201,9 @@ pub fn run(
 
     // AppKit requires the main thread. The shell retains ownership of both
     // background threads and joins them before any borrowed state is released.
-    const effective_static_dir = try resolvePackagedStaticDir(allocator, app_manifest.static_dir);
+    const resources_dir = try resolvePackagedResourcesDir(allocator);
+    defer if (resources_dir) |dir| allocator.free(dir);
+    const effective_static_dir = try resolvePackagedStaticDir(allocator, app_manifest.static_dir, resources_dir);
     defer if (effective_static_dir) |dir| allocator.free(dir);
     var ctx = ServerCtx{
         .allocator = allocator,
@@ -170,6 +213,7 @@ pub fn run(
         .static_dir = effective_static_dir,
         .raw_handler = opts.raw_handler,
     };
+    ctx.manifest.host = bind_host;
     const server_thread = try std.Thread.spawn(.{}, runServer, .{&ctx});
     defer {
         if (watcher) |*w| w.stop();
@@ -187,10 +231,12 @@ pub fn run(
     log.info("merjs server ready on port {d}", .{port});
 
     // Build the loopback URL the WebView will load.
-    var url_buf: [128]u8 = undefined;
-    const url_z = try std.fmt.bufPrintZ(&url_buf, "http://{s}:{d}/", .{ app_manifest.host, port });
+    var host_buf: [128]u8 = undefined;
+    const url_host = try formatUrlHost(&host_buf, bind_host);
+    var url_buf: [160]u8 = undefined;
+    const url_z = try std.fmt.bufPrintZ(&url_buf, "http://{s}:{d}/", .{ url_host, port });
 
-    const runtime_origin = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ app_manifest.host, port });
+    const runtime_origin = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ url_host, port });
     defer allocator.free(runtime_origin);
     const allowed_origins = try allocator.alloc([]const u8, app_manifest.security.allowed_origins.len + 1);
     defer allocator.free(allowed_origins);
@@ -202,6 +248,8 @@ pub fn run(
     const token = try createBridgeToken(allocator);
     defer allocator.free(token);
     if (!bridge.isValidBridgeToken(token)) return error.InvalidBridgeToken;
+    const open_path_roots = try resolveOpenPathRoots(allocator, app_manifest.security.open.path_roots, resources_dir);
+    defer freeOpenPathRoots(allocator, open_path_roots);
     const bctx = try allocator.create(bridge.Ctx);
     defer allocator.destroy(bctx);
     bctx.* = .{
@@ -213,7 +261,7 @@ pub fn run(
         .extra_commands = opts.commands,
         .bridge_token = token,
         .external_url_schemes = app_manifest.security.open.external_schemes,
-        .open_path_roots = app_manifest.security.open.path_roots,
+        .open_path_roots = open_path_roots,
     };
 
     // Hand off to the platform backend (blocks on the event loop).
@@ -221,4 +269,33 @@ pub fn run(
         .macos => return @import("macos.zig").openWindow(url_z.ptr, app_manifest.window, bctx),
         else => unreachable, // guarded before any side effects above
     }
+}
+
+test "native loopback bind and URL hosts normalize IPv6 brackets" {
+    try std.testing.expectEqualStrings("::1", normalizeBindHost("::1"));
+    try std.testing.expectEqualStrings("::1", normalizeBindHost("[::1]"));
+    try std.testing.expectEqualStrings("127.0.0.1", normalizeBindHost("127.0.0.1"));
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("[::1]", try formatUrlHost(&buf, "::1"));
+    try std.testing.expectEqualStrings("[::1]", try formatUrlHost(&buf, "[::1]"));
+    try std.testing.expectEqualStrings("127.0.0.1", try formatUrlHost(&buf, "127.0.0.1"));
+}
+
+test "packaged resource detection and open roots use Contents Resources" {
+    const resources = (try packagedResourcesDirFromExePath(std.testing.allocator, "/Applications/Test.app/Contents/MacOS/test")).?;
+    defer std.testing.allocator.free(resources);
+    try std.testing.expectEqualStrings("/Applications/Test.app/Contents/Resources", resources);
+    try std.testing.expectEqual(@as(?[]u8, null), try packagedResourcesDirFromExePath(std.testing.allocator, "/tmp/test"));
+
+    const roots = try resolveOpenPathRoots(std.testing.allocator, &.{ "exports", "/tmp/shared" }, resources);
+    defer freeOpenPathRoots(std.testing.allocator, roots);
+    try std.testing.expectEqualStrings("/Applications/Test.app/Contents/Resources/exports", roots[0]);
+    try std.testing.expectEqualStrings("/tmp/shared", roots[1]);
+}
+
+test "development open roots remain cwd relative" {
+    const roots = try resolveOpenPathRoots(std.testing.allocator, &.{"exports"}, null);
+    defer freeOpenPathRoots(std.testing.allocator, roots);
+    try std.testing.expectEqualStrings("exports", roots[0]);
 }

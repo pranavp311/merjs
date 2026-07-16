@@ -479,8 +479,10 @@ pub fn build(b: *std.Build) void {
     // Auto-run codegen before worker compilation too.
     worker_wasm.step.dependOn(&run_codegen.step);
     const install_worker = b.addInstallFile(worker_wasm.getEmittedBin(), "../examples/site/worker/worker/merjs.wasm");
-    const worker_step = b.step("worker", "Compile worker WASM for Cloudflare Workers");
+    const install_vercel_worker = b.addInstallFile(worker_wasm.getEmittedBin(), "../examples/vercel-edge/merjs.wasm");
+    const worker_step = b.step("worker", "Compile worker WASM for Cloudflare Workers and Vercel Edge");
     worker_step.dependOn(&install_worker.step);
+    worker_step.dependOn(&install_vercel_worker.step);
     worker_step.dependOn(&install_grep.step);
 
     // ── Examples (sgdata, kanban) ────────────────────────────────────────────
@@ -791,16 +793,22 @@ pub fn build(b: *std.Build) void {
             \\</plist>
         , .{ bundle_id_xml, display_name_xml, version_xml });
         const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}), plist_xml);
+        const app_path = b.getInstallPath(.prefix, pkg_name);
+        // Every package graph starts from an empty bundle. This prevents
+        // removed or pre-positioned files from surviving into local signed output.
+        const package_clean = b.addSystemCommand(&.{ "rm", "-rf", app_path });
         const pkg_bin = b.addInstallFile(
             native_exe.getEmittedBin(),
             b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}),
         );
         pkg_bin.step.dependOn(&native_install.step);
+        pkg_bin.step.dependOn(&package_clean.step);
         const pkg_plist = b.addInstallDirectory(.{
             .source_dir = plist.getDirectory(),
             .install_dir = .prefix,
             .install_subdir = "",
         });
+        pkg_plist.step.dependOn(&package_clean.step);
         const static_assets_dir = comptime zonServerStaticDir(app_zon);
         const pkg_static = b.addInstallDirectory(.{
             .source_dir = b.path(static_assets_dir),
@@ -818,12 +826,12 @@ pub fn build(b: *std.Build) void {
             static_assets_path,
         });
         pkg_static.step.dependOn(&check_static_links.step);
+        pkg_static.step.dependOn(&package_clean.step);
         const package_step = b.step("package", "Package the native app as a .app bundle (macOS)");
         package_step.dependOn(&pkg_bin.step);
         package_step.dependOn(&pkg_plist.step);
         package_step.dependOn(&pkg_static.step);
 
-        const app_path = b.getInstallPath(.prefix, pkg_name);
         const signing_identity = firstNonEmpty(
             b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
             zonMacosString(app_zon, "signing_identity"),

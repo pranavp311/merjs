@@ -767,6 +767,9 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "std.mem.eql(u8, zonServerMode(zon), \"embedded\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_prod_install.step.dependOn(native_prod_check_step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_build_step.dependOn(&native_prod_install.step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "pkg_bin.step.dependOn(&package_clean.step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "pkg_plist.step.dependOn(&package_clean.step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "pkg_static.step.dependOn(&package_clean.step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_clean.step.dependOn(native_prod_check_step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_pkg_bin.step.dependOn(&release_clean.step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_codesign.step.dependOn(release_package_step)") != null);
@@ -1303,13 +1306,18 @@ const native_build_snippet =
     \\            \\</dict></plist>
     \\        , .{ bundle_id_xml, display_name_xml, version_xml });
     \\        const plist = b.addWriteFile(b.fmt("{s}/Contents/Info.plist", .{pkg_name}), plist_xml);
+    \\        const app_path = b.getInstallPath(.prefix, pkg_name);
+    \\        // Always empty the destination bundle before copying package contents.
+    \\        const package_clean = b.addSystemCommand(&.{ "rm", "-rf", app_path });
     \\        const pkg_bin = b.addInstallFile(native_exe.getEmittedBin(), b.fmt("{s}/Contents/MacOS/mernative", .{pkg_name}));
     \\        pkg_bin.step.dependOn(&native_install.step);
+    \\        pkg_bin.step.dependOn(&package_clean.step);
     \\        const pkg_plist = b.addInstallDirectory(.{
     \\            .source_dir = plist.getDirectory(),
     \\            .install_dir = .prefix,
     \\            .install_subdir = "",
     \\        });
+    \\        pkg_plist.step.dependOn(&package_clean.step);
     \\        const static_assets_dir = comptime NativePackage.zonServerStaticDir(app_zon);
     \\        const pkg_static = b.addInstallDirectory(.{
     \\            .source_dir = b.path(static_assets_dir),
@@ -1320,12 +1328,12 @@ const native_build_snippet =
     \\        const static_assets_path = b.path(static_assets_dir).getPath(b);
     \\        const check_static_links = b.addSystemCommand(&.{ "sh", "-c", "root=$(cd \"$1\" && pwd -P) || exit 1; assets=$(cd \"$2\" && pwd -P) || exit 1; case \"$assets\" in \"$root\"|\"$root\"/*) ;; *) echo 'mer native: static_dir must resolve inside the project' >&2; exit 1;; esac; if find \"$2\"/ -type l -print -quit | grep -q .; then echo 'mer native: static_dir must not contain nested symlinks' >&2; exit 1; fi", "sh", project_root_path, static_assets_path });
     \\        pkg_static.step.dependOn(&check_static_links.step);
+    \\        pkg_static.step.dependOn(&package_clean.step);
     \\        const package_step = b.step("package", "Package native app as a .app bundle");
     \\        package_step.dependOn(&pkg_bin.step);
     \\        package_step.dependOn(&pkg_plist.step);
     \\        package_step.dependOn(&pkg_static.step);
     \\
-    \\        const app_path = b.getInstallPath(.prefix, pkg_name);
     \\        const signing_identity = NativePackage.firstNonEmpty(
     \\            b.option([]const u8, "macos-signing-identity", "macOS codesign identity for package-sign"),
     \\            NativePackage.zonMacosString(app_zon, "signing_identity"),

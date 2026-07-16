@@ -37,6 +37,19 @@ const expected = new Uint8Array(
 assert.ok(expected.length >= 8, "expected-state protocol header missing");
 assert.equal(new DataView(expected.buffer).getUint32(0, true), 0x3246534d, "expected-state protocol version changed");
 
+const malformed = new Uint8Array(24);
+const malformedView = new DataView(malformed.buffer);
+malformedView.setUint32(0, 3, true);
+malformedView.setUint32(4, 1, true);
+malformedView.setUint32(8, 1024 * 1024 + 1, true);
+const malformedPtr = wasm.alloc(malformed.length);
+new Uint8Array(wasm.memory.buffer).set(malformed, malformedPtr);
+wasm.collect_fetch_urls(malformedPtr, malformed.length);
+assert.equal(wasm.collect_urls_len(), 0, "failed collection retained prior request bytes");
+assert.equal(wasm.fetch_protocol_error(), 0, "failed collection retained prior fetch error");
+assert.equal(wasm.expected_state_len(), 0, "failed collection retained prior expected state");
+wasm.dealloc(malformedPtr, malformed.length);
+
 new Uint8Array(wasm.memory.buffer, 0, applicationState.length).set(applicationState);
 const expectedPtr = expected.length === 0 ? 0 : wasm.alloc(expected.length);
 if (expected.length !== 0) new Uint8Array(wasm.memory.buffer).set(expected, expectedPtr);

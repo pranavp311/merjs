@@ -18,8 +18,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Test release version validation
-        run: python3 -m unittest scripts/test_release_version.py
+      - name: Test release and package artifacts before publication
+        run: |
+          python3 -m unittest scripts/test_release_version.py
+          python3 -m unittest discover -s packages/pypi/tests -v
+          npm --prefix packages/npm test
+          (cd packages/npm && npm pack --dry-run)
 
       - name: Setup Zig 0.16.0
         uses: mlugg/setup-zig@v2
@@ -42,6 +46,10 @@ jobs:
           zig test build.zig
           zig build test
           zig build cli
+          zig build cli -Dtarget=aarch64-macos -Doptimize=ReleaseSmall
+          zig build cli -Dtarget=x86_64-macos -Doptimize=ReleaseSmall
+          zig build cli -Dtarget=x86_64-linux -Doptimize=ReleaseSmall
+          zig build cli -Dtarget=aarch64-linux -Doptimize=ReleaseSmall
           zig build worker
           zig build sgdata-worker
           zig build worker-example-kanban
@@ -54,6 +62,7 @@ jobs:
           node --check examples/site/worker/worker/fetch-bridge.js
           node --check examples/singapore-data-dashboard/worker/worker.js
           node --check examples/kanban/worker/worker.js
+          node --check examples/vercel-edge/api/index.js
           node tests/worker_snapshot.mjs
           node tests/worker_fetch_bridge.mjs
           node --test examples/singapore-data-dashboard/worker/ai-budget.test.mjs
@@ -69,6 +78,7 @@ jobs:
             "$stage/examples/site/worker/grep.wasm" \
             "$stage/examples/site/worker/worker/merjs.wasm" \
             "$stage/examples/site/worker/worker/grep.wasm" \
+            "$stage/examples/vercel-edge/merjs.wasm" \
             "$stage/examples/singapore-data-dashboard/worker/merjs.wasm"
           (cd "$stage" && zig build worker && zig build sgdata-worker)
           node "$stage/tests/worker_deployment.mjs" "$stage"
@@ -113,6 +123,7 @@ jobs:
 
           for artifact in (
               "examples/site/worker/worker/merjs.wasm",
+              "examples/vercel-edge/merjs.wasm",
               "examples/singapore-data-dashboard/worker/merjs.wasm",
               "examples/kanban/worker/merjs.wasm",
           ):
@@ -246,6 +257,9 @@ jobs:
           from pathlib import Path
           source = Path("build.zig").read_text()
           for edge in (
+              "pkg_bin.step.dependOn(&package_clean.step)",
+              "pkg_plist.step.dependOn(&package_clean.step)",
+              "pkg_static.step.dependOn(&package_clean.step)",
               "release_clean.step.dependOn(native_prod_check_step)",
               "release_codesign.step.dependOn(release_package_step)",
               "zip.step.dependOn(&release_codesign.step)",

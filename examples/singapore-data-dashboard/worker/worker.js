@@ -55,12 +55,43 @@ function injectEnv(wasm, env) {
 const resolverScript = "(()=>{for(const s of document.querySelectorAll('template[data-mer-resolve]')){for(const p of document.querySelectorAll('[data-mer-placeholder]')){if(p.getAttribute('data-mer-placeholder')===s.getAttribute('data-mer-resolve')){p.replaceWith(s.content);s.remove();break}}}})();";
 const forwardedHeaders = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
 
+async function readIncomingBody(request, limit = 1024 * 1024) {
+  const value = request.headers.get("content-length");
+  if (value !== null && (!/^(0|[1-9][0-9]*)$/.test(value) ||
+      !Number.isSafeInteger(Number(value)) || Number(value) > limit)) {
+    await request.body?.cancel("invalid or oversized request body").catch(() => {});
+    throw new Error("invalid or oversized request body");
+  }
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks = [];
+  let length = 0;
+  let complete = false;
+  try {
+    while (true) {
+      const { done, value: chunk } = await reader.read();
+      if (done) { complete = true; break; }
+      if (chunk.byteLength > limit - length) {
+        await reader.cancel("request body too large").catch(() => {});
+        throw new Error("request body too large");
+      }
+      chunks.push(chunk);
+      length += chunk.byteLength;
+    }
+  } finally {
+    if (!complete) await reader.cancel("request body read failed").catch(() => {});
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+  return body;
+}
+
 async function encodeIncomingRequest(request, url) {
   const encoder = new TextEncoder();
   const parts = [encoder.encode(request.method), encoder.encode(url.pathname + url.search)];
-  const contentLength = request.headers.get("content-length");
-  if (contentLength !== null && Number(contentLength) > 1024 * 1024) throw new Error("request body too large");
-  parts.push(request.method === "GET" || request.method === "HEAD" ? new Uint8Array() : new Uint8Array(await request.arrayBuffer()));
+  parts.push(await readIncomingBody(request));
   parts.push(encoder.encode(request.headers.get("cookie") || ""));
   parts.push(encoder.encode(request.headers.get("cf-connecting-ip") || ""));
   const headers = forwardedHeaders.flatMap(name => {
@@ -99,9 +130,12 @@ async function admitAi(request, env, work) {
     return jsonResp({ error: "AI controls are not configured" }, 503);
   if (request.headers.get("authorization") !== `Bearer ${env.AI_BEARER_TOKEN}`)
     return jsonResp({ error: "Unauthorized" }, 401);
-  const contentLength = Number(request.headers.get("content-length") || 0);
-  if (!Number.isFinite(contentLength) || contentLength > 8192)
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && (!/^(0|[1-9][0-9]*)$/.test(contentLength) ||
+      !Number.isSafeInteger(Number(contentLength)) || Number(contentLength) > 8192)) {
+    await request.body?.cancel("AI request too large").catch(() => {});
     return jsonResp({ error: "AI request too large" }, 413);
+  }
   let admission;
   try { admission = createAiAdmission(request, env); }
   catch (error) {
@@ -372,12 +406,56 @@ function jsonResp(data, status = 200) {
   });
 }
 
+async function handleCollections(request, env, url) {
+  if (request.method !== "GET")
+    return workerResponse(JSON.stringify({ error: "Method Not Allowed" }), {
+      status: 405,
+      headers: { "content-type": "application/json", "allow": "GET" },
+    });
+  if (!env.SG_DATA_API_KEY)
+    return jsonResp({ error: "Collections service is not configured" }, 503);
+
+  const search = url.searchParams.get("search");
+  const page = url.searchParams.get("page") || "1";
+  if (search !== null && search.length > 200)
+    return jsonResp({ error: "Invalid search query" }, 400);
+  if (search === null && !/^[1-9][0-9]*$/.test(page))
+    return jsonResp({ error: "Invalid page" }, 400);
+
+  const upstream = new URL(search === null
+    ? "https://api-production.data.gov.sg/v2/public/api/collections"
+    : "https://api-production.data.gov.sg/v2/public/api/datasets");
+  if (search === null) upstream.searchParams.set("page", page);
+  else upstream.searchParams.set("search", search);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(upstream, {
+      headers: { "x-api-key": env.SG_DATA_API_KEY },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel("upstream error").catch(() => {});
+      return jsonResp({ error: "data.gov.sg returned an error" }, 502);
+    }
+    const body = await readIncomingBody(response, 1024 * 1024);
+    return workerResponse(body, { headers: { "content-type": "application/json; charset=utf-8" } });
+  } catch (_) {
+    return jsonResp({ error: "Failed to fetch from data.gov.sg" }, 502);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function handleRequest(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/_mer/resolve.js" && (request.method === "GET" || request.method === "HEAD"))
       return resolverResponse(request);
 
-    // Handle AI routes in JS — wasm32-freestanding can't use process/fs/network
+    // Handle network routes in JS — wasm32-freestanding can't use network APIs.
+    if (url.pathname === "/api/collections")
+      return handleCollections(request, env, url);
     if (url.pathname === "/api/ai" && request.method === "POST")
       return admitAi(request, env, (signal, admission) => handleAi(request, env, signal, admission));
     if (url.pathname === "/api/suggestions" && request.method === "POST")

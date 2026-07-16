@@ -137,8 +137,16 @@ var request_dispatch_count: u32 = 0;
 /// Phase 1: collect a bounded binary request list during a dry render.
 /// Returns its pointer; call `collect_urls_len()` for the byte length.
 export fn collect_fetch_urls(req_ptr: [*]const u8, req_len: u32) [*]const u8 {
-    const req = makeRequest(req_ptr[0..req_len]) orelse return "".ptr;
-    const r = router orelse return "".ptr;
+    last_requests = "";
+    last_fetch_error = 0;
+    const req = makeRequest(req_ptr[0..req_len]) orelse {
+        _ = mer.wasmClearCacheV2();
+        return "".ptr;
+    };
+    const r = router orelse {
+        _ = mer.wasmClearCacheV2();
+        return "".ptr;
+    };
     mer.wasmBeginCollect();
     request_dispatch_count +%= 1;
     const response = dispatch_mod.dispatchBuffered(r, req);

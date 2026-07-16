@@ -5,7 +5,7 @@ const std = @import("std");
 const runtime = @import("runtime");
 const mercss_jit = @import("mercss_jit");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -14,7 +14,24 @@ pub fn main() !void {
     try runtime.init(alloc);
     defer runtime.deinit();
 
-    // Each entry stores the full relative path from the project root.
+    var args = try std.process.Args.Iterator.initAllocator(init.args, alloc);
+    defer args.deinit();
+    const executable = args.next() orelse "codegen";
+    const app_arg = args.next();
+    const api_arg = args.next();
+    const output_arg = args.next();
+    if ((app_arg == null) != (api_arg == null) or
+        (app_arg == null) != (output_arg == null) or
+        args.next() != null)
+    {
+        std.debug.print("usage: {s} [<app-dir> <api-dir> <output>]\n", .{executable});
+        return error.InvalidArguments;
+    }
+    const app_dir = app_arg orelse "app";
+    const api_dir = api_arg orelse "api";
+    const output_path = output_arg orelse "src/generated/routes.zig";
+
+    // Each entry stores its logical module path, independent of the scanned directory.
     // e.g. "app/about.zig", "api/hello.zig"
     var entries: std.ArrayList([]u8) = .empty;
     defer {
@@ -22,8 +39,8 @@ pub fn main() !void {
         entries.deinit(alloc);
     }
 
-    try scanDir(alloc, &entries, "app");
-    try scanDir(alloc, &entries, "api");
+    try scanDir(alloc, &entries, app_dir, "app");
+    try scanDir(alloc, &entries, api_dir, "api");
 
     // Sort routes: static before dynamic, then alphabetically within each group.
     // This ensures /users/settings always matches before /users/:id.
@@ -81,26 +98,32 @@ pub fn main() !void {
 
     // Layout — if app/layout.zig exists, export its wrap function.
     // Also export streamWrap for streaming SSR if the layout provides it.
-    if (fileExists("app/layout.zig")) {
+    const layout_path = try std.fs.path.join(alloc, &.{ app_dir, "layout.zig" });
+    defer alloc.free(layout_path);
+    if (fileExists(layout_path)) {
         try buf.appendSlice(alloc, "const app_layout = @import(\"app/layout\");\n");
         try buf.appendSlice(alloc, "pub const layout = app_layout.wrap;\n");
         try buf.appendSlice(alloc, "pub const streamLayout = if (@hasDecl(app_layout, \"streamWrap\")) app_layout.streamWrap else null;\n");
     }
 
     // Error handlers — if app/404.zig exists, export its render function.
-    if (fileExists("app/404.zig")) {
+    const not_found_path = try std.fs.path.join(alloc, &.{ app_dir, "404.zig" });
+    defer alloc.free(not_found_path);
+    if (fileExists(not_found_path)) {
         try buf.appendSlice(alloc, "const app_404 = @import(\"app/404\");\n");
         try buf.appendSlice(alloc, "pub const notFound = app_404.render;\n");
     }
 
-    _ = try std.Io.Dir.cwd().createDirPathOpen(runtime.io, "src/generated", .{});
-    const out = try std.Io.Dir.cwd().createFile(runtime.io, "src/generated/routes.zig", .{});
+    const output_dir = std.fs.path.dirname(output_path) orelse ".";
+    var generated_dir = try std.Io.Dir.cwd().createDirPathOpen(runtime.io, output_dir, .{});
+    defer generated_dir.close(runtime.io);
+    const out = try std.Io.Dir.cwd().createFile(runtime.io, output_path, .{});
     defer out.close(runtime.io);
     try out.writePositionalAll(runtime.io, buf.items, 0);
 
-    std.debug.print("codegen: wrote {d} route(s) to src/generated/routes.zig\n", .{entries.items.len});
+    std.debug.print("codegen: wrote {d} route(s) to {s}\n", .{ entries.items.len, output_path });
 
-    // ── mercss-jit: scan app/ for class candidates → app/_mercss.css ─────────
+    // ── mercss-jit: scan the selected app for class candidates ────────────────
     {
         var ds = mercss_jit.DesignSystem.init(alloc);
         defer ds.deinit();
@@ -115,25 +138,27 @@ pub fn main() !void {
         var candidates: std.ArrayList([]const u8) = .empty;
         defer candidates.deinit(alloc);
 
-        try scanCssCandidates(alloc, "app", &sources, &candidates);
+        try scanCssCandidates(alloc, app_dir, &sources, &candidates);
 
         const css = try mercss_jit.compile(alloc, &ds, candidates.items);
         defer alloc.free(css);
 
-        const css_out = try std.Io.Dir.cwd().createFile(runtime.io, "app/_mercss.css", .{});
+        const css_output_path = try std.fs.path.join(alloc, &.{ app_dir, "_mercss.css" });
+        defer alloc.free(css_output_path);
+        const css_out = try std.Io.Dir.cwd().createFile(runtime.io, css_output_path, .{});
         defer css_out.close(runtime.io);
         try css_out.writePositionalAll(runtime.io, css, 0);
 
         std.debug.print(
-            "mercss: wrote {d} bytes ({d} candidates, {d} sources) to app/_mercss.css\n",
-            .{ css.len, candidates.items.len, sources.items.len },
+            "mercss: wrote {d} bytes ({d} candidates, {d} sources) to {s}\n",
+            .{ css.len, candidates.items.len, sources.items.len, css_output_path },
         );
     }
 }
 
-/// Scan dir/ for *.zig files, appending "dir/file.zig" to entries.
-fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), dir: []const u8) !void {
-    var d = std.Io.Dir.cwd().openDir(runtime.io, dir, .{ .iterate = true }) catch return;
+/// Scan source_dir/ for *.zig files, appending "logical_dir/file.zig" to entries.
+fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), source_dir: []const u8, logical_dir: []const u8) !void {
+    var d = std.Io.Dir.cwd().openDir(runtime.io, source_dir, .{ .iterate = true }) catch return;
     defer d.close(runtime.io);
     var walker = try d.walk(alloc);
     defer walker.deinit();
@@ -144,7 +169,7 @@ fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), dir: []const
         if (std.mem.eql(u8, entry.path, "layout.zig")) continue;
         // Skip 404.zig — it's an error handler, not a regular route.
         if (std.mem.eql(u8, entry.path, "404.zig")) continue;
-        const full = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.path });
+        const full = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ logical_dir, entry.path });
         try entries.append(alloc, full);
     }
 }

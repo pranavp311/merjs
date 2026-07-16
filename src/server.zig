@@ -122,6 +122,9 @@ pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3000,
     dev: bool = false,
+    /// Deprecated compatibility fields; retained for source compatibility and ignored.
+    debug: bool = false,
+    kuri_port: u16 = 9222,
     /// Overrides the strict production policy (or the hot-reload-only dev policy).
     content_security_policy: ?[]const u8 = null,
     /// Bounds the process-wide static file cache. Oversized files bypass it.
@@ -218,7 +221,7 @@ const OwnedConnections = struct {
             while (!self.mutex.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
             const stopping = self.stopping.load(.acquire);
             for (self.items.items, 0..) |conn, i| {
-                if (stopping) conn.ctx.close();
+                if (stopping) conn.ctx.interrupt();
                 if (shouldReapOwned(stopping, conn.ctx.completed.load(.acquire))) {
                     reaped = self.items.swapRemove(i);
                     break;
@@ -273,7 +276,7 @@ const DeadlineRegistry = struct {
                 if (absoluteDeadlineExpired(ctx.absolute_connection_deadline_ns, now) or
                     absoluteDeadlineExpired(ctx.absolute_phase_deadline_ns.load(.acquire), now))
                 {
-                    ctx.close();
+                    ctx.interrupt();
                 }
             }
             self.mutex.unlock();
@@ -419,7 +422,9 @@ pub const Server = struct {
                 return err;
             };
             owned_connections.append(.{ .thread = t, .ctx = ctx }) catch |err| {
-                ctx.close();
+                // The worker already owns the stream: interrupt it, then join
+                // before reclaiming its context. Only the worker closes the fd.
+                ctx.interrupt();
                 t.join();
                 self.allocator.destroy(ctx);
                 return err;
@@ -472,17 +477,30 @@ const ConnCtx = struct {
     max_requests: usize,
     absolute_phase_deadline_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    socket_mutex: std.atomic.Mutex = .unlocked,
+    final_close_started: bool = false,
 
-    fn close(self: *ConnCtx) void {
-        if (!self.closed.swap(true, .acq_rel)) self.stream.close(self.io);
+    /// Wake blocked worker I/O without releasing the descriptor. Serialization
+    /// with finalClose prevents shutdown from targeting a subsequently reused fd.
+    fn interrupt(self: *ConnCtx) void {
+        while (!self.socket_mutex.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
+        defer self.socket_mutex.unlock();
+        if (!self.final_close_started) self.stream.shutdown(self.io, .both) catch {};
+    }
+
+    /// The spawned connection worker is the sole owner of final descriptor close.
+    fn finalClose(self: *ConnCtx) void {
+        while (!self.socket_mutex.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
+        defer self.socket_mutex.unlock();
+        self.final_close_started = true;
+        self.stream.close(self.io);
     }
 };
 
 fn handleConn(ctx: *ConnCtx) void {
     defer ctx.completed.store(true, .release);
     defer ctx.deadline_registry.unregister(ctx);
-    defer ctx.close();
+    defer ctx.finalClose();
     defer _ = ctx.active_connections.fetchSub(1, .release);
 
     var read_buf: [16384]u8 = undefined;
@@ -1292,6 +1310,8 @@ test "per-request arenas release large bodies instead of retaining connection ca
 
 test "server limits have finite production defaults" {
     const config: Config = .{};
+    try std.testing.expect(!config.debug);
+    try std.testing.expectEqual(@as(u16, 9222), config.kuri_port);
     try std.testing.expect(config.max_active_connections >= 1000);
     try std.testing.expect(config.kernel_backlog > 0);
     try std.testing.expect(config.header_deadline_ms > 0);

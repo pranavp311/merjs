@@ -318,6 +318,21 @@ fn navigationPolicyIMP(self: Id, _cmd: Sel, webview: Id, action: Id, decision_ha
     }
 }
 
+fn formatSecurityOrigin(buf: []u8, proto: []const u8, host: []const u8, port: NSInteger) ![]const u8 {
+    const is_ipv6 = std.mem.indexOfScalar(u8, host, ':') != null;
+    const url_host = if (is_ipv6 and host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host[1 .. host.len - 1] else host;
+    if (port > 0) {
+        return if (is_ipv6)
+            try std.fmt.bufPrint(buf, "{s}://[{s}]:{d}", .{ proto, url_host, port })
+        else
+            try std.fmt.bufPrint(buf, "{s}://{s}:{d}", .{ proto, host, port });
+    }
+    return if (is_ipv6)
+        try std.fmt.bufPrint(buf, "{s}://[{s}]", .{ proto, url_host })
+    else
+        try std.fmt.bufPrint(buf, "{s}://{s}", .{ proto, host });
+}
+
 fn messageFrameOrigin(message: Id, buf: *[512]u8) ?[]const u8 {
     const frame_info = send(message, sel("frameInfo")) orelse return null;
     const security_origin = send(frame_info, sel("securityOrigin")) orelse return null;
@@ -326,11 +341,7 @@ fn messageFrameOrigin(message: Id, buf: *[512]u8) ?[]const u8 {
     const proto = std.mem.span(sendPtr(proto_obj, sel("UTF8String")));
     const host = std.mem.span(sendPtr(host_obj, sel("UTF8String")));
     if (proto.len == 0 or host.len == 0) return null;
-    const port = sendInt(security_origin, sel("port"));
-    if (port > 0) {
-        return std.fmt.bufPrint(buf, "{s}://{s}:{d}", .{ proto, host, port }) catch null;
-    }
-    return std.fmt.bufPrint(buf, "{s}://{s}", .{ proto, host }) catch null;
+    return formatSecurityOrigin(buf, proto, host, sendInt(security_origin, sel("port"))) catch null;
 }
 
 /// Allocate the MerInvokeHandler delegate class (NSObject + one instance method).
@@ -494,4 +505,11 @@ pub fn openWindow(url_z: [*:0]const u8, win: manifest.WindowConfig, ctx: ?*bridg
     send1v(window, sel("makeKeyAndOrderFront:"), null);
     sendBoolv(app, sel("activateIgnoringOtherApps:"), YES);
     sendv(app, sel("run")); // blocks until window closed
+}
+
+test "WK frame origins bracket IPv6 authorities" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("http://[::1]:8080", try formatSecurityOrigin(&buf, "http", "::1", 8080));
+    try std.testing.expectEqualStrings("http://[::1]", try formatSecurityOrigin(&buf, "http", "[::1]", 0));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", try formatSecurityOrigin(&buf, "http", "127.0.0.1", 8080));
 }

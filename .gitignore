@@ -22,6 +22,7 @@ worker/merjs.wasm
 worker/grep.wasm
 examples/site/worker/worker/merjs.wasm
 examples/site/worker/worker/grep.wasm
+examples/vercel-edge/merjs.wasm
 examples/kanban/worker/merjs.wasm
 examples/singapore-data-dashboard/worker/merjs.wasm
 

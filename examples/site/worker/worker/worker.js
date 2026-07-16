@@ -3,7 +3,7 @@
 import merWasm from "./merjs.wasm";
 import grepWasm from "./grep.wasm";
 import { AiAdmissionError, authorizePaidOperation, createAiAdmission } from "./ai-budget.js";
-import { collectFetchRounds, readBoundedBody, runBounded } from "./fetch-bridge.js";
+import { collectFetchRounds, readBoundedBody, readBoundedRequestBody, runBounded } from "./fetch-bridge.js";
 
 const merModule = Promise.resolve(merWasm).then(source =>
   source instanceof WebAssembly.Module ? source : WebAssembly.compile(source));
@@ -204,9 +204,12 @@ async function admitAi(request, env, work) {
     return jsonResp({ error: "AI controls are not configured" }, 503);
   if (request.headers.get("authorization") !== `Bearer ${env.AI_BEARER_TOKEN}`)
     return jsonResp({ error: "Unauthorized" }, 401);
-  const contentLength = Number(request.headers.get("content-length") || 0);
-  if (!Number.isFinite(contentLength) || contentLength > 8192)
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && (!/^(0|[1-9][0-9]*)$/.test(contentLength) ||
+      !Number.isSafeInteger(Number(contentLength)) || Number(contentLength) > 8192)) {
+    await request.body?.cancel("AI request too large").catch(() => {});
     return jsonResp({ error: "AI request too large" }, 413);
+  }
   let admission;
   try { admission = createAiAdmission(request, env); }
   catch (error) {
@@ -406,12 +409,7 @@ async function encodeIncomingRequest(request, url, encoder) {
     const value = request.headers.get(name);
     return value === null ? [] : [[encoder.encode(name), encoder.encode(value)]];
   });
-  const contentLength = request.headers.get("content-length");
-  if (contentLength !== null && Number(contentLength) > MAX_INCOMING_BODY_BYTES)
-    throw new Error("request body too large");
-  const body = request.method === "GET" || request.method === "HEAD"
-    ? new Uint8Array()
-    : new Uint8Array(await request.arrayBuffer());
+  const body = await readBoundedRequestBody(request, MAX_INCOMING_BODY_BYTES);
   const headerBytes = headers.reduce((total, [name, value]) => total + 8 + name.length + value.length, 0);
   const total = 24 + method.length + target.length + body.length + cookie.length + clientIdentity.length + headerBytes;
   if (method.length === 0 || method.length > 16 || target.length === 0 ||
