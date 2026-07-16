@@ -4,7 +4,7 @@
 //! mercss.Component and mercss.ResponsiveComponent. This module is available
 //! only as `mer.mercss_compat` and will be removed in 0.3.0.
 
-pub fn declarations(comptime Component: anytype, comptime ResponsiveComponent: anytype) type {
+pub fn declarations(comptime Component: anytype, comptime ResponsiveComponent: anytype, comptime InteractiveComponent: anytype) type {
     return struct {
         /// Deprecated: define application design tokens outside framework core.
         pub const DesignSystem = struct {
@@ -74,6 +74,47 @@ pub fn declarations(comptime Component: anytype, comptime ResponsiveComponent: a
             .sm = .{ .padding = "24px" },
             .md = .{ .padding = "32px" },
             .lg = .{ .padding = "48px" },
+        });
+
+        /// Deprecated: define interactive components in application code.
+        pub const InteractiveButton = InteractiveComponent(.{
+            .base = .{
+                .padding = "12px 24px",
+                .background = "#3b82f6",
+                .color = "white",
+                .border_radius = "6px",
+                .cursor = "pointer",
+                .transition = "all 0.2s",
+            },
+            .hover = .{
+                .background = "#2563eb",
+                .transform = "translateY(-1px)",
+            },
+            .focus = .{
+                .box_shadow = "0 0 0 3px rgba(59,130,246,0.3)",
+                .outline = "none",
+            },
+            .active = .{
+                .transform = "scale(0.98)",
+                .background = "#1d4ed8",
+            },
+        });
+
+        /// Deprecated: define responsive interactive components in application code.
+        pub const ResponsiveInteractiveButton = InteractiveComponent(.{
+            .base = .{
+                .padding = "8px 16px",
+                .background = "#3b82f6",
+            },
+            .hover = .{ .background = "#2563eb" },
+            .sm = .{
+                .base = .{ .padding = "12px 24px" },
+                .hover = .{ .background = "#1d4ed8" },
+            },
+            .md = .{
+                .base = .{ .padding = "16px 32px" },
+                .hover = .{ .background = "#1e40af" },
+            },
         });
 
         /// Deprecated: retained as a no-op for source compatibility.

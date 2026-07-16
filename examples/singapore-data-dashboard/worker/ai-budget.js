@@ -2,6 +2,46 @@ const GATE_TIMEOUT_MS = 2000;
 const accountKeyPattern = /^[A-Za-z0-9._:-]{1,128}$/;
 const idempotencyKeyPattern = /^[A-Za-z0-9._:-]{16,128}$/;
 const operationPattern = /^[a-z0-9._:-]{1,64}$/;
+const MAX_GATE_RESPONSE_BYTES = 16 * 1024;
+
+async function readBoundedText(response, limit, signal) {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && (!/^(0|[1-9][0-9]*)$/.test(contentLength) ||
+      !Number.isSafeInteger(Number(contentLength)) || Number(contentLength) > limit)) {
+    await response.body?.cancel("budget response too large").catch(() => {});
+    throw new Error("budget response too large");
+  }
+  if (signal?.aborted) throw signal.reason;
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let length = 0;
+  let complete = false;
+  const cancel = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    while (true) {
+      if (signal?.aborted) throw signal.reason;
+      const { done, value } = await reader.read();
+      if (signal?.aborted) throw signal.reason;
+      if (done) { complete = true; break; }
+      if (value.byteLength > limit - length) {
+        await reader.cancel("budget response too large").catch(() => {});
+        throw new Error("budget response too large");
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    if (!complete) await reader.cancel(signal?.reason || "budget response read failed").catch(() => {});
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
 
 export class AiAdmissionError extends Error {
   constructor(message, status = 503) {
@@ -55,7 +95,7 @@ export async function authorizePaidOperation(env, admission, operation, estimate
       }),
       timedOut,
     ]);
-    text = await Promise.race([response.text(), timedOut]);
+    text = await Promise.race([readBoundedText(response, MAX_GATE_RESPONSE_BYTES, controller.signal), timedOut]);
   } catch {
     throw new AiAdmissionError("AI budget guard unavailable");
   } finally {

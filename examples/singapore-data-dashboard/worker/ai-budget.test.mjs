@@ -42,7 +42,7 @@ function sharedGate(limit) {
 const now = Date.parse("2026-03-10T12:00:00Z");
 
 async function denied(promise, status) {
-  await assert.rejects(promise, error => error instanceof AiAdmissionError && error.status === status);
+  await assert.rejects(promise, error => error instanceof Error && error.status === status);
 }
 
 test("separate Worker isolates use one deployment-wide gate", async () => {
@@ -77,6 +77,29 @@ test("a budget gate timeout denies execution", async () => {
   };
   const admission = createSingaporeAdmission(request("timeout-gate-0001"), env, now);
   await denied(authorizeSingapore(env, admission, "openai.answer", 0.02), 503);
+});
+
+test("oversized budget decisions are canceled and denied", async () => {
+  for (const [createAdmission, authorize] of [
+    [createSingaporeAdmission, authorizeSingapore],
+    [createSiteAdmission, authorizeSite],
+  ]) {
+    let canceled = 0;
+    const env = {
+      AI_BUDGET_ACCOUNT: "shared-production-account",
+      AI_BUDGET_GUARD: {
+        async fetch() {
+          return new Response(new ReadableStream({
+            start(controller) { controller.enqueue(new Uint8Array(20 * 1024)); },
+            cancel() { canceled++; },
+          }));
+        },
+      },
+    };
+    const admission = createAdmission(request("oversized-gate-01"), env, now);
+    await denied(authorize(env, admission, "openai.answer", 0.02), 503);
+    assert.equal(canceled, 1);
+  }
 });
 
 test("malformed decisions and replayed authorizations deny execution", async () => {

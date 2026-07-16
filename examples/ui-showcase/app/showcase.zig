@@ -1,11 +1,11 @@
 //! UI Component Showcase for merlion-ui
 const mer = @import("mer");
 const h = mer.h;
-const Button = @import("components/button.zig");
-const Card = @import("components/card.zig");
-const Input = @import("components/input.zig");
-const Badge = @import("components/badge.zig");
-const Alert = @import("components/alert.zig");
+const Button = @import("app/components/button");
+const Card = @import("app/components/card");
+const Input = @import("app/components/input");
+const Badge = @import("app/components/badge");
+const Alert = @import("app/components/alert");
 
 pub const meta: mer.Meta = .{
     .title = "merlion-ui Component Showcase",

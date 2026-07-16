@@ -55,11 +55,14 @@ function injectEnv(wasm, env) {
 const resolverScript = "(()=>{for(const s of document.querySelectorAll('template[data-mer-resolve]')){for(const p of document.querySelectorAll('[data-mer-placeholder]')){if(p.getAttribute('data-mer-placeholder')===s.getAttribute('data-mer-resolve')){p.replaceWith(s.content);s.remove();break}}}})();";
 const forwardedHeaders = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
 
-async function readIncomingBody(message, limit = 1024 * 1024, maxDurationMs = 30000) {
+async function readIncomingBody(message, limit = 1024 * 1024, maxDurationMs = 30000, externalSignal) {
   const controller = new AbortController();
   const abortFromMessage = () => controller.abort(message.signal?.reason);
+  const abortFromExternal = () => controller.abort(externalSignal?.reason);
   if (message.signal?.aborted) abortFromMessage();
   else message.signal?.addEventListener("abort", abortFromMessage, { once: true });
+  if (externalSignal?.aborted) abortFromExternal();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
   const timeoutError = new Error("body deadline exceeded");
   timeoutError.name = "TimeoutError";
   const timeout = setTimeout(() => controller.abort(timeoutError), maxDurationMs);
@@ -103,7 +106,17 @@ async function readIncomingBody(message, limit = 1024 * 1024, maxDurationMs = 30
   } finally {
     clearTimeout(timeout);
     message.signal?.removeEventListener("abort", abortFromMessage);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
   }
+}
+
+async function readBoundedUpstreamText(response, signal) {
+  const bytes = await readIncomingBody(response, 1024 * 1024, 15000, signal);
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+async function readBoundedUpstreamJson(response, signal) {
+  return JSON.parse(await readBoundedUpstreamText(response, signal));
 }
 
 async function encodeIncomingRequest(request, url) {
@@ -264,7 +277,7 @@ async function handleAi(request, env, signal, admission) {
       }),
       signal,
     });
-    const reformData = await reformRes.json();
+    const reformData = await readBoundedUpstreamJson(reformRes, signal);
     for (const out of reformData?.output ?? []) {
       if (out.type !== "message") continue;
       for (const c of out.content ?? []) { if (c.text) { searchQuery = c.text.trim(); break; } }
@@ -280,7 +293,7 @@ async function handleAi(request, env, signal, admission) {
     body: JSON.stringify({ model: "text-embedding-3-small", input: searchQuery.slice(0, 512) }),
     signal,
   });
-  const embedData = await embedRes.json();
+  const embedData = await readBoundedUpstreamJson(embedRes, signal);
   const embedding = embedData?.data?.[0]?.embedding;
   if (!embedding) return jsonResp({ error: "Embedding failed: " + JSON.stringify(embedData).slice(0, 200) });
 
@@ -297,7 +310,7 @@ async function handleAi(request, env, signal, admission) {
     body: JSON.stringify({ vector: embedding, k: 6, namespace: "budget2026v2", include_metadata: true }),
     signal,
   });
-  const searchText = await searchRes.text();
+  const searchText = await readBoundedUpstreamText(searchRes, signal);
   let searchData;
   try { searchData = JSON.parse(searchText); } catch { searchData = null; }
   if (!searchRes.ok || !searchData?.results) {
@@ -335,7 +348,7 @@ async function handleAi(request, env, signal, admission) {
     body: JSON.stringify({ model: "gpt-5-nano", instructions: systemPrompt, input: userMsg.slice(0, 13000), max_output_tokens: 1024 }),
     signal,
   });
-  const chatData = await chatRes.json();
+  const chatData = await readBoundedUpstreamJson(chatRes, signal);
 
   let answer = "";
   for (const out of chatData?.output ?? []) {
@@ -376,7 +389,7 @@ async function handleSuggestions(request, env, signal, admission) {
     }),
     signal,
   });
-  const data = await res.json();
+  const data = await readBoundedUpstreamJson(res, signal);
 
   let text = "";
   for (const out of data?.output ?? []) {

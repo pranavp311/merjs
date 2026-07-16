@@ -68,6 +68,8 @@ The breakpoint values are also available as `mercss.Breakpoints.sm`, `.md`,
 - `mercss.Component(styles)` creates a type with `css` and `classes` constants.
 - `mercss.ResponsiveComponent(config)` creates the same constants plus
   mobile-first breakpoint rules.
+- `mercss.InteractiveComponent(config)` adds `hover`, `focus`, and `active`
+  state variants, including responsive state overrides.
 - `mercss.Breakpoints` exposes the standard breakpoint widths.
 
 Styles are ordinary Zig structs, so applications can keep type-safe tokens in
@@ -88,28 +90,27 @@ const Alert = mercss.Component(.{
 });
 ```
 
-See `examples/site/app/mercss-demo.zig` for a complete page with app-owned
-`DesignSystem`, `Button`, `Card`, `Alert`, and responsive container definitions.
+See `examples/site/app/mercss-demo.zig` for a complete page using the
+release design tokens and interactive/responsive component primitives.
 
 ## Deprecated demo compatibility
 
-mercss remains experimental. The old demo declarations — `DesignSystem`,
-`Button`, `Card`, `Alert`, `ResponsiveContainer`, `getDemoHtml`, `getAllCss`, and
-`exampleUsage` — are no longer imported or re-exported by `mer.mercss`. The core
-module contains only the reusable `Component`, `ResponsiveComponent`, and
-`Breakpoints` primitives.
+mercss remains experimental. The v0.2.5 demo declarations — `DesignSystem`,
+`Button`, `Card`, `Alert`, `ResponsiveContainer`, `InteractiveButton`,
+`ResponsiveInteractiveButton`, `getDemoHtml`, `getAllCss`, and `exampleUsage` —
+remain available from `mer.mercss` for source compatibility. New applications
+should define app-owned components with the reusable `Component`,
+`ResponsiveComponent`, and `InteractiveComponent` primitives instead.
 
-Code that needs a short migration window can explicitly use the separate
-`mer.mercss_compat` namespace. For example, replace `mer.mercss.Button` with
-`mer.mercss_compat.Button` while moving that component into application code.
-This deprecated namespace is a demo-only compatibility bridge and will be
-removed in **0.3.0**. `Navbar`, `Hero`, and `Badge` are not framework mercss
-exports; component libraries or applications should own such UI surfaces.
+The same deprecated names are also available from `mer.mercss_compat` to make
+migration explicit. Both compatibility surfaces are scheduled for removal in
+**0.3.0**. `Navbar`, `Hero`, and `Badge` are not framework mercss exports;
+component libraries or applications should own such UI surfaces.
 
 ## Current limits
 
-mercss does not currently generate state variants (`hover`, `focus`, or
-`active`), dark-mode variants, container queries, plugins, resets, keyframes,
-or an `@apply` equivalent. CSS strings must be included by the application,
-usually through `Meta.extra_head`, and each component's CSS should be included
-only once.
+mercss generates `hover`, `focus`, and `active` state variants, including
+responsive state overrides. It does not currently generate dark-mode variants,
+container queries, plugins, resets, keyframes, or an `@apply` equivalent. CSS
+strings must be included by the application, usually through `Meta.extra_head`,
+and each component's CSS should be included only once.

@@ -1,6 +1,7 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+examples/**/zig-pkg/
 
 # Generated files (recreated by `zig build codegen`)
 src/generated/*
@@ -65,7 +66,8 @@ public/style.css
 *.o
 --version
 
-# Harness artifacts (local agent session/trace — not PR evidence)
+# Local agent worktrees/session state — never repository inputs
+.claude/worktrees/
 harness.trace.jsonl
 harness.trajectory.jsonl
 session-*.session.json

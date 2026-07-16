@@ -399,7 +399,7 @@ pub fn build(b: *std.Build) void {
 
     // mercss JIT compiler — codegen scans app/ for class candidates,
     // compiles them, and writes app/_mercss.css before the exe builds.
-    const mercss_jit_mod = b.createModule(.{
+    const mercss_jit_mod = b.addModule("mercss_jit", .{
         .root_source_file = b.path("src/mercss-jit.zig"),
         .target = b.graph.host,
         .optimize = .Debug,

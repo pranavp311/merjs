@@ -206,6 +206,7 @@ const build_zig_template =
     \\        .optimize = .Debug,
     \\    });
     \\    codegen_mod.addImport("runtime", merjs_dep.module("runtime"));
+    \\    codegen_mod.addImport("mercss_jit", merjs_dep.module("mercss_jit"));
     \\    const codegen_exe = b.addExecutable(.{
     \\        .name = "codegen",
     \\        .root_module = codegen_mod,
@@ -748,6 +749,7 @@ test "build_zig_template exposes a starter test step" {
 test "build_zig_template uses local codegen entrypoint" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "b.path(\"tools/codegen.zig\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "codegen_mod.addImport(\"runtime\", merjs_dep.module(\"runtime\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "codegen_mod.addImport(\"mercss_jit\", merjs_dep.module(\"mercss_jit\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "merjs_dep.path(\"tools/codegen.zig\")") == null);
 }
 

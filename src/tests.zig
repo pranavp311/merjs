@@ -97,11 +97,23 @@ test "core API: environment lifecycle owns values and resets them" {
     _ = mer.loadDotenvStatus;
 }
 
-test "core API: mercss demos are isolated in the deprecated compatibility namespace" {
-    try std.testing.expect(!@hasDecl(mer.mercss, "Button"));
-    try std.testing.expect(!@hasDecl(mer.mercss, "compatibility"));
-    try std.testing.expect(@hasDecl(mer, "mercss_compat"));
-    try std.testing.expectEqualStrings("#3b82f6", mer.mercss_compat.DesignSystem.colors.primary);
+test "core API: v0.2.5 mercss declarations remain source compatible" {
+    inline for (.{
+        "DesignSystem",
+        "Button",
+        "Card",
+        "Alert",
+        "getDemoHtml",
+        "getAllCss",
+        "ResponsiveContainer",
+        "InteractiveButton",
+        "ResponsiveInteractiveButton",
+        "exampleUsage",
+    }) |name| {
+        try std.testing.expect(@hasDecl(mer.mercss, name));
+        try std.testing.expect(@hasDecl(mer.mercss_compat, name));
+    }
+    try std.testing.expectEqualStrings("#3b82f6", mer.mercss.DesignSystem.colors.primary);
 }
 
 test "core API: shared exports retain their public type identity" {

@@ -595,6 +595,20 @@ pub fn InteractiveComponent(comptime config: anytype) type {
     };
 }
 
+// Deprecated v0.2.5 demo declarations. Keep these aliases source-compatible
+// until the documented 0.3.0 removal; new code should define app-owned tokens.
+const legacy = @import("mercss_compat.zig").declarations(Component, ResponsiveComponent, InteractiveComponent);
+pub const DesignSystem = legacy.DesignSystem;
+pub const Button = legacy.Button;
+pub const Card = legacy.Card;
+pub const Alert = legacy.Alert;
+pub const getDemoHtml = legacy.getDemoHtml;
+pub const getAllCss = legacy.getAllCss;
+pub const ResponsiveContainer = legacy.ResponsiveContainer;
+pub const InteractiveButton = legacy.InteractiveButton;
+pub const ResponsiveInteractiveButton = legacy.ResponsiveInteractiveButton;
+pub const exampleUsage = legacy.exampleUsage;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ═══════════════════════════════════════════════════════════════════════════════

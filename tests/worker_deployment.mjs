@@ -100,6 +100,16 @@ for (const adapter of [
   assert.match(source, /raceWithSignal\(workPromise/, `${adapter}: AI deadline does not bound the caller response`);
   assert.match(source, /workPromise\.finally\(\(\) => \{ aiActive--; \}\)/, `${adapter}: AI concurrency releases before work settles`);
   assert.match(source, /request\.body\?\.cancel\("AI request rejected"\)/, `${adapter}: rejected AI uploads are not canceled`);
+  assert.doesNotMatch(source, /await [A-Za-z]+(?:Res)?\.(?:json|text)\(\)/, `${adapter}: AI upstream response is buffered without a byte cap`);
+}
+
+for (const adapter of [
+  "examples/singapore-data-dashboard/worker/ai-budget.js",
+  "examples/site/worker/worker/ai-budget.js",
+]) {
+  const source = readFileSync(join(root, adapter), "utf8");
+  assert.match(source, /MAX_GATE_RESPONSE_BYTES = 16 \* 1024/, `${adapter}: budget decision size is unbounded`);
+  assert.doesNotMatch(source, /response\.text\(\)/, `${adapter}: budget decision bypasses bounded streaming`);
 }
 
 const siteAdapter = readFileSync(join(root, "examples/site/worker/worker/worker.js"), "utf8");

@@ -143,6 +143,9 @@ jobs:
           grep -F '.path = ".."' "$scaffold/build.zig.zon"
           (cd "$scaffold" && zig build test)
 
+      - name: Build the checked-in UI showcase consumer
+        run: (cd examples/ui-showcase && zig build test)
+
       - name: Build merjs
         run: zig build
 

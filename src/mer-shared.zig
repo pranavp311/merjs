@@ -10,7 +10,7 @@ const env_mod = @import("env.zig");
 pub const mercss = @import("mercss.zig");
 pub const design = @import("mercss-design.zig");
 /// Deprecated demo-only compatibility API. Removed in 0.3.0.
-pub const mercss_compat = @import("mercss_compat.zig").declarations(mercss.Component, mercss.ResponsiveComponent);
+pub const mercss_compat = @import("mercss_compat.zig").declarations(mercss.Component, mercss.ResponsiveComponent, mercss.InteractiveComponent);
 pub const version = "0.2.5";
 
 pub const StreamParts = struct {

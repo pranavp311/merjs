@@ -22,13 +22,16 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // zig build codegen
+    const codegen_mod = b.createModule(.{
+        .root_source_file = merjs_dep.path("tools/codegen.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    codegen_mod.addImport("runtime", merjs_dep.module("runtime"));
+    codegen_mod.addImport("mercss_jit", merjs_dep.module("mercss_jit"));
     const codegen_exe = b.addExecutable(.{
         .name = "codegen",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/codegen.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
+        .root_module = codegen_mod,
     });
     const run_codegen = b.addRunArtifact(codegen_exe);
     run_codegen.setCwd(b.path("."));

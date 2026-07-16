@@ -140,6 +140,13 @@ function jsonResp(data, status = 200) {
   });
 }
 
+const MAX_AI_UPSTREAM_RESPONSE_BYTES = 1024 * 1024;
+
+async function readBoundedJson(response, signal) {
+  const bytes = await readBoundedBody(response, MAX_AI_UPSTREAM_RESPONSE_BYTES, signal);
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+}
+
 // ── R2 grep search (WASM-powered, no embeddings) ──────────────────────────────
 
 const GREP_QUERY_CAPACITY = 4096;
@@ -359,7 +366,7 @@ async function handleBudgetAi(request, env, signal, admission) {
       }),
       signal,
     });
-    const reformData = await reformRes.json();
+    const reformData = await readBoundedJson(reformRes, signal);
     for (const out of reformData?.output ?? []) {
       if (out.type !== "message") continue;
       for (const c of out.content ?? []) { if (c.text) { searchQuery = c.text.trim(); break; } }
@@ -402,7 +409,7 @@ async function handleBudgetAi(request, env, signal, admission) {
     }),
     signal,
   });
-  const chatData = await chatRes.json();
+  const chatData = await readBoundedJson(chatRes, signal);
 
   let answer = "";
   for (const out of chatData?.output ?? []) {
@@ -447,7 +454,7 @@ async function handleBudgetSuggestions(request, env, signal, admission) {
     }),
     signal,
   });
-  const data = await res.json();
+  const data = await readBoundedJson(res, signal);
 
   let text = "";
   for (const out of data?.output ?? []) {
