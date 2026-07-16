@@ -97,12 +97,15 @@ for (const adapter of [
   assert.match(source, /readAiJson\(request, deadlineSignal\)/, `${adapter}: AI body reader omits its deadline`);
   assert.match(source, /readAiJson\(request, signal\)/, `${adapter}: AI handler drops its admission signal`);
   assert.match(source, /await reader\.read\(\);\n\s+if \(controller\.signal\.aborted\)/, `${adapter}: AI body accepts abort-driven truncation`);
-  assert.match(source, /raceWithSignal\(Promise\.resolve/, `${adapter}: AI deadline does not bound the whole operation`);
+  assert.match(source, /raceWithSignal\(workPromise/, `${adapter}: AI deadline does not bound the caller response`);
+  assert.match(source, /workPromise\.finally\(\(\) => \{ aiActive--; \}\)/, `${adapter}: AI concurrency releases before work settles`);
   assert.match(source, /request\.body\?\.cancel\("AI request rejected"\)/, `${adapter}: rejected AI uploads are not canceled`);
 }
 
 const siteAdapter = readFileSync(join(root, "examples/site/worker/worker/worker.js"), "utf8");
 assert.match(siteAdapter, /readBoundedBody\(\{[\s\S]*body: obj\.body,[\s\S]*MAX_CORPUS_JSON_BYTES, signal\)/, "site R2 corpus read is not bounded");
+assert.match(siteAdapter, /obj\?\.body\?\.cancel\("AI deadline exceeded"\)/, "site abandons an R2 body that resolves after its deadline");
+assert.match(siteAdapter, /cachedChunks\.expiresAt > now/, "site corpus cache never revalidates");
 assert.match(siteAdapter, /GREP_CHUNKS_CAPACITY - totalLen - 4/, "site grep corpus can exceed WASM capacity");
 assert.match(siteAdapter, /qBytes\.length > GREP_QUERY_CAPACITY/, "site grep query can exceed WASM capacity");
 

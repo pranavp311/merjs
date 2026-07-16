@@ -146,13 +146,18 @@ const GREP_QUERY_CAPACITY = 4096;
 const GREP_CHUNKS_CAPACITY = 1024 * 1024;
 const MAX_CORPUS_JSON_BYTES = 1024 * 1024;
 const MAX_CORPUS_CHUNKS = 8192;
+const CORPUS_CACHE_TTL_MS = 60 * 1000;
 let cachedChunks = null;
 
 async function getChunks(env, signal) {
   if (signal.aborted) throw signal.reason;
-  if (cachedChunks) return cachedChunks;
+  const now = Date.now();
+  if (cachedChunks && cachedChunks.expiresAt > now) return cachedChunks.value;
   const obj = await env.BUCKET.get("budget2026/all_chunks.json");
-  if (signal.aborted) throw signal.reason;
+  if (signal.aborted) {
+    await obj?.body?.cancel("AI deadline exceeded").catch(() => {});
+    throw signal.reason;
+  }
   if (!obj) return [];
   const objectSize = Number(obj.size);
   if (!Number.isSafeInteger(objectSize) || objectSize < 0 || objectSize > MAX_CORPUS_JSON_BYTES) {
@@ -167,8 +172,8 @@ async function getChunks(env, signal) {
   if (!Array.isArray(parsed) || parsed.length > MAX_CORPUS_CHUNKS ||
       parsed.some(chunk => chunk === null || typeof chunk !== "object" || typeof chunk.text !== "string"))
     throw new Error("invalid corpus");
-  cachedChunks = parsed;
-  return cachedChunks;
+  cachedChunks = { value: parsed, expiresAt: Date.now() + CORPUS_CACHE_TTL_MS };
+  return cachedChunks.value;
 }
 
 // Pack chunk texts into length-prefixed binary for WASM: [u32-LE len][text]...
@@ -276,11 +281,15 @@ async function admitAi(request, env, work) {
   const timeoutError = new Error("AI deadline exceeded");
   timeoutError.name = "TimeoutError";
   const timeout = setTimeout(() => controller.abort(timeoutError), 15000);
-  try { return await raceWithSignal(Promise.resolve().then(() => work(controller.signal, admission)), controller.signal); }
+  const workPromise = Promise.resolve().then(() => work(controller.signal, admission));
+  // Keep the strict concurrency slot charged until the underlying operation
+  // actually settles, even if the caller-facing deadline wins the race.
+  void workPromise.finally(() => { aiActive--; }).catch(() => {});
+  try { return await raceWithSignal(workPromise, controller.signal); }
   catch (error) {
     if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
     return jsonResp({ error: error?.name === "TimeoutError" ? "AI request timed out" : "AI upstream unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
-  } finally { clearTimeout(timeout); aiActive--; }
+  } finally { clearTimeout(timeout); }
 }
 
 async function readAiJson(request, deadlineSignal) {

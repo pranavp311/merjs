@@ -186,11 +186,15 @@ async function admitAi(request, env, work) {
   const timeoutError = new Error("AI deadline exceeded");
   timeoutError.name = "TimeoutError";
   const timeout = setTimeout(() => controller.abort(timeoutError), 15000);
-  try { return await raceWithSignal(Promise.resolve().then(() => work(controller.signal, admission)), controller.signal); }
+  const workPromise = Promise.resolve().then(() => work(controller.signal, admission));
+  // Keep the strict concurrency slot charged until the underlying operation
+  // actually settles, even if the caller-facing deadline wins the race.
+  void workPromise.finally(() => { aiActive--; }).catch(() => {});
+  try { return await raceWithSignal(workPromise, controller.signal); }
   catch (error) {
     if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
     return jsonResp({ error: error?.name === "TimeoutError" ? "AI request timed out" : "AI upstream unavailable" }, error?.name === "TimeoutError" ? 504 : 502);
-  } finally { clearTimeout(timeout); aiActive--; }
+  } finally { clearTimeout(timeout); }
 }
 
 async function readAiJson(request, deadlineSignal) {
