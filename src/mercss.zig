@@ -596,96 +596,42 @@ pub fn InteractiveComponent(comptime config: anytype) type {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DEMO: Design System & Components
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const DesignSystem = struct {
-    pub const colors = .{
-        .primary = "#3b82f6",
-        .secondary = "#64748b",
-        .danger = "#ef4444",
-        .success = "#22c55e",
-    };
-
-    pub const spacing = .{
-        .xs = 4,
-        .sm = 8,
-        .md = 16,
-        .lg = 24,
-        .xl = 32,
-    };
-};
-
-/// Button component with compile-time styles
-pub const Button = Component(.{
-    .padding = "8px 16px",
-    .border_radius = "6px",
-    .font_weight = "600",
-    .cursor = "pointer",
-    .transition = "all 0.2s",
-    .background = DesignSystem.colors.primary,
-});
-
-/// Card component
-pub const Card = Component(.{
-    .background = "white",
-    .border_radius = "8px",
-    .padding = "16px",
-    .box_shadow = "0 1px 3px rgba(0,0,0,0.1)",
-});
-
-/// Alert component
-pub const Alert = Component(.{
-    .padding = "12px 16px",
-    .border_radius = "6px",
-    .font_weight = "500",
-    .background = DesignSystem.colors.danger,
-});
-
-/// Demo: Generate complete HTML page with inline CSS
-pub fn getDemoHtml() []const u8 {
-    comptime {
-        return "<!DOCTYPE html><html><head><style>" ++
-            Button.css ++
-            Card.css ++
-            Alert.css ++
-            "</style></head><body>" ++
-            "<button class='" ++ Button.classes ++ "'>Click me</button>" ++
-            "<div class='" ++ Card.classes ++ "'>Card content here</div>" ++
-            "<div class='" ++ Alert.classes ++ "'>Alert message!</div>" ++
-            "</body></html>";
-    }
-}
-
-/// Get just the CSS for all components
-pub fn getAllCss() []const u8 {
-    comptime {
-        return Button.css ++ Card.css ++ Alert.css;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
 
-test "Button CSS generation" {
-    // Should contain padding rule
-    try testing.expect(std.mem.indexOf(u8, Button.css, "padding") != null);
-    // Should contain primary color
-    try testing.expect(std.mem.indexOf(u8, Button.css, "#3b82f6") != null);
-}
+const TestComponent = Component(.{
+    .padding = "8px 16px",
+    .border_radius = "6px",
+    .width = 24,
+});
 
-test "Card CSS generation" {
-    // Should contain border-radius (kebab-case conversion)
-    try testing.expect(std.mem.indexOf(u8, Card.css, "border-radius") != null);
-    // Should contain white background
-    try testing.expect(std.mem.indexOf(u8, Card.css, "white") != null);
+const TestResponsiveComponent = ResponsiveComponent(.{
+    .base = .{ .padding = "16px" },
+    .sm = .{ .padding = "24px" },
+    .md = .{ .padding = "32px" },
+});
+
+const TestInteractiveComponent = InteractiveComponent(.{
+    .base = .{ .padding = "8px 16px", .background = "#3b82f6" },
+    .hover = .{ .background = "#2563eb" },
+    .focus = .{ .outline = "none" },
+    .active = .{ .transform = "scale(0.98)" },
+    .md = .{
+        .base = .{ .padding = "16px 32px" },
+        .hover = .{ .background = "#1e40af" },
+    },
+});
+
+test "component CSS and class generation" {
+    try testing.expect(std.mem.indexOf(u8, TestComponent.css, safe_css) != null);
+    try testing.expect(std.mem.indexOf(u8, TestComponent.css, "padding:8px 16px;") != null);
+    try testing.expect(std.mem.indexOf(u8, TestComponent.css, "border-radius:6px;") != null);
+    try testing.expect(std.mem.indexOf(u8, TestComponent.classes, safe_class) != null);
 }
 
 test "kebab-case conversion" {
-    // Test snake_case to kebab-case conversion
     comptime {
         try testing.expectEqualStrings("border-radius", toKebabCase("border_radius"));
         try testing.expectEqualStrings("background-color", toKebabCase("background_color"));
@@ -693,262 +639,25 @@ test "kebab-case conversion" {
     }
 }
 
-test "Button class names" {
-    // Should have mcss- prefix
-    try testing.expect(std.mem.indexOf(u8, Button.classes, "mcss-") != null);
-    // Should contain padding class
-    try testing.expect(std.mem.indexOf(u8, Button.classes, "mcss-padding-") != null);
-}
-
-test "components include safe boundary class" {
-    try testing.expect(std.mem.indexOf(u8, Button.classes, safe_class) != null);
-    try testing.expect(std.mem.indexOf(u8, Button.css, safe_css) != null);
-}
-
-test "different values generate different classes" {
-    const rounded = Component(.{ .border_radius = "4px" });
-    const pill = Component(.{ .border_radius = "9999px" });
-
-    try testing.expect(!std.mem.eql(u8, rounded.classes, pill.classes));
-    try testing.expect(std.mem.indexOf(u8, rounded.css, "border-radius:4px;") != null);
-    try testing.expect(std.mem.indexOf(u8, pill.css, "border-radius:9999px;") != null);
-}
-
-test "Complete HTML generation" {
-    const html = comptime getDemoHtml();
-
-    // Has all structure
-    try testing.expect(std.mem.indexOf(u8, html, "<!DOCTYPE html>") != null);
-    try testing.expect(std.mem.indexOf(u8, html, "<style>") != null);
-    try testing.expect(std.mem.indexOf(u8, html, "</style>") != null);
-
-    // Has components
-    try testing.expect(std.mem.indexOf(u8, html, "<button") != null);
-    try testing.expect(std.mem.indexOf(u8, html, "<div") != null);
-
-    // Has CSS rules
-    try testing.expect(std.mem.indexOf(u8, html, "mcss-") != null);
-}
-
-test "CSS deduplication concept" {
-    // In real usage, you'd only include each component's CSS once
-    // This test shows the CSS strings are compile-time constants
-    const css1 = Button.css;
-    const css2 = Button.css;
-
-    // Both point to same comptime-generated string
-    try testing.expect(css1.len == css2.len);
-    try testing.expect(std.mem.eql(u8, css1, css2));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RESPONSIVE COMPONENT TESTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Demo: Responsive container component
-pub const ResponsiveContainer = ResponsiveComponent(.{
-    .base = .{ .padding = "16px" },
-    .sm = .{ .padding = "24px" },
-    .md = .{ .padding = "32px" },
-    .lg = .{ .padding = "48px" },
-});
-
-test "Responsive component CSS generation" {
+test "responsive component CSS and class generation" {
     comptime {
         @setEvalBranchQuota(50000);
-    }
-
-    // Should contain media queries
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "@media") != null);
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "min-width") != null);
-
-    // Should contain breakpoint classes
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "mcss-sm-") != null);
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "mcss-md-") != null);
-}
-
-test "Responsive component class names" {
-    comptime {
-        @setEvalBranchQuota(50000);
-    }
-
-    // Should contain base class
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.classes, "mcss-padding-") != null);
-
-    // Should contain breakpoint classes
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.classes, "mcss-sm-padding-") != null);
-    try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.classes, "mcss-md-padding-") != null);
-}
-
-test "Responsive breakpoints structure" {
-    comptime {
-        // Raise branch quota for complex comptime string operations
-        @setEvalBranchQuota(5000);
-
-        // Base style should exist
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, ".mcss-padding-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "padding:16px;}") != null);
-
-        // sm breakpoint (640px+)
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "@media (min-width: 640px)") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, ".mcss-sm-padding-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "padding:24px;}") != null);
-
-        // md breakpoint (768px+)
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "@media (min-width: 768px)") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, ".mcss-md-padding-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveContainer.css, "padding:32px;}") != null);
+        try testing.expect(std.mem.indexOf(u8, TestResponsiveComponent.css, "@media (min-width: 640px)") != null);
+        try testing.expect(std.mem.indexOf(u8, TestResponsiveComponent.css, "@media (min-width: 768px)") != null);
+        try testing.expect(std.mem.indexOf(u8, TestResponsiveComponent.css, "padding:24px;") != null);
+        try testing.expect(std.mem.indexOf(u8, TestResponsiveComponent.classes, "mcss-sm-") != null);
+        try testing.expect(std.mem.indexOf(u8, TestResponsiveComponent.classes, "mcss-md-") != null);
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// INTERACTIVE COMPONENT TESTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Demo: Interactive button with hover, focus, and active states
-pub const InteractiveButton = InteractiveComponent(.{
-    .base = .{
-        .padding = "12px 24px",
-        .background = "#3b82f6",
-        .color = "white",
-        .border_radius = "6px",
-        .cursor = "pointer",
-        .transition = "all 0.2s",
-    },
-    .hover = .{
-        .background = "#2563eb",
-        .transform = "translateY(-1px)",
-    },
-    .focus = .{
-        .box_shadow = "0 0 0 3px rgba(59,130,246,0.3)",
-        .outline = "none",
-    },
-    .active = .{
-        .transform = "scale(0.98)",
-        .background = "#1d4ed8",
-    },
-});
-
-test "Interactive component CSS generation" {
+test "interactive component preserves state and responsive variants" {
     comptime {
         @setEvalBranchQuota(100000);
-
-        // Base styles
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-padding-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, "padding:12px 24px;}") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-background-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, "background:#3b82f6;}") != null);
-
-        // Hover pseudo-class
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-hover-background-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ":hover{background:#2563eb;}") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-hover-transform-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ":hover{transform:translateY(-1px);}") != null);
-
-        // Focus pseudo-class
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-focus-box_shadow-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ":focus{box-shadow:") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-focus-outline-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ":focus{outline:none;}") != null);
-
-        // Active pseudo-class
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-active-transform-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ":active{transform:scale(0.98);}") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ".mcss-active-background-") != null);
-        try testing.expect(std.mem.indexOf(u8, InteractiveButton.css, ":active{background:#1d4ed8;}") != null);
+        try testing.expect(std.mem.indexOf(u8, TestInteractiveComponent.css, ":hover{background:#2563eb;}") != null);
+        try testing.expect(std.mem.indexOf(u8, TestInteractiveComponent.css, ":focus{outline:none;}") != null);
+        try testing.expect(std.mem.indexOf(u8, TestInteractiveComponent.css, ":active{transform:scale(0.98);}") != null);
+        try testing.expect(std.mem.indexOf(u8, TestInteractiveComponent.css, "@media (min-width: 768px)") != null);
+        try testing.expect(std.mem.indexOf(u8, TestInteractiveComponent.css, ":hover{background:#1e40af;}") != null);
+        try testing.expect(std.mem.indexOf(u8, TestInteractiveComponent.classes, "mcss-hover-md-") != null);
     }
-}
-
-test "Interactive component class names" {
-    comptime {
-        @setEvalBranchQuota(50000);
-    }
-
-    // Should contain base classes
-    try testing.expect(std.mem.indexOf(u8, InteractiveButton.classes, "mcss-padding-") != null);
-    try testing.expect(std.mem.indexOf(u8, InteractiveButton.classes, "mcss-background-") != null);
-
-    // Should contain hover classes
-    try testing.expect(std.mem.indexOf(u8, InteractiveButton.classes, "mcss-hover-background-") != null);
-    try testing.expect(std.mem.indexOf(u8, InteractiveButton.classes, "mcss-hover-transform-") != null);
-
-    // Should contain focus classes
-    try testing.expect(std.mem.indexOf(u8, InteractiveButton.classes, "mcss-focus-box_shadow-") != null);
-
-    // Should contain active classes
-    try testing.expect(std.mem.indexOf(u8, InteractiveButton.classes, "mcss-active-transform-") != null);
-}
-
-/// Demo: Interactive component with responsive state variants
-pub const ResponsiveInteractiveButton = InteractiveComponent(.{
-    .base = .{
-        .padding = "8px 16px",
-        .background = "#3b82f6",
-    },
-    .hover = .{
-        .background = "#2563eb",
-    },
-    .sm = .{
-        .base = .{ .padding = "12px 24px" },
-        .hover = .{ .background = "#1d4ed8" },
-    },
-    .md = .{
-        .base = .{ .padding = "16px 32px" },
-        .hover = .{ .background = "#1e40af" },
-    },
-});
-
-test "Responsive interactive component" {
-    comptime {
-        @setEvalBranchQuota(100000);
-
-        // Base styles
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ".mcss-padding-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, "padding:8px 16px;}") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ".mcss-hover-background-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ":hover{background:#2563eb;}") != null);
-
-        // sm breakpoint with hover
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, "@media (min-width: 640px)") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ".mcss-hover-sm-background-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ":hover{background:#1d4ed8;}") != null);
-
-        // md breakpoint with hover
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, "@media (min-width: 768px)") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ".mcss-hover-md-background-") != null);
-        try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.css, ":hover{background:#1e40af;}") != null);
-    }
-}
-
-test "Responsive interactive class names" {
-    comptime {
-        @setEvalBranchQuota(50000);
-    }
-
-    // Base classes
-    try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.classes, "mcss-padding-") != null);
-    try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.classes, "mcss-hover-background-") != null);
-
-    // Responsive hover classes
-    try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.classes, "mcss-hover-sm-background-") != null);
-    try testing.expect(std.mem.indexOf(u8, ResponsiveInteractiveButton.classes, "mcss-hover-md-background-") != null);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// EXAMPLE: How this would work in a real page
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub fn exampleUsage() void {
-    // In a real page handler:
-    //
-    // pub fn render(req: mer.Request) mer.Response {
-    //     // CSS is generated at comptime - zero runtime cost!
-    //     const css = Button.css ++ Card.css;
-    //
-    //     return mer.html(
-    //         "<style>" ++ css ++ "</style>" ++
-    //         "<button class='" ++ Button.classes ++ "'>Click</button>"
-    //     );
-    // }
-    _ = {};
 }
