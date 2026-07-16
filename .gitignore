@@ -18,6 +18,8 @@ dist/
 # Cloudflare Workers — compiled WASM output
 worker/merjs.wasm
 worker/grep.wasm
+examples/site/worker/worker/merjs.wasm
+examples/site/worker/worker/grep.wasm
 examples/kanban/worker/merjs.wasm
 examples/singapore-data-dashboard/worker/merjs.wasm
 

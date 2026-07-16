@@ -487,7 +487,6 @@ const TestSigned = struct {
     }
 };
 
-
 var test_fetch_body: []const u8 = "";
 
 fn testFetch(alloc: std.mem.Allocator, url: []const u8, max_bytes: usize) anyerror![]u8 {
@@ -529,7 +528,6 @@ test "validateFeedJson accepts structurally valid signed update feed" {
     try validateFeedJson(std.testing.allocator, json);
 }
 
-
 test "checkForUpdateJson treats disabled updates as no_update without panic" {
     var result = try checkForUpdateJson(std.testing.allocator, .{}, "com.example.app", "1.0.0", "macos", "aarch64", 0, "{}");
     defer result.deinit(std.testing.allocator);
@@ -554,7 +552,6 @@ test "checkForUpdateJson verifies signature and returns update metadata" {
     try std.testing.expect(result == .update_available);
     try std.testing.expectEqualStrings("1.2.3", result.update_available.version);
 }
-
 
 test "checkForUpdate uses fetcher abstraction with size cap" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");
@@ -627,7 +624,6 @@ test "checkForUpdateJson rejects wrong signature app platform and rollback windo
     }, "com.example.app", "0.9.0", "macos", "aarch64", 0, good_json));
 }
 
-
 test "checkForUpdateJson rejects tampered min_supported_version" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");
     const unsigned_feed = signedTestFeed(unsigned_platform.signature, "1.2.3");
@@ -659,7 +655,6 @@ test "checkForUpdateJson rejects tampered min_supported_version" {
         .public_key = public_key,
     }, "com.example.app", "1.2.2", "macos", "aarch64", 0, json));
 }
-
 
 test "checkForUpdateJson rejects tampered version that would suppress updates" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");
@@ -715,7 +710,6 @@ test "checkForUpdateJson treats empty-string config as disabled" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 0), result.no_update);
 }
-
 
 test "checkForUpdateJson rejects stale metadata_version" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");

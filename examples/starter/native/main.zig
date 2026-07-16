@@ -17,6 +17,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    _ = try mer.loadDotenvStatus(allocator);
+    defer mer.deinitDotenv();
+
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     const args = try init.args.toSlice(arena_state.allocator());

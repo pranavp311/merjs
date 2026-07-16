@@ -6,6 +6,7 @@
 ///   sync         →  std.Thread.ResetEvent (server signals ready → main loads URL)
 const std = @import("std");
 const mer = @import("mer");
+const runtime = @import("runtime");
 // ObjC runtime — no @cImport needed (proven in spike #50)
 extern fn objc_getClass(name: [*:0]const u8) ?*anyopaque;
 extern fn sel_registerName(name: [*:0]const u8) ?*anyopaque;
@@ -79,6 +80,7 @@ fn sendWebViewInit(recv: Id, s: Sel, frame: CGRect, config: Id) Id {
 // Server thread context
 const ServerCtx = struct {
     ready: mer.ServerReady = .{},
+    stop: mer.ServerStop = .{},
     allocator: std.mem.Allocator,
 };
 
@@ -90,6 +92,7 @@ fn runServer(ctx: *ServerCtx) void {
         .port = 0, // OS assigns a free port
         .dev = false,
         .ready = &ctx.ready,
+        .stop = &ctx.stop,
     }, &router, null);
     srv.listen() catch |err| {
         std.log.err("server listen failed: {}", .{err});
@@ -101,14 +104,24 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    try runtime.init(allocator);
+    defer runtime.deinit();
+    _ = try mer.loadDotenvStatus(allocator);
+    defer mer.deinitDotenv();
+    mer.telemetry.init();
+    defer mer.telemetry.deinit();
 
-    // Allocate server context on heap so the thread can outlive this stack frame
+    // Allocate server context on heap so its address remains stable until join.
     const ctx = try allocator.create(ServerCtx);
     ctx.* = .{ .allocator = allocator };
 
     // Spawn HTTP server on background thread (#53)
     const thread = try std.Thread.spawn(.{}, runServer, .{ctx});
-    thread.detach();
+    defer {
+        ctx.stop.request();
+        thread.join();
+        allocator.destroy(ctx);
+    }
 
     // Block until server is bound and ready (#51)
     ctx.ready.wait();

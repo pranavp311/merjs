@@ -11,7 +11,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const runtime = @import("runtime");
 
-pub const version = "0.2.5";
+const package_manifest = @embedFile("build.zig.zon");
+pub const version = version: {
+    const marker = ".version = \"";
+    const start = (std.mem.indexOf(u8, package_manifest, marker) orelse
+        @compileError("build.zig.zon has no version")) + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, package_manifest, start, '"') orelse
+        @compileError("build.zig.zon has an invalid version");
+    break :version package_manifest[start..end];
+};
 
 const print = std.debug.print;
 
@@ -63,11 +71,9 @@ fn resolveInPath(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     return alloc.dupe(u8, name);
 }
 
-/// Get current Unix timestamp in milliseconds (vanity metric helper).
+/// Get a monotonic timestamp in milliseconds (vanity metric helper).
 fn currentMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    return std.Io.Clock.awake.now(runtime.io).toMilliseconds();
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -97,8 +103,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (std.mem.eql(u8, cmd, "init")) {
-        const name = if (args.len >= 3) args[2] else ".";
-        try cmdInit(alloc, name);
+        try cmdInit(alloc, args[2..]);
         return;
     }
 
@@ -292,8 +297,16 @@ const main_zig_template =
     \\    defer arena_state.deinit();
     \\    const args = try init.args.toSlice(arena_state.allocator());
     \\
-    \\    // Load .env before threads start.
-    \\    mer.loadDotenv(alloc);
+    \\    // Load .env before threads start. The compatibility branch keeps the
+    \\    // scaffold buildable against the dependency revision fetched below.
+    \\    if (@hasDecl(mer, "loadDotenvStatus")) {
+    \\        _ = try mer.loadDotenvStatus(alloc);
+    \\    } else {
+    \\        mer.loadDotenv(alloc);
+    \\    }
+    \\    defer if (@hasDecl(mer, "deinitDotenv")) mer.deinitDotenv();
+    \\    mer.telemetry.init();
+    \\    defer mer.telemetry.deinit();
     \\
     \\    var config = mer.Config{
     \\        .host = "127.0.0.1",
@@ -313,11 +326,9 @@ const main_zig_template =
     \\            i += 1;
     \\        } else if (std.mem.eql(u8, args[i], "--no-dev")) {
     \\            config.dev = false;
-    \\        } else if (std.mem.eql(u8, args[i], "--debug")) {
-    \\            config.debug = true;
-    \\        } else if (std.mem.eql(u8, args[i], "--kuri-port") and i + 1 < args.len) {
-    \\            config.kuri_port = try std.fmt.parseInt(u16, args[i + 1], 10);
-    \\            i += 1;
+    \\        } else if (std.mem.eql(u8, args[i], "--debug") or std.mem.eql(u8, args[i], "--kuri-port")) {
+    \\            log.err("{s} was removed with the disabled browser automation integration", .{args[i]});
+    \\            return error.RemovedBrowserAutomationOption;
     \\        } else if (std.mem.eql(u8, args[i], "--verbose") or std.mem.eql(u8, args[i], "-v")) {
     \\            config.verbose = true;
     \\        } else if (std.mem.eql(u8, args[i], "--prerender")) {
@@ -414,7 +425,50 @@ fn projectNameForZon(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-fn writeBuildZigZon(dir: std.Io.Dir, alloc: std.mem.Allocator, name: []const u8) !void {
+const default_merjs_url = "git+https://github.com/justrach/merjs.git";
+
+const InitOptions = struct {
+    name: []const u8 = ".",
+    merjs_url: []const u8 = default_merjs_url,
+    merjs_path: ?[]const u8 = null,
+};
+
+fn parseInitOptions(args: []const []const u8) !InitOptions {
+    var options = InitOptions{};
+    var have_name = false;
+    var have_url = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--merjs-url")) {
+            if (i + 1 >= args.len) return error.MissingMerjsUrl;
+            i += 1;
+            options.merjs_url = args[i];
+            have_url = true;
+        } else if (std.mem.eql(u8, args[i], "--merjs-path")) {
+            if (i + 1 >= args.len) return error.MissingMerjsPath;
+            i += 1;
+            options.merjs_path = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "-")) {
+            return error.UnknownInitOption;
+        } else if (!have_name) {
+            options.name = args[i];
+            have_name = true;
+        } else {
+            return error.UnexpectedInitArgument;
+        }
+    }
+    if (options.merjs_url.len == 0) return error.MissingMerjsUrl;
+    if (have_url and options.merjs_path != null) return error.ConflictingMerjsDependency;
+    for (options.merjs_url) |c| if (c == '"' or c == '\\' or c <= 0x1f or c == 0x7f) return error.InvalidMerjsUrl;
+    if (options.merjs_path) |path| {
+        if (path.len == 0) return error.MissingMerjsPath;
+        if (std.fs.path.isAbsolute(path)) return error.AbsoluteMerjsPath;
+        for (path) |c| if (c == '"' or c == '\\' or c <= 0x1f or c == 0x7f) return error.InvalidMerjsPath;
+    }
+    return options;
+}
+
+fn writeBuildZigZon(dir: std.Io.Dir, alloc: std.mem.Allocator, name: []const u8, options: InitOptions) !void {
     const zig_name = try projectNameForZon(alloc, name);
     defer alloc.free(zig_name);
 
@@ -426,7 +480,14 @@ fn writeBuildZigZon(dir: std.Io.Dir, alloc: std.mem.Allocator, name: []const u8)
     try file.writeStreamingAll(runtime.io, "    .minimum_zig_version = \"0.16.0\",\n");
     try file.writeStreamingAll(runtime.io, "    .dependencies = .{\n");
     try file.writeStreamingAll(runtime.io, "        .merjs = .{\n");
-    try file.writeStreamingAll(runtime.io, "            .url = \"git+https://github.com/justrach/merjs.git\",\n");
+    if (options.merjs_path) |path| {
+        try file.writeStreamingAll(runtime.io, "            .path = \"");
+        try file.writeStreamingAll(runtime.io, path);
+    } else {
+        try file.writeStreamingAll(runtime.io, "            .url = \"");
+        try file.writeStreamingAll(runtime.io, options.merjs_url);
+    }
+    try file.writeStreamingAll(runtime.io, "\",\n");
     try file.writeStreamingAll(runtime.io, "        },\n");
     try file.writeStreamingAll(runtime.io, "    },\n");
     try file.writeStreamingAll(runtime.io, "    .paths = .{\n");
@@ -441,7 +502,10 @@ fn writeBuildZigZon(dir: std.Io.Dir, alloc: std.mem.Allocator, name: []const u8)
     try file.writeStreamingAll(runtime.io, "}\n");
 }
 
-fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
+fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
+    const options = try parseInitOptions(args);
+    const name = options.name;
+
     // Start timing for vanity metrics
     const start_ms = currentMs();
     var file_count: usize = 0;
@@ -479,7 +543,7 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
     }
 
     // Write build.zig.zon.
-    try writeBuildZigZon(dir, alloc, name);
+    try writeBuildZigZon(dir, alloc, name, options);
     file_count += 1;
 
     // Patch in the fingerprint: run zig build to get the suggested value.
@@ -521,17 +585,17 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
         }
     }
 
-    // Auto-fetch the merjs dependency so the project builds immediately (#61).
-    print("📦 Fetching merjs dependency...\n", .{});
+    // Auto-fetch URL dependencies so the project builds immediately (#61).
     const fetch_start_ms = currentMs();
-    {
+    if (options.merjs_path == null) {
+        print("📦 Fetching merjs dependency...\n", .{});
         const cwd_path = if (use_cwd) "." else name;
         const zig_exe = try resolveInPath(alloc, "zig");
         defer alloc.free(zig_exe);
 
         // Get the package hash (printed to stdout by zig fetch without --save).
         const hash_result = try runInheritEnv(alloc, .{
-            .argv = &.{ zig_exe, "fetch", "git+https://github.com/justrach/merjs.git" },
+            .argv = &.{ zig_exe, "fetch", options.merjs_url },
             .cwd = .{ .path = cwd_path },
         });
         defer alloc.free(hash_result.stdout);
@@ -539,13 +603,13 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
 
         if (hash_result.term.exited != 0) {
             print("   ⚠️  Could not fetch merjs dependency (no network?)\n", .{});
-            print("      Run manually: zig fetch --save=merjs git+https://github.com/justrach/merjs.git\n", .{});
+            print("      Run manually: zig fetch --save=merjs {s}\n", .{options.merjs_url});
         } else {
             const pkg_hash = std.mem.trimEnd(u8, hash_result.stdout, "\n\r ");
 
             // Pin the commit URL into build.zig.zon.
             const save_result = try runInheritEnv(alloc, .{
-                .argv = &.{ zig_exe, "fetch", "--save=merjs", "git+https://github.com/justrach/merjs.git" },
+                .argv = &.{ zig_exe, "fetch", "--save=merjs", options.merjs_url },
                 .cwd = .{ .path = cwd_path },
             });
             alloc.free(save_result.stderr);
@@ -556,7 +620,7 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
                 defer if (!use_cwd) alloc.free(zon_path_str);
                 const zon_content = try std.Io.Dir.cwd().readFileAlloc(runtime.io, zon_path_str, alloc, .limited(8192));
                 defer alloc.free(zon_content);
-                if (std.mem.indexOf(u8, zon_content, ".url = \"git+https://github.com/justrach/merjs.git")) |url_start| {
+                if (std.mem.indexOf(u8, zon_content, ".url = \"")) |url_start| {
                     if (std.mem.indexOfPos(u8, zon_content, url_start, "\n")) |eol| {
                         const insert_pos = eol + 1;
                         const hash_line = try std.fmt.allocPrint(alloc, "            .hash = \"{s}\",\n", .{pkg_hash});
@@ -641,6 +705,17 @@ fn cmdInit(alloc: std.mem.Allocator, name: []const u8) !void {
     print("  mer add css           # add Tailwind CSS support\n", .{});
     print("  mer add wasm          # add WebAssembly module\n", .{});
     print("  mer add worker        # add Cloudflare Worker output\n\n", .{});
+}
+
+test "init accepts an explicit pinned merjs dependency URL" {
+    const options = try parseInitOptions(&.{ "starter", "--merjs-url", "git+file:///checkout#0123456789abcdef" });
+    try std.testing.expectEqualStrings("starter", options.name);
+    try std.testing.expectEqualStrings("git+file:///checkout#0123456789abcdef", options.merjs_url);
+    const local = try parseInitOptions(&.{ "starter", "--merjs-path", ".." });
+    try std.testing.expectEqualStrings("..", local.merjs_path.?);
+    try std.testing.expectError(error.MissingMerjsUrl, parseInitOptions(&.{"--merjs-url"}));
+    try std.testing.expectError(error.ConflictingMerjsDependency, parseInitOptions(&.{ "--merjs-url", "https://example.com/repo", "--merjs-path", "/checkout" }));
+    try std.testing.expectError(error.UnknownInitOption, parseInitOptions(&.{"--revision"}));
 }
 
 test "projectNameForZon uses basename for absolute paths" {
@@ -761,8 +836,24 @@ test "CLI child processes inherit configured environment" {
     try map.put("MERJS_ENV_SENTINEL", "ok");
 
     if (builtin.os.tag == .windows) {
-        const synthetic_env: std.process.Environ = .{ .block = try map.createWindowsBlock(alloc, .{}) };
-        defer synthetic_env.block.deinit(alloc);
+        const WindowsEnv = struct {
+            extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) std.os.windows.BOOL;
+        };
+        const key_w = comptime std.unicode.wtf8ToWtf16LeStringLiteral("MERJS_ENV_SENTINEL");
+        const value_w = comptime std.unicode.wtf8ToWtf16LeStringLiteral("ok");
+        const global_env: std.process.Environ = .{ .block = .global };
+        const previous_value = std.process.Environ.getAlloc(global_env, alloc, "MERJS_ENV_SENTINEL") catch |err| switch (err) {
+            error.EnvironmentVariableMissing => null,
+            else => return err,
+        };
+        defer if (previous_value) |value| alloc.free(value);
+        const previous_value_w = if (previous_value) |value| try std.unicode.wtf8ToWtf16LeAllocZ(alloc, value) else null;
+        defer if (previous_value_w) |value| alloc.free(value);
+
+        try std.testing.expect(WindowsEnv.SetEnvironmentVariableW(key_w, value_w).toBool());
+        defer std.debug.assert(WindowsEnv.SetEnvironmentVariableW(key_w, if (previous_value_w) |value| value.ptr else null).toBool());
+
+        const synthetic_env = global_env;
 
         const previous = process_environ;
         process_environ = synthetic_env;
@@ -1869,7 +1960,7 @@ fn cmdAddUiAll() !void {
 fn printUsage() void {
     print("\n  mer -- the merjs CLI (v{s})\n", .{version});
     print("\n  usage:\n", .{});
-    print("    mer init <name>      scaffold a new project\n", .{});
+    print("    mer init <name> [--merjs-url URL | --merjs-path PATH] scaffold with an explicit dependency\n", .{});
     print("    mer dev [--port N]   codegen + dev server with hot reload\n", .{});
     print("    mer build            production build (ReleaseSmall + prerender)\n", .{});
     print("    mer add <feature>    add optional features (css, wasm, worker, ui, native)\n", .{});

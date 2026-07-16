@@ -87,6 +87,14 @@ fn zonUpdateString(comptime zon: anytype, comptime field: []const u8) ?[]const u
     return @field(zon.update, field);
 }
 
+fn zonServerMode(comptime zon: anytype) []const u8 {
+    const T = @TypeOf(zon);
+    if (!@hasField(T, "server")) return "embedded";
+    const ServerT = @TypeOf(zon.server);
+    if (!@hasField(ServerT, "mode")) return "embedded";
+    return zon.server.mode;
+}
+
 fn zonServerHost(comptime zon: anytype) []const u8 {
     const T = @TypeOf(zon);
     if (!@hasField(T, "server")) return "127.0.0.1";
@@ -292,6 +300,7 @@ fn zonHasOpenArray(comptime zon: anytype, comptime field: []const u8) bool {
 
 fn macProdCheckMessage(comptime zon: anytype) []const u8 {
     comptime var msg: []const u8 = "";
+    if (!std.mem.eql(u8, zonServerMode(zon), "embedded")) msg = msg ++ "native production server.mode must be embedded\\n";
     if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
     if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production extra navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
@@ -312,13 +321,6 @@ pub fn build(b: *std.Build) void {
     const dhi_dep = b.dependency("dhi", .{});
     const dhi_model_mod = dhi_dep.module("model");
     const dhi_validator_mod = dhi_dep.module("validator");
-
-    // ── kuri dependency (browser automation for debug mode) ─────────────────
-    // TODO: re-enable once kuri is updated for Zig 0.16
-    // const kuri_dep = b.dependency("kuri", .{
-    //     .target = target,
-    //     .optimize = if (optimize != .Debug) optimize else .ReleaseFast,
-    // });
 
     // ── Runtime module (std.Io instance management) ───────────────────────────
     const runtime_mod = b.addModule("runtime", .{
@@ -386,11 +388,6 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "merjs", .root_module = main_mod });
     b.installArtifact(exe);
 
-    // Install kuri binary alongside merjs.
-    // TODO: re-enable once kuri is updated for Zig 0.16
-    // const install_kuri = b.addInstallArtifact(kuri_dep.artifact("kuri"), .{});
-    // b.getInstallStep().dependOn(&install_kuri.step);
-
     // ── Codegen ──────────────────────────────────────────────────────────────
     const codegen_mod = b.createModule(.{
         .root_source_file = b.path("tools/codegen.zig"),
@@ -450,7 +447,7 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_synth.step);
 
     const grep_wasm = helpers.addWasmExe(b, "grep", "examples/site/wasm/grep.zig", wasm_target);
-    const install_grep = b.addInstallFile(grep_wasm.getEmittedBin(), "../examples/site/worker/grep.wasm");
+    const install_grep = b.addInstallFile(grep_wasm.getEmittedBin(), "../examples/site/worker/worker/grep.wasm");
     b.step("grep", "Compile grep WASM").dependOn(&install_grep.step);
 
     // ── Worker WASM ─────────────────────────────────────────────────────────
@@ -473,15 +470,16 @@ pub fn build(b: *std.Build) void {
     const worker_wasm = b.addExecutable(.{ .name = "merjs", .root_module = worker_mod });
     worker_wasm.rdynamic = true;
     worker_wasm.entry = .disabled;
+    worker_wasm.max_memory = helpers.wasm_max_memory;
     // Auto-run codegen before worker compilation too.
     worker_wasm.step.dependOn(&run_codegen.step);
-    const install_worker = b.addInstallFile(worker_wasm.getEmittedBin(), "../examples/site/worker/merjs.wasm");
+    const install_worker = b.addInstallFile(worker_wasm.getEmittedBin(), "../examples/site/worker/worker/merjs.wasm");
     const worker_step = b.step("worker", "Compile worker WASM for Cloudflare Workers");
     worker_step.dependOn(&install_worker.step);
     worker_step.dependOn(&install_grep.step);
 
     // ── Examples (sgdata, kanban) ────────────────────────────────────────────
-    examples.addExamples(b, mer_mod, wasm_target);
+    examples.addExamples(b, mer_worker_mod, wasm_target);
 
     // ── Tools (CSS, setup) ──────────────────────────────────────────────────
     tools.addTools(b);
@@ -515,18 +513,25 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     // Run inline tests in individual framework source files.
-    for ([_][]const u8{ "src/css.zig", "src/session.zig", "src/telemetry.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
+    for ([_][]const u8{ "src/css.zig", "src/env.zig", "src/fetch.zig", "src/session.zig", "src/telemetry.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
         const file_test_mod = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
+        if (std.mem.eql(u8, src_path, "src/fetch.zig") or std.mem.eql(u8, src_path, "src/telemetry.zig")) {
+            file_test_mod.addImport("runtime", runtime_mod);
+        }
         if (std.mem.eql(u8, src_path, "src/native/bridge.zig") and target.result.os.tag == .macos) {
             file_test_mod.linkFramework("AppKit", .{});
             file_test_mod.linkFramework("Foundation", .{});
         }
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = file_test_mod })).step);
+        const run_file_tests = b.addRunArtifact(b.addTest(.{ .root_module = file_test_mod }));
+        test_step.dependOn(&run_file_tests.step);
+        if (std.mem.eql(u8, src_path, "src/telemetry.zig")) {
+            b.step("test-telemetry", "Run telemetry unit tests").dependOn(&run_file_tests.step);
+        }
     }
     {
         const cli_test_mod = b.createModule(.{
@@ -537,6 +542,16 @@ pub fn build(b: *std.Build) void {
         });
         cli_test_mod.addImport("runtime", runtime_mod);
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli_test_mod })).step);
+    }
+    {
+        const core_api_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        core_api_test_mod.addImport("mer", mer_mod);
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = core_api_test_mod })).step);
     }
     // Run router + runtime inline tests (through mer.zig as root to avoid
     // file-ownership conflict: mer.zig file-imports router.zig/server.zig/etc.,
@@ -558,8 +573,8 @@ pub fn build(b: *std.Build) void {
     // ── Consumer integration test (issue #62, #69) ────────────────────────
     // Simulates a consumer project with its own routes — proves that
     // `mer.Router.fromGenerated` works and framework example routes don't leak in.
-    // With the self-referential mer import, no manual wiring of ssr.zig/router.zig
-    // transitive deps is needed — consumers just use `@import("mer")`.
+    // The self-referential mer import keeps router dependencies internal, so
+    // consumers only need `@import("mer")`.
     {
         const consumer_test_mod = b.createModule(.{
             .root_source_file = b.path("tests/consumer/src/test_consumer_routes.zig"),
@@ -636,7 +651,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Packages ────────────────────────────────────────────────────────────
-    packages.addPackages(b, target, optimize, mer_mod);
+    packages.addPackages(b, target, optimize, mer_mod, test_step);
 
     // ── `zig build desktop-spike` — macOS native app research (#50) ─────────
     if (target.result.os.tag == .macos) {
@@ -662,6 +677,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         desktop_mod.addImport("mer", mer_mod);
+        desktop_mod.addImport("runtime", runtime_mod);
         helpers.addDirModules(b, desktop_mod, mer_mod, "examples/site/app", "app", site_extras);
         helpers.addDirModules(b, desktop_mod, mer_mod, "examples/site/api", "api", &.{});
         helpers.addRoutesModule(b, desktop_mod, mer_mod, "src/generated/routes.zig", "examples/site/app", "examples/site/api", site_extras);
@@ -926,4 +942,46 @@ pub fn build(b: *std.Build) void {
         const native_prod_release_step = b.step("native-prod-release", "Validate, sign, notarize, and staple the macOS native app");
         native_prod_release_step.dependOn(package_notarize_step);
     }
+}
+
+test "native production manifest gate accepts a complete embedded graph" {
+    const zon = .{
+        .server = .{ .mode = "embedded", .host = "127.0.0.1" },
+        .security = .{
+            .navigation = .{ .allowed_origins = .{} },
+            .bridge = .{ .allowed_commands = .{"mer.ping"}, .command_origins = .{"mer.ping|http://127.0.0.1"} },
+            .open = .{ .external_schemes = .{"https"}, .path_roots = .{"public"} },
+        },
+        .update = .{
+            .provider = "github-releases",
+            .feed_url = "https://updates.example.com/feed.json",
+            .public_key = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        },
+    };
+    try std.testing.expectEqualStrings("", comptime macProdCheckMessage(zon));
+}
+
+test "native production manifest gate rejects every unsafe graph branch" {
+    const zon = .{
+        .server = .{ .mode = "dev", .host = "0.0.0.0" },
+        .security = .{
+            .navigation = .{ .allowed_origins = .{"http://localhost:3000"} },
+            .bridge = .{ .allowed_commands = .{}, .command_origins = .{} },
+            .open = .{ .external_schemes = .{}, .path_roots = .{} },
+        },
+        .update = .{ .provider = "other", .feed_url = "http://example.com/feed.json", .public_key = "bad" },
+    };
+    const message = comptime macProdCheckMessage(zon);
+    inline for (.{
+        "server.mode must be embedded",
+        "server.host must be loopback",
+        "navigation origins must not include loopback",
+        "allowed_commands",
+        "command_origins",
+        "external_schemes",
+        "path_roots",
+        "invalid .update.provider",
+        "invalid .update.feed_url",
+        "invalid .update.public_key",
+    }) |finding| try std.testing.expect(std.mem.indexOf(u8, message, finding) != null);
 }

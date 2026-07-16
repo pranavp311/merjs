@@ -27,6 +27,7 @@ const ServerCtx = struct {
     router: *const mer.Router,
     manifest: manifest_mod.Manifest,
     ready: mer.ServerReady = .{},
+    stop: mer.ServerStop = .{},
     watcher: ?*mer.Watcher = null,
     static_dir: ?[]const u8 = null,
     raw_handler: ?*const mer.RawHandler = null,
@@ -38,6 +39,7 @@ fn runServer(ctx: *ServerCtx) void {
         .port = ctx.manifest.port,
         .dev = ctx.manifest.dev,
         .ready = &ctx.ready,
+        .stop = &ctx.stop,
         .static_dir = ctx.static_dir,
         .raw_handler = ctx.raw_handler,
     }, ctx.router, if (ctx.manifest.dev) ctx.watcher else null);
@@ -45,6 +47,13 @@ fn runServer(ctx: *ServerCtx) void {
         log.err("server listen failed: {}", .{err});
         ctx.ready.set(); // unblock the main thread even on failure
     };
+}
+
+fn wakeServer(host: []const u8, port: u16) void {
+    if (port == 0) return;
+    const address = std.Io.net.IpAddress.parse(host, port) catch return;
+    const stream = address.connect(runtime.io, .{ .mode = .stream }) catch return;
+    stream.close(runtime.io);
 }
 
 fn createBridgeToken(allocator: std.mem.Allocator) ![]u8 {
@@ -69,22 +78,25 @@ fn isSafeRelativeStaticDir(path: []const u8) bool {
     return last.len > 0 and !std.mem.eql(u8, last, ".") and !std.mem.eql(u8, last, "..");
 }
 
-fn resolvePackagedStaticDir(allocator: std.mem.Allocator, configured_static_dir: ?[]const u8) !?[]const u8 {
-    if (builtin.os.tag != .macos) return configured_static_dir;
+fn resolvePackagedStaticDir(allocator: std.mem.Allocator, configured_static_dir: ?[]const u8) !?[]u8 {
+    if (builtin.os.tag != .macos) return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
     const relative = configured_static_dir orelse "public";
-    if (!isSafeRelativeStaticDir(relative)) return "__mer_invalid_static_dir__";
-    const exe_path = std.process.executablePathAlloc(runtime.io, allocator) catch return configured_static_dir;
+    if (!isSafeRelativeStaticDir(relative)) return try allocator.dupe(u8, "__mer_invalid_static_dir__");
+    const exe_path = std.process.executablePathAlloc(runtime.io, allocator) catch
+        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
     defer allocator.free(exe_path);
-    const macos_dir = std.fs.path.dirname(exe_path) orelse return configured_static_dir;
-    const contents_dir = std.fs.path.dirname(macos_dir) orelse return configured_static_dir;
+    const macos_dir = std.fs.path.dirname(exe_path) orelse
+        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
+    const contents_dir = std.fs.path.dirname(macos_dir) orelse
+        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
     const app_dir = std.fs.path.dirname(contents_dir);
     const is_packaged_app = std.mem.eql(u8, std.fs.path.basename(contents_dir), "Contents") and
         app_dir != null and std.mem.endsWith(u8, app_dir.?, ".app");
     const candidate = try std.fs.path.join(allocator, &.{ contents_dir, "Resources", relative });
-    errdefer allocator.free(candidate);
     std.Io.Dir.cwd().access(runtime.io, candidate, .{}) catch {
-        if (is_packaged_app) return "__mer_missing_packaged_static_dir__";
-        return configured_static_dir;
+        allocator.free(candidate);
+        if (is_packaged_app) return try allocator.dupe(u8, "__mer_missing_packaged_static_dir__");
+        return if (configured_static_dir) |dir| try allocator.dupe(u8, dir) else null;
     };
     return candidate;
 }
@@ -116,6 +128,8 @@ pub fn run(
     // std.Io runtime must be initialized before Server.listen touches runtime.io.
     try runtime.init(allocator);
     defer runtime.deinit();
+    mer.telemetry.init();
+    defer mer.telemetry.deinit();
 
     if (!std.mem.eql(u8, app_manifest.web_engine, "system")) {
         log.err("web_engine='{s}' is not supported in this release (use \"system\")", .{app_manifest.web_engine});
@@ -131,35 +145,40 @@ pub fn run(
 
     // Dev mode: start the file watcher so hot-reload SSE works in the window.
     var watcher: ?mer.Watcher = null;
-    var watcher_ref: ?*mer.Watcher = null;
+    defer if (watcher) |*w| w.deinit();
+    var watcher_thread: ?std.Thread = null;
+    var watcher_joined = false;
+    defer if (!watcher_joined) {
+        if (watcher) |*w| w.stop();
+        if (watcher_thread) |thread| thread.join();
+    };
     if (app_manifest.dev) {
         watcher = mer.Watcher.init(allocator, app_manifest.watch_dir);
-        watcher_ref = &watcher.?;
-        const wt = try std.Thread.spawn(.{}, mer.Watcher.run, .{&watcher.?});
-        wt.detach();
+        watcher_thread = try std.Thread.spawn(.{}, mer.Watcher.run, .{&watcher.?});
         log.info("hot reload active — watching {s}/", .{app_manifest.watch_dir});
     }
-    defer if (watcher) |*w| w.deinit();
 
-    // Spawn HTTP server on a background thread (AppKit requires the main thread).
-    // The server/watcher are detached for this macOS-first shell. Closing the
-    // last window terminates the process through AppKit; cooperative shutdown
-    // can replace this once Server.listen has a stop signal.
-    // Runtime-owned allocations below intentionally outlive the blocking AppKit
-    // loop; replace them with an owning shell object when cooperative shutdown
-    // and multi-window lifetimes land.
+    // AppKit requires the main thread. The shell retains ownership of both
+    // background threads and joins them before any borrowed state is released.
     const effective_static_dir = try resolvePackagedStaticDir(allocator, app_manifest.static_dir);
-    const ctx = try allocator.create(ServerCtx);
-    ctx.* = .{
+    defer if (effective_static_dir) |dir| allocator.free(dir);
+    var ctx = ServerCtx{
         .allocator = allocator,
         .router = router,
         .manifest = app_manifest,
-        .watcher = watcher_ref,
+        .watcher = if (watcher) |*w| w else null,
         .static_dir = effective_static_dir,
         .raw_handler = opts.raw_handler,
     };
-    const thread = try std.Thread.spawn(.{}, runServer, .{ctx});
-    thread.detach();
+    const server_thread = try std.Thread.spawn(.{}, runServer, .{&ctx});
+    defer {
+        if (watcher) |*w| w.stop();
+        if (watcher_thread) |thread| thread.join();
+        watcher_joined = true;
+        ctx.stop.request();
+        wakeServer(ctx.manifest.host, ctx.ready.port);
+        server_thread.join();
+    }
 
     // Block until the server is bound and ready.
     ctx.ready.wait();
@@ -172,15 +191,19 @@ pub fn run(
     const url_z = try std.fmt.bufPrintZ(&url_buf, "http://{s}:{d}/", .{ app_manifest.host, port });
 
     const runtime_origin = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ app_manifest.host, port });
+    defer allocator.free(runtime_origin);
     const allowed_origins = try allocator.alloc([]const u8, app_manifest.security.allowed_origins.len + 1);
+    defer allocator.free(allowed_origins);
     allowed_origins[0] = runtime_origin;
     @memcpy(allowed_origins[1..], app_manifest.security.allowed_origins);
 
     // Bridge context (heap-allocated; outlives the blocking event loop). The
     // ObjC IMP reaches it via the macos backend's g_bridge_ctx global.
     const token = try createBridgeToken(allocator);
+    defer allocator.free(token);
     if (!bridge.isValidBridgeToken(token)) return error.InvalidBridgeToken;
     const bctx = try allocator.create(bridge.Ctx);
+    defer allocator.destroy(bctx);
     bctx.* = .{
         .allocator = allocator,
         .permissions = app_manifest.permissions,

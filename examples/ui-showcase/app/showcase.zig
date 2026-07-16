@@ -14,13 +14,13 @@ pub const meta: mer.Meta = .{
 
 pub fn render(req: mer.Request) mer.Response {
     _ = req;
-    
+
     return mer.html(
         h.div(.{ .class = "max-w-4xl mx-auto p-8 space-y-12" }, &.{
             // Header
             h.h1(.{ .class = "text-4xl font-bold mb-4" }, "merlion-ui Showcase"),
             h.p(.{ .class = "text-slate-600 mb-8" }, "Beautiful, copy-pasteable UI components for merlionjs. Like shadcn/ui, but for Zig."),
-            
+
             // Button Section
             h.section(.{ .class = "space-y-4" }, &.{
                 h.h2(.{ .class = "text-2xl font-semibold" }, "Buttons"),
@@ -33,7 +33,7 @@ pub fn render(req: mer.Request) mer.Response {
                     Button.render(.{ .label = "Link", .variant = .link }),
                 }),
             }),
-            
+
             // Card Section
             h.section(.{ .class = "space-y-4" }, &.{
                 h.h2(.{ .class = "text-2xl font-semibold" }, "Cards"),
@@ -44,7 +44,7 @@ pub fn render(req: mer.Request) mer.Response {
                     },
                 }),
             }),
-            
+
             // Input Section
             h.section(.{ .class = "space-y-4" }, &.{
                 h.h2(.{ .class = "text-2xl font-semibold" }, "Inputs"),
@@ -53,7 +53,7 @@ pub fn render(req: mer.Request) mer.Response {
                     Input.render(.{ .name = "password", .type = .password, .label = "Password", .placeholder = "••••••••" }),
                 }),
             }),
-            
+
             // Badge Section
             h.section(.{ .class = "space-y-4" }, &.{
                 h.h2(.{ .class = "text-2xl font-semibold" }, "Badges"),
@@ -64,7 +64,7 @@ pub fn render(req: mer.Request) mer.Response {
                     Badge.render(.{ .label = "Outline", .variant = .outline }),
                 }),
             }),
-            
+
             // Alert Section
             h.section(.{ .class = "space-y-4" }, &.{
                 h.h2(.{ .class = "text-2xl font-semibold" }, "Alerts"),

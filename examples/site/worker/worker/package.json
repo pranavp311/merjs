@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check worker.js && node --check ai-budget.js"
+  }
+}

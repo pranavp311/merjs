@@ -16,16 +16,17 @@
     .capabilities = .{ "webview", "js_bridge" },
     .permissions = .{ "window", "clipboard", "dialog", "open" },
     .security = .{
-        .navigation = .{ .allowed_origins = .{ "mer://app" } },
+        .navigation = .{ .allowed_origins = .{"mer://app"} },
         .bridge = .{
             // Tauri-style least privilege: commands must be explicitly listed
             // here and still pass their permission class below.
             .allowed_commands = .{
-                "mer.ping", "mer.echo",
-                "clipboard.read", "clipboard.write",
-                "dialog.openFile", "dialog.pickDirectory", "dialog.openDirectory",
-                "open.external", "open.path",
-                "window.setTitle", "window.close",
+                "mer.ping",             "mer.echo",
+                "clipboard.read",       "clipboard.write",
+                "dialog.openFile",      "dialog.pickDirectory",
+                "dialog.openDirectory", "open.external",
+                "open.path",            "window.setTitle",
+                "window.close",
             },
             .command_origins = .{
                 "mer.ping|http://127.0.0.1",
@@ -43,7 +44,7 @@
         },
         .open = .{
             .external_schemes = .{ "http", "https", "mailto" },
-            .path_roots = .{ "public" },
+            .path_roots = .{"public"},
         },
     },
     .macos = .{

@@ -115,6 +115,7 @@ of `mer.app.zon`.
 
 This fails if the manifest is missing or misconfigures:
 
+- native `.server.mode = "embedded"` (development/hot-reload mode cannot ship)
 - native `.server.host` loopback IP-literal binding (`127.0.0.1` recommended; `localhost` is intentionally rejected)
 - `.macos.signing_identity`
 - `.macos.notarization_profile`

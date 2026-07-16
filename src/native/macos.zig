@@ -189,7 +189,8 @@ var g_nav_delegate: Id = null;
 /// posts from foreign frames or ad-hoc WebKit messages fail token verification
 /// before any command handler is considered.
 fn makeMerShim(alloc: std.mem.Allocator, token: []const u8) ![:0]u8 {
-    const shim = try std.fmt.allocPrint(alloc,
+    const shim = try std.fmt.allocPrint(
+        alloc,
         "(function(){{" ++
             "if(window.mer)return;" ++
             "var cb={{}},idc=0,t='{s}';" ++
@@ -430,7 +431,6 @@ fn setupBridge(webview: Id, ctx: *bridge.Ctx) void {
     const name_z = std.fmt.bufPrintZ(&name_buf, "merInvoke", .{}) catch return;
     const ns_name = sendStr(cls("NSString"), sel("stringWithUTF8String:"), name_z.ptr);
     send2v(ucc, sel("addScriptMessageHandler:name:"), handler, ns_name);
-
 }
 
 /// Open a native window hosting a WKWebView pointed at `url_z`. Blocks on the

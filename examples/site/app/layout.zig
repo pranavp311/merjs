@@ -169,7 +169,10 @@ pub fn streamWrap(allocator: std.mem.Allocator, path: []const u8, meta: mer.Meta
         \\  <meta charset="UTF-8">
         \\  <meta name="viewport" content="width=device-width, initial-scale=1.0">
         \\
-    ) catch return .{ .head = "", .tail = "" };
+    ) catch {
+        head_buf.deinit();
+        return .{ .head = "", .tail = "" };
+    };
 
     hw.print("  <title>{s} — merjs</title>\n", .{title}) catch {};
     hw.print("  <meta name=\"description\" content=\"{s}\">\n", .{desc}) catch {};
@@ -253,5 +256,5 @@ pub fn streamWrap(allocator: std.mem.Allocator, path: []const u8, meta: mer.Meta
 
     const tail = footer_tail;
 
-    return .{ .head = head_buf.written(), .tail = tail };
+    return .{ .head = head_buf.written(), .tail = tail, .head_allocator = allocator };
 }

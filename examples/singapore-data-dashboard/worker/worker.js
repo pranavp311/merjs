@@ -3,22 +3,22 @@
 // This worker handles dynamic routes via the merjs WASM module.
 
 import merWasm from "./merjs.wasm";
+import { AiAdmissionError, authorizePaidOperation, createAiAdmission } from "./ai-budget.js";
 
-let instance = null;
+const merModule = Promise.resolve(merWasm).then(source =>
+  source instanceof WebAssembly.Module ? source : WebAssembly.compile(source));
 
-async function getInstance() {
-  if (instance) return instance;
-  const mod = await WebAssembly.instantiate(merWasm, {
-    env: { memory: new WebAssembly.Memory({ initial: 256 }) },
-  });
-  instance = mod.exports || mod;
-  instance.init();
-  return instance;
+async function createInstance() {
+  const instantiated = await WebAssembly.instantiate(await merModule, {});
+  const wasm = instantiated.exports || instantiated;
+  wasm.init();
+  return wasm;
 }
 
+// Explicit application policy for this dashboard's inline UI, maps, fonts, and APIs.
 const securityHeaders = {
   "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
-  "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://*.basemaps.cartocdn.com https://*.tile.openstreetmap.org; connect-src 'self' https://api.open-meteo.com https://api-open.data.gov.sg https://cloudflareinsights.com https://cdn.jsdelivr.net https://unpkg.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://*.basemaps.cartocdn.com https://*.tile.openstreetmap.org; connect-src 'self' https://api.open-meteo.com https://api-open.data.gov.sg https://cloudflareinsights.com https://cdn.jsdelivr.net https://unpkg.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
   "x-frame-options": "DENY",
   "x-content-type-options": "nosniff",
   "referrer-policy": "strict-origin-when-cross-origin",
@@ -26,44 +26,139 @@ const securityHeaders = {
   "permissions-policy": "camera=(), microphone=(), geolocation=()",
 };
 
-// Track whether env bindings have been injected into the WASM module.
-let envInjected = false;
-
 function injectEnv(wasm, env) {
-  if (envInjected || !wasm.__mer_set_env) return;
-  envInjected = true;
+  if (!wasm.__mer_set_env_status) {
+    throw new Error("WASM module does not expose observable environment injection");
+  }
   const enc = new TextEncoder();
   for (const [key, val] of Object.entries(env)) {
     if (typeof val !== "string") continue;
     const kb = enc.encode(key);
     const vb = enc.encode(val);
-    const kp = wasm.alloc(kb.length);
-    const vp = wasm.alloc(vb.length);
-    if (!kp || !vp) continue;
-    const mem = new Uint8Array(wasm.memory.buffer);
-    mem.set(kb, kp);
-    mem.set(vb, vp);
-    wasm.__mer_set_env(kp, kb.length, vp, vb.length);
-    // Originals freed here — Zig already copied into its string_buf.
-    wasm.dealloc(kp, kb.length);
-    wasm.dealloc(vp, vb.length);
+    const kp = kb.length === 0 ? 0 : wasm.alloc(kb.length);
+    const vp = vb.length === 0 ? 0 : wasm.alloc(vb.length);
+    try {
+      if ((kb.length !== 0 && !kp) || (vb.length !== 0 && !vp))
+        throw new Error(`WASM env allocation failed for ${key}`);
+      const mem = new Uint8Array(wasm.memory.buffer);
+      mem.set(kb, kp);
+      mem.set(vb, vp);
+      const status = wasm.__mer_set_env_status(kp, kb.length, vp, vb.length);
+      if (status !== 0) throw new Error(`WASM env injection failed for ${key}: ${status}`);
+    } finally {
+      if (kb.length !== 0 && kp) wasm.dealloc(kp, kb.length);
+      if (vb.length !== 0 && vp) wasm.dealloc(vp, vb.length);
+    }
   }
+}
+
+const resolverScript = "(()=>{for(const s of document.querySelectorAll('template[data-mer-resolve]')){for(const p of document.querySelectorAll('[data-mer-placeholder]')){if(p.getAttribute('data-mer-placeholder')===s.getAttribute('data-mer-resolve')){p.replaceWith(s.content);s.remove();break}}}})();";
+const forwardedHeaders = ["accept", "authorization", "content-type", "origin", "referer", "user-agent"];
+
+async function encodeIncomingRequest(request, url) {
+  const encoder = new TextEncoder();
+  const parts = [encoder.encode(request.method), encoder.encode(url.pathname + url.search)];
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > 1024 * 1024) throw new Error("request body too large");
+  parts.push(request.method === "GET" || request.method === "HEAD" ? new Uint8Array() : new Uint8Array(await request.arrayBuffer()));
+  parts.push(encoder.encode(request.headers.get("cookie") || ""));
+  parts.push(encoder.encode(request.headers.get("cf-connecting-ip") || ""));
+  const headers = forwardedHeaders.flatMap(name => {
+    const value = request.headers.get(name);
+    return value === null ? [] : [[encoder.encode(name), encoder.encode(value)]];
+  });
+  const headerBytes = headers.reduce((sum, [name, value]) => sum + 8 + name.length + value.length, 0);
+  const total = 24 + parts.reduce((sum, part) => sum + part.length, 0) + headerBytes;
+  if (!parts[0].length || parts[0].length > 16 || !parts[1].length || parts[1].length > 16 * 1024 ||
+      parts[2].length > 1024 * 1024 || parts[3].length > 16 * 1024 || parts[4].length > 256 ||
+      headerBytes > 64 * 1024 || total > 2 * 1024 * 1024)
+    throw new Error("request metadata too large");
+  const encoded = new Uint8Array(total);
+  const view = new DataView(encoded.buffer);
+  parts.forEach((part, index) => view.setUint32(index * 4, part.length, true));
+  view.setUint32(20, headers.length, true);
+  let offset = 24;
+  for (const part of parts) { encoded.set(part, offset); offset += part.length; }
+  for (const [name, value] of headers) {
+    view.setUint32(offset, name.length, true); view.setUint32(offset + 4, value.length, true); offset += 8;
+    encoded.set(name, offset); offset += name.length; encoded.set(value, offset); offset += value.length;
+  }
+  return encoded;
 }
 
 // ── AI route handlers (JS-native — wasm32 can't do process/fs/network) ────────
 
-async function handleAi(request, env) {
+const AI_MAX_CONCURRENCY = 2;
+const AI_MAX_PER_MINUTE = 10;
+let aiActive = 0;
+let aiMinute = 0;
+let aiMinuteCount = 0;
+
+async function admitAi(request, env, work) {
+  if (!env.AI_BEARER_TOKEN)
+    return jsonResp({ error: "AI controls are not configured" }, 503);
+  if (request.headers.get("authorization") !== `Bearer ${env.AI_BEARER_TOKEN}`)
+    return jsonResp({ error: "Unauthorized" }, 401);
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (!Number.isFinite(contentLength) || contentLength > 8192)
+    return jsonResp({ error: "AI request too large" }, 413);
+  let admission;
+  try { admission = createAiAdmission(request, env); }
+  catch (error) {
+    return jsonResp({ error: error.message }, error instanceof AiAdmissionError ? error.status : 503);
+  }
+  const minute = Math.floor(Date.now() / 60000);
+  if (minute !== aiMinute) { aiMinute = minute; aiMinuteCount = 0; }
+  // These isolate-local limits are defense-in-depth only; the shared gate is authoritative.
+  if (aiActive >= AI_MAX_CONCURRENCY || aiMinuteCount >= AI_MAX_PER_MINUTE)
+    return jsonResp({ error: "AI capacity exceeded" }, 429);
+  aiActive++;
+  aiMinuteCount++;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try { return await work(controller.signal, admission); }
+  catch (error) {
+    if (error instanceof AiAdmissionError) return jsonResp({ error: error.message }, error.status);
+    return jsonResp({ error: "AI upstream unavailable" }, 502);
+  } finally { clearTimeout(timeout); aiActive--; }
+}
+
+async function readAiJson(request) {
+  if (!request.body) throw new Error("missing body");
+  const reader = request.body.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > 8192 - length) {
+        await reader.cancel("body too large");
+        throw new Error("body too large");
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+}
+
+async function handleAi(request, env, signal, admission) {
   let body;
-  try { body = await request.json(); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+  try { body = await readAiJson(request); } catch { return jsonResp({ error: "Invalid or oversized JSON" }, 400); }
   const question = body?.question;
-  if (!question) return jsonResp({ error: "question required" }, 400);
+  if (typeof question !== "string" || !question.trim() || question.length > 512)
+    return jsonResp({ error: "question must be 1-512 characters" }, 400);
 
   const openaiKey = env.OPENAI_API_KEY;
   const emergentKey = env.EMERGENT_API_KEY;
-  if (!openaiKey) return jsonResp({ error: "OPENAI_API_KEY not set" });
-  if (!emergentKey) return jsonResp({ error: "EMERGENT_API_KEY not set" });
+  if (!openaiKey || !emergentKey) return jsonResp({ error: "AI upstream is not configured" }, 503);
   // Step 1: Reformulate question into keyword search query (improves retrieval)
   let searchQuery = question;
+  await authorizePaidOperation(env, admission, "openai.reform", 0.001, signal);
   try {
     const reformRes = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -74,6 +169,7 @@ async function handleAi(request, env) {
         input: question,
         max_output_tokens: 30,
       }),
+      signal,
     });
     const reformData = await reformRes.json();
     for (const out of reformData?.output ?? []) {
@@ -84,10 +180,12 @@ async function handleAi(request, env) {
   } catch { /* fall back to raw question */ }
 
   // Step 2: Embed search query
+  await authorizePaidOperation(env, admission, "openai.embedding", 0.001, signal);
   const embedRes = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openaiKey}` },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: searchQuery }),
+    body: JSON.stringify({ model: "text-embedding-3-small", input: searchQuery.slice(0, 512) }),
+    signal,
   });
   const embedData = await embedRes.json();
   const embedding = embedData?.data?.[0]?.embedding;
@@ -95,6 +193,7 @@ async function handleAi(request, env) {
 
 
   // Step 2: Search EmergentDB
+  await authorizePaidOperation(env, admission, "emergentdb.search", 0.003, signal);
   const searchRes = await fetch("https://api.emergentdb.com/vectors/search", {
     method: "POST",
     headers: {
@@ -102,7 +201,8 @@ async function handleAi(request, env) {
       "Authorization": `Bearer ${emergentKey}`,
       "User-Agent": "EmergentDB-Ingest/1.0",
     },
-    body: JSON.stringify({ vector: embedding, k: 10, namespace: "budget2026v2", include_metadata: true }),
+    body: JSON.stringify({ vector: embedding, k: 6, namespace: "budget2026v2", include_metadata: true }),
+    signal,
   });
   const searchText = await searchRes.text();
   let searchData;
@@ -117,8 +217,9 @@ async function handleAi(request, env) {
   for (const r of results) {
     const chunk = r.metadata?.text || r.metadata?.title || "";
     if (!chunk) continue;
-    if (context) context += "\n\n---\n\n";
-    context += chunk;
+    const separator = context ? "\n\n---\n\n" : "";
+    context += separator + chunk.slice(0, Math.max(0, 12000 - context.length - separator.length));
+    if (context.length >= 12000) break;
   }
 
 
@@ -134,10 +235,12 @@ async function handleAi(request, env) {
     ? `Context from FY2026 Budget Statement:\n${context}\n\nQuestion: ${question}`
     : `No relevant document context was found for this question.\n\nQuestion: ${question}`;
 
+  await authorizePaidOperation(env, admission, "openai.answer", 0.015, signal);
   const chatRes = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openaiKey}` },
-    body: JSON.stringify({ model: "gpt-5-nano", instructions: systemPrompt, input: userMsg, max_output_tokens: 128000 }),
+    body: JSON.stringify({ model: "gpt-5-nano", instructions: systemPrompt, input: userMsg.slice(0, 13000), max_output_tokens: 1024 }),
+    signal,
   });
   const chatData = await chatRes.json();
 
@@ -150,23 +253,25 @@ async function handleAi(request, env) {
     if (answer) break;
   }
 
-  if (!answer) return jsonResp({ error: "No answer from AI", raw: chatData });
-  return jsonResp({ answer, searches_performed: 1 });
+  if (!answer) return jsonResp({ error: "No answer from AI" }, 502);
+  return jsonResp({ answer: answer.slice(0, 8000), searches_performed: 1 });
 }
 
-async function handleSuggestions(request, env) {
+async function handleSuggestions(request, env, signal, admission) {
   let body;
-  try { body = await request.json(); } catch { return jsonResp({ suggestions: [] }); }
+  try { body = await readAiJson(request); } catch { return jsonResp({ error: "Invalid or oversized JSON" }, 400); }
   const { question, answer = "" } = body ?? {};
-  if (!question) return jsonResp({ suggestions: [] });
+  if (typeof question !== "string" || !question.trim() || question.length > 512 || typeof answer !== "string" || answer.length > 2000)
+    return jsonResp({ error: "invalid suggestion input" }, 400);
 
   const openaiKey = env.OPENAI_API_KEY;
-  if (!openaiKey) return jsonResp({ suggestions: [] });
+  if (!openaiKey) return jsonResp({ error: "AI upstream is not configured" }, 503);
 
   const prompt = answer
     ? `A user asked about Singapore's FY2026 Budget: "${question}"\nThe answer was: "${answer.slice(0, 400)}"\n\nGenerate exactly 3 short follow-up questions they might want to ask next. Each question should be concise (under 12 words) and explore a different aspect. Return ONLY a raw JSON array of 3 strings — no markdown, no explanation. Example format: ["Question one?","Question two?","Question three?"]`
     : `A user is asking about Singapore's FY2026 Budget: "${question}"\n\nGenerate exactly 3 short follow-up questions they might want to explore next. Each question should be concise (under 12 words) and cover a different related aspect. Return ONLY a raw JSON array of 3 strings — no markdown, no explanation. Example format: ["Question one?","Question two?","Question three?"]`;
 
+  await authorizePaidOperation(env, admission, "openai.suggestions", 0.002, signal);
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openaiKey}` },
@@ -174,8 +279,9 @@ async function handleSuggestions(request, env) {
       model: "gpt-5-nano",
       instructions: "You generate follow-up questions. Return only a JSON array of strings.",
       input: prompt,
-      max_output_tokens: 1024,
+      max_output_tokens: 256,
     }),
+    signal,
   });
   const data = await res.json();
 
@@ -193,64 +299,137 @@ async function handleSuggestions(request, env) {
   const end = text.lastIndexOf("]");
   if (start === -1 || end <= start) return jsonResp({ suggestions: [] });
   try {
-    return jsonResp({ suggestions: JSON.parse(text.slice(start, end + 1)) });
+    const suggestions = JSON.parse(text.slice(start, end + 1));
+    if (!Array.isArray(suggestions)) throw new Error("invalid suggestions");
+    return jsonResp({ suggestions: suggestions.slice(0, 3).filter(value => typeof value === "string").map(value => value.slice(0, 100)) });
   } catch {
     return jsonResp({ suggestions: [] });
   }
 }
 
+function workerResponse(body, init = {}) {
+  const headers = new Headers(securityHeaders);
+  if (Array.isArray(init.headers)) {
+    for (const [name, value] of init.headers) headers.append(name, value);
+  } else {
+    new Headers(init.headers || {}).forEach((value, name) => headers.append(name, value));
+  }
+  return new Response(body, { ...init, headers });
+}
+
+const RESPONSE_MAGIC = 0x3152454d;
+const RESPONSE_VERSION = 1;
+const MAX_RESPONSE_HEADERS = 10;
+const MAX_RESPONSE_HEADER_NAME_BYTES = 64;
+const MAX_RESPONSE_HEADER_VALUE_BYTES = 4096;
+const MAX_RESPONSE_HEADER_BYTES = 32 * 1024;
+const headerNamePattern = /^[!#$%&'*+.^_`|~0-9a-z-]+$/;
+
+function decodeWorkerResponse(bytes, decoder) {
+  if (bytes.byteLength < 16 || bytes.byteLength > 32 * 1024 * 1024) throw new Error("invalid WASM response size");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(0, true) !== RESPONSE_MAGIC || view.getUint16(4, true) !== RESPONSE_VERSION || view.getUint16(10, true) !== 0)
+    throw new Error("unsupported WASM response protocol");
+  const status = view.getUint16(6, true);
+  const count = view.getUint16(8, true);
+  const bodyLength = view.getUint32(12, true);
+  if (status < 100 || status > 599 || count === 0 || count > MAX_RESPONSE_HEADERS) throw new Error("invalid WASM response metadata");
+  const headers = [];  let offset = 16;
+  let contentTypes = 0;
+  let locations = 0;
+  for (let i = 0; i < count; i++) {
+    if (offset + 6 > bytes.byteLength) throw new Error("truncated WASM response header");
+    const nameLength = view.getUint16(offset, true);
+    const valueLength = view.getUint32(offset + 2, true);
+    offset += 6;
+    if (!nameLength || nameLength > MAX_RESPONSE_HEADER_NAME_BYTES || valueLength > MAX_RESPONSE_HEADER_VALUE_BYTES ||
+        offset + nameLength + valueLength > bytes.byteLength || offset + nameLength + valueLength - 16 > MAX_RESPONSE_HEADER_BYTES)
+      throw new Error("invalid WASM response header length");
+    const name = decoder.decode(bytes.subarray(offset, offset + nameLength));
+    offset += nameLength;
+    const value = decoder.decode(bytes.subarray(offset, offset + valueLength));
+    offset += valueLength;
+    if (!headerNamePattern.test(name) || /[\0\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value) ||
+        (name !== "content-type" && name !== "location" && name !== "set-cookie")) throw new Error("invalid WASM response header");
+    if (name === "content-type") contentTypes++;
+    if (name === "location") locations++;
+    headers.push([name, value]);  }
+  if (contentTypes !== 1 || locations > 1 || offset + bodyLength !== bytes.byteLength ||
+      (locations === 1) !== (status >= 300 && status < 400)) throw new Error("inconsistent WASM response metadata");
+  return { status, headers, body: bytes.slice(offset) };
+}
+
+function resolverResponse(request) {
+  return workerResponse(request.method === "HEAD" ? null : resolverScript, {
+    headers: { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=3600" },
+  });
+}
+
 function jsonResp(data, status = 200) {
-  return new Response(JSON.stringify(data), {
+  return workerResponse(JSON.stringify(data), {
     status,
     headers: { "content-type": "application/json" },
   });
 }
 
-export default {
-  async fetch(request, env, _ctx) {
+async function handleRequest(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/_mer/resolve.js" && (request.method === "GET" || request.method === "HEAD"))
+      return resolverResponse(request);
 
     // Handle AI routes in JS — wasm32-freestanding can't use process/fs/network
     if (url.pathname === "/api/ai" && request.method === "POST")
-      return handleAi(request, env);
+      return admitAi(request, env, (signal, admission) => handleAi(request, env, signal, admission));
     if (url.pathname === "/api/suggestions" && request.method === "POST")
-      return handleSuggestions(request, env);
+      return admitAi(request, env, (signal, admission) => handleSuggestions(request, env, signal, admission));
 
-    const wasm = await getInstance();
+    let wasm;
+    try {
+      // Mutable router, environment, and response state is isolated per request.
+      wasm = await createInstance();
+      injectEnv(wasm, env);
+    } catch (_) {
+      return workerResponse("WASM initialization failed", { status: 500 });
+    }
 
-    // Inject Cloudflare secret bindings into the Zig env table once per cold start.
-    injectEnv(wasm, env);
-
-    const input = `${request.method} ${url.pathname}`;
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-    const encoded = encoder.encode(input);
-
-    // Allocate memory in WASM and write the request.
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let encoded;
+    try {
+      encoded = await encodeIncomingRequest(request, url);
+    } catch (_) {
+      return workerResponse("Request Too Large", { status: 413 });
+    }
     const ptr = wasm.alloc(encoded.length);
-    if (!ptr) return new Response("WASM alloc failed", { status: 500 });
+    if (!ptr) return workerResponse("WASM alloc failed", { status: 500 });
 
-    const mem = new Uint8Array(wasm.memory.buffer);
-    mem.set(encoded, ptr);
+    let resPtr;
+    try {
+      new Uint8Array(wasm.memory.buffer).set(encoded, ptr);
+      resPtr = wasm.handle(ptr, encoded.length);
+    } catch (_) {
+      return workerResponse("Internal Server Error", { status: 500 });
+    } finally {
+      wasm.dealloc(ptr, encoded.length);
+    }
+    if (!resPtr) return workerResponse("Not Found", { status: 404 });
 
-    // Call handle and read the response.
-    const resPtr = wasm.handle(ptr, encoded.length);
-    wasm.dealloc(ptr, encoded.length);
+    try {
+      const resLen = wasm.response_len();
+      const decoded = decodeWorkerResponse(new Uint8Array(wasm.memory.buffer, resPtr, resLen), decoder);
+      return workerResponse(decoded.body, decoded);
+    } catch (_) {
+      return workerResponse("Internal Server Error", { status: 500 });
+    } finally {
+      wasm.response_done();
+    }
+}
 
-    if (!resPtr) return new Response("Not Found", { status: 404 });
-
-    const resLen = wasm.response_len();
-    const resBuf = new Uint8Array(wasm.memory.buffer, resPtr, resLen);
-
-    // Decode: u16 status LE | u16 ct_len LE | content-type | body
-    const status = resBuf[0] | (resBuf[1] << 8);
-    const ctLen = resBuf[2] | (resBuf[3] << 8);
-    const contentType = decoder.decode(resBuf.slice(4, 4 + ctLen));
-    const body = resBuf.slice(4 + ctLen);
-
-    return new Response(body, {
-      status,
-      headers: { "content-type": contentType, ...securityHeaders },
-    });
+export default {
+  async fetch(request, env, _ctx) {
+    try {
+      return await handleRequest(request, env);
+    } catch (_) {
+      return workerResponse("Internal Server Error", { status: 500 });
+    }
   },
 };
