@@ -30,6 +30,7 @@ async function readBody(message, limit, signal) {
     while (true) {
       if (signal?.aborted) throw signal.reason;
       const { done, value } = await reader.read();
+      if (signal?.aborted) throw signal.reason;
       if (done) { complete = true; break; }
       if (value.byteLength > limit - size) {
         await reader.cancel("body too large").catch(() => {});
