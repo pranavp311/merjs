@@ -26,9 +26,20 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Probe production build from a clean archive before standalone WASM
+        run: |
+          stage="$RUNNER_TEMP/clean-prod"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          git archive HEAD | tar -x -C "$stage"
+          (cd "$stage" && zig build prod)
+          test -f "$stage/examples/site/public/counter.wasm"
+          test -f "$stage/examples/site/public/synth.wasm"
+
       - name: Build and test Linux compatibility matrix
         run: |
           zig version
+          zig test build.zig
           zig build test
           zig build cli
           zig build worker
@@ -37,12 +48,15 @@ jobs:
           zig build wasm
           zig build prod
 
-      - name: Check Worker JavaScript syntax
+      - name: Check Worker JavaScript syntax and AI budget behavior
         run: |
           node --check examples/site/worker/worker/worker.js
+          node --check examples/site/worker/worker/fetch-bridge.js
           node --check examples/singapore-data-dashboard/worker/worker.js
           node --check examples/kanban/worker/worker.js
           node tests/worker_snapshot.mjs
+          node tests/worker_fetch_bridge.mjs
+          node --test examples/singapore-data-dashboard/worker/ai-budget.test.mjs
 
       - name: Probe Worker deployments from a clean archive
         run: |
@@ -136,13 +150,73 @@ jobs:
 
       - name: Build and package native app
         run: |
-          zig build native-build -Doptimize=ReleaseSmall
+          zig build native-dev-build -Doptimize=ReleaseSmall
           zig build package -Doptimize=ReleaseSmall
           test -x zig-out/MerJS.app/Contents/MacOS/mernative
 
-      - name: Test rejected and accepted production-gate graphs without credentials
+      - name: Compile the exact generated native scaffold snippet
         run: |
-          if zig build native-prod-check \
+          zig build cli
+          scaffold="$GITHUB_WORKSPACE/.ci-native-scaffold"
+          rm -rf "$scaffold"
+          trap 'rm -rf "$scaffold"' EXIT
+          zig-out/bin/mer init "$scaffold" --merjs-path ".."
+          (cd "$scaffold" && ../zig-out/bin/mer add native > add-native.out 2>&1)
+          python3 - "$scaffold" <<'PY'
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          output = (root / "add-native.out").read_text()
+          marker = "    // ── native shell (mer native / mer package)"
+          start = output.index(marker)
+          end = output.index("\n  Then:", start)
+          snippet = output[start:end].rstrip() + "\n"
+          build = root / "build.zig"
+          source = build.read_text()
+          boundary = "\n}\n\nfn addRoutesModule"
+          pos = source.index(boundary)
+          build.write_text(source[:pos] + "\n" + snippet + source[pos:])
+          PY
+          (cd "$scaffold" && zig fmt build.zig && zig build native-dev-build -Doptimize=ReleaseSmall)
+          if (cd "$scaffold" && zig build native-build \
+              -Dmacos-signing-identity=ci-placeholder \
+              -Dmacos-notarization-profile=ci-placeholder); then
+            echo "generated development manifest unexpectedly passed" >&2
+            exit 1
+          fi
+          cp "$scaffold/mer.app.zon" "$scaffold/mer.app.zon.dev"
+          python3 - "$scaffold/mer.app.zon" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          path.write_text(path.read_text().replace('        .mode = "dev", // "dev" (hot reload) | "embedded" (prod)\n', ''))
+          PY
+          if (cd "$scaffold" && zig build native-build \
+              -Dmacos-signing-identity=ci-placeholder \
+              -Dmacos-notarization-profile=ci-placeholder 2>missing-mode.log); then
+            echo "generated manifest without server.mode unexpectedly passed" >&2
+            exit 1
+          fi
+          grep -F "server.mode must be embedded" "$scaffold/missing-mode.log"
+          mv "$scaffold/mer.app.zon.dev" "$scaffold/mer.app.zon"
+          python3 - "$scaffold/mer.app.zon" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          text = text.replace('.mode = "dev"', '.mode = "embedded"')
+          text = text.replace('// .provider = "github-releases",', '.provider = "github-releases",')
+          text = text.replace('// .feed_url = "https://example.com/mer-native/update.json",', '.feed_url = "https://example.com/mer-native/update.json",')
+          text = text.replace('// .public_key = "ed25519:...",', '.public_key = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",')
+          path.write_text(text)
+          PY
+          (cd "$scaffold" && zig build native-build \
+            -Dmacos-signing-identity=ci-placeholder \
+            -Dmacos-notarization-profile=ci-placeholder)
+
+      - name: Test rejected and accepted native-build graphs without credentials
+        run: |
+          if zig build native-build \
               -Dmacos-signing-identity=ci-placeholder \
               -Dmacos-notarization-profile=ci-placeholder 2>rejected.log; then
             echo "development manifest unexpectedly passed the production gate" >&2
@@ -162,7 +236,7 @@ jobs:
           text = text.replace('// .public_key = "ed25519:...",', '.public_key = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",')
           path.write_text(text)
           PY
-          zig build native-prod-check \
+          zig build native-build \
             -Dmacos-signing-identity=ci-placeholder \
             -Dmacos-notarization-profile=ci-placeholder
 

@@ -130,6 +130,19 @@ This fails if the manifest is missing or misconfigures:
 
 ## 5. Build, sign, notarize, staple
 
+For a production-gated standalone binary (without packaging), run:
+
+```bash
+mer native build -Dmacos-signing-identity="Developer ID Application: …" \
+  -Dmacos-notarization-profile=merjs-notary
+```
+
+This invokes the same `native-prod-check` gate as `mer native doctor`; it does
+not silently produce a "production" binary from a development-mode manifest.
+For a build-only development compile, use `zig build native-dev-build`.
+
+For a signed, notarized app bundle, run:
+
 ```bash
 mer package --release
 # or

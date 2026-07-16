@@ -139,10 +139,13 @@ pub const fetch = fetch_mod.fetch;
 pub const fetchAll = fetch_mod.fetchAll;
 pub const wasmBeginCollect = fetch_mod.wasmBeginCollect;
 pub const wasmEndCollect = fetch_mod.wasmEndCollect;
+pub const wasmEndCollectV2 = fetch_mod.wasmEndCollectV2;
 pub const wasmExpectedState = fetch_mod.wasmExpectedState;
 pub const wasmRestoreExpectedState = fetch_mod.wasmRestoreExpectedState;
 pub const wasmProvideResult = fetch_mod.wasmProvideResult;
+pub const wasmProvideResultV2 = fetch_mod.wasmProvideResultV2;
 pub const wasmClearCache = fetch_mod.wasmClearCache;
+pub const wasmClearCacheV2 = fetch_mod.wasmClearCacheV2;
 
 pub const Meta = struct {
     title: []const u8 = "",

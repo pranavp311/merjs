@@ -5,12 +5,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const env_mod = @import("env.zig");
-const runtime = @import("runtime");
 
 const max_sentry_field_len = 2048;
 const max_sentry_envelope_len = 16 * 1024;
 const max_sentry_sends = 8;
 const sentry_send_timeout = std.Io.Duration.fromSeconds(5);
+const telemetry_poll_interval = std.Io.Duration.fromMilliseconds(1);
+const sentry_message_prefix = "Route handler error on ";
 
 fn env(name: []const u8) ?[]const u8 {
     return env_mod.get(name);
@@ -85,7 +86,7 @@ fn buildSentryEnvelope(
     framework_version: []const u8,
 ) ![]u8 {
     if (error_name.len > max_sentry_field_len or
-        path.len > max_sentry_field_len or
+        path.len > max_sentry_field_len - sentry_message_prefix.len or
         framework_version.len > max_sentry_field_len) return error.InvalidEventField;
 
     var out: std.ArrayList(u8) = .empty;
@@ -104,7 +105,7 @@ fn buildSentryEnvelope(
 
     var message: std.ArrayList(u8) = .empty;
     defer message.deinit(allocator);
-    try message.appendSlice(allocator, "Route handler error on ");
+    try message.appendSlice(allocator, sentry_message_prefix);
     try message.appendSlice(allocator, path);
     try appendJsonString(&out, allocator, message.items);
     try appendBounded(&out, allocator, "}]},\"request\":{\"url\":");
@@ -116,53 +117,102 @@ fn buildSentryEnvelope(
 }
 
 const SentrySendContext = struct {
+    allocator: std.mem.Allocator,
     url: []u8,
     payload: []u8,
+    owners: std.atomic.Value(usize) = .init(1),
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn retain(ctx: *SentrySendContext) void {
+        _ = ctx.owners.fetchAdd(1, .monotonic);
+    }
+
+    fn release(ctx: *SentrySendContext) void {
+        if (ctx.owners.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = ctx.allocator;
+        allocator.free(ctx.url);
+        allocator.free(ctx.payload);
+        allocator.destroy(ctx);
+    }
+
+    fn finish(ctx: *SentrySendContext) void {
+        ctx.completed.store(true, .release);
+    }
+
+    fn wait(ctx: *SentrySendContext, io: std.Io, timeout: std.Io.Duration) bool {
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = timeout, .clock = .awake });
+        var budget = pollBudget(timeout);
+        while (!ctx.completed.load(.acquire)) {
+            if (budget == 0 or std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return false;
+            budget -= 1;
+            std.Io.sleep(io, telemetry_poll_interval, .awake) catch return false;
+        }
+        return true;
+    }
 };
 
-var sentry_mutex: std.atomic.Mutex = .unlocked;
-var sentry_accepting = true;
+const LifecycleState = enum { running, stopping, stopped };
+
+var lifecycle_mutex: std.atomic.Mutex = .unlocked;
+var lifecycle_state: LifecycleState = .running;
 var sentry_in_flight: usize = 0;
+var sentry_network_in_flight: usize = 0;
+var statsd_in_flight: usize = 0;
+var statsd_addr: ?std.Io.net.IpAddress = null;
 
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
+fn pollBudget(timeout: std.Io.Duration) usize {
+    const milliseconds = @max(timeout.toMilliseconds(), 0);
+    return @intCast(@min(milliseconds + 1, 60_001));
+}
+
 fn acquireSentrySlot() bool {
-    lock(&sentry_mutex);
-    defer sentry_mutex.unlock();
-    if (!sentry_accepting or sentry_in_flight == max_sentry_sends) return false;
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    if (lifecycle_state != .running or sentry_network_in_flight == max_sentry_sends) return false;
     sentry_in_flight += 1;
+    sentry_network_in_flight += 1;
     return true;
 }
 
 fn releaseSentrySlot() void {
-    lock(&sentry_mutex);
-    defer sentry_mutex.unlock();
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    std.debug.assert(sentry_in_flight > 0 and sentry_network_in_flight > 0);
+    sentry_in_flight -= 1;
+    sentry_network_in_flight -= 1;
+}
+
+fn releaseSentrySupervisor() void {
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
     std.debug.assert(sentry_in_flight > 0);
     sentry_in_flight -= 1;
 }
 
-fn destroySentryContext(ctx: *SentrySendContext) void {
-    const allocator = std.heap.page_allocator;
-    allocator.free(ctx.url);
-    allocator.free(ctx.payload);
-    allocator.destroy(ctx);
+fn releaseSentryWorker() void {
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    std.debug.assert(sentry_network_in_flight > 0);
+    sentry_network_in_flight -= 1;
 }
 
 fn createSentryContext(
+    allocator: std.mem.Allocator,
     cfg: SentryConfig,
     error_name: []const u8,
     path: []const u8,
     framework_version: []const u8,
 ) !*SentrySendContext {
-    const allocator = std.heap.page_allocator;
     const payload = try buildSentryEnvelope(allocator, cfg, error_name, path, framework_version);
     errdefer allocator.free(payload);
     const url = try std.fmt.allocPrint(allocator, "https://{s}/api/{s}/envelope/", .{ cfg.host, cfg.project_id });
     errdefer allocator.free(url);
     const ctx = try allocator.create(SentrySendContext);
-    ctx.* = .{ .url = url, .payload = payload };
+    ctx.* = .{ .allocator = allocator, .url = url, .payload = payload };
     return ctx;
 }
 
@@ -173,14 +223,14 @@ pub fn sentryCapture(error_name: []const u8, path: []const u8, framework_version
     const dsn_str = env("SENTRY_DSN") orelse return;
     const cfg = parseSentryDsn(dsn_str) orelse return;
     if (!acquireSentrySlot()) return;
-    const ctx = createSentryContext(cfg, error_name, path, framework_version) catch {
+    const ctx = createSentryContext(std.heap.page_allocator, cfg, error_name, path, framework_version) catch {
         releaseSentrySlot();
         return;
     };
 
     const thread = std.Thread.spawn(.{}, sentrySendThread, .{ctx}) catch {
         releaseSentrySlot();
-        destroySentryContext(ctx);
+        ctx.release();
         return;
     };
     thread.detach();
@@ -198,111 +248,157 @@ fn sentryFetch(client: *std.http.Client, ctx: *const SentrySendContext) bool {
     return result.status.class() == .success;
 }
 
-fn sentryTimeout(io: std.Io) void {
-    std.Io.sleep(io, sentry_send_timeout, .awake) catch {};
-}
+const SentryWork = *const fn (*const SentrySendContext) void;
 
-fn sentrySend(ctx: *const SentrySendContext) bool {
+fn sentryNetworkWork(ctx: *const SentrySendContext) void {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
-    const io = threaded.io();
-    var client = std.http.Client{ .allocator = std.heap.page_allocator, .io = io };
+    var client = std.http.Client{ .allocator = std.heap.page_allocator, .io = threaded.io() };
     defer client.deinit();
 
-    const Result = union(enum) { send: bool, timeout: void };
-    var results: [2]Result = undefined;
-    var select: std.Io.Select(Result) = .init(io, &results);
-    defer _ = select.cancel();
-    select.concurrent(.send, sentryFetch, .{ &client, ctx }) catch return false;
-    select.async(.timeout, sentryTimeout, .{io});
-    return switch (select.await() catch return false) {
-        .send => |success| success,
-        .timeout => false,
+    // Zig 0.16 FetchOptions/RequestOptions expose no connect or read deadline.
+    // ConnectTcpOptions has a timeout field, but connectTcpOptions currently
+    // does not pass it to DNS/TCP and fetch cannot use it. A blocked DNS/TLS
+    // operation therefore cannot be safely canceled or joined here. Detached
+    // network workers retain their context, and this strict cap bounds them.
+    _ = sentryFetch(&client, ctx);
+}
+
+fn sentryNetworkThread(ctx: *SentrySendContext, work: SentryWork) void {
+    defer releaseSentryWorker();
+    defer ctx.release();
+    defer ctx.finish();
+    work(ctx);
+}
+
+const SentrySpawn = *const fn (*SentrySendContext, SentryWork) std.Thread.SpawnError!std.Thread;
+
+fn spawnSentryNetwork(ctx: *SentrySendContext, work: SentryWork) std.Thread.SpawnError!std.Thread {
+    return std.Thread.spawn(.{}, sentryNetworkThread, .{ ctx, work });
+}
+
+fn superviseSentry(ctx: *SentrySendContext, io: std.Io, timeout: std.Io.Duration, work: SentryWork, spawn: SentrySpawn) ?std.Thread {
+    ctx.retain();
+    const thread = spawn(ctx, work) catch {
+        ctx.release();
+        releaseSentryWorker();
+        return null;
     };
+    _ = ctx.wait(io, timeout);
+    return thread;
 }
 
 fn sentrySendThread(ctx: *SentrySendContext) void {
-    defer releaseSentrySlot();
-    defer destroySentryContext(ctx);
-    _ = sentrySend(ctx);
+    defer releaseSentrySupervisor();
+    defer ctx.release();
+    var timer = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer timer.deinit();
+    const thread = superviseSentry(ctx, timer.io(), sentry_send_timeout, sentryNetworkWork, spawnSentryNetwork) orelse return;
+    thread.detach();
 }
 
 // ── Datadog (DogStatsD) ─────────────────────────────────────────────────────
 // Sends metrics via UDP to the local Datadog agent.
 // Set DD_AGENT_HOST and optionally DD_DOGSTATSD_PORT (default: 8125).
 
-var statsd_mutex: std.atomic.Mutex = .unlocked;
-var statsd_accepting = true;
-var statsd_addr: ?std.Io.net.IpAddress = null;
-var statsd_sock: ?std.Io.net.Socket = null;
-
-fn closeStatsdLocked() void {
-    if (statsd_sock) |*socket| socket.close(runtime.io);
-    statsd_sock = null;
-    statsd_addr = null;
-}
-
-/// Allow telemetry submissions after a previous `deinit` (primarily for tests
-/// and runtimes that are initialized more than once in one process).
+/// Allow telemetry submissions after a completed `deinit`. An `init` racing
+/// an active shutdown is linearized before that shutdown and is a no-op.
 pub fn init() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    lock(&sentry_mutex);
-    defer sentry_mutex.unlock();
-    std.debug.assert(sentry_in_flight == 0);
-    sentry_accepting = true;
-
-    lock(&statsd_mutex);
-    defer statsd_mutex.unlock();
-    statsd_accepting = true;
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    if (lifecycle_state == .stopped) lifecycle_state = .running;
 }
 
-/// Stop accepting Sentry submissions, wait for the bounded set of active sends,
-/// and close DogStatsD. Call before `runtime.deinit()`. Safe to call repeatedly.
+fn stopTelemetry(io: std.Io, timeout: std.Io.Duration) void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = timeout, .clock = .awake });
+    lock(&lifecycle_mutex);
+    switch (lifecycle_state) {
+        .stopped => {
+            lifecycle_mutex.unlock();
+            return;
+        },
+        .stopping => {},
+        .running => lifecycle_state = .stopping,
+    }
+
+    var budget = pollBudget(timeout);
+    while (sentry_in_flight != 0 or statsd_in_flight != 0) {
+        lifecycle_mutex.unlock();
+        if (budget == 0 or std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return finishStop();
+        budget -= 1;
+        std.Io.sleep(io, telemetry_poll_interval, .awake) catch return finishStop();
+        lock(&lifecycle_mutex);
+        if (lifecycle_state != .stopping) {
+            lifecycle_mutex.unlock();
+            return;
+        }
+    }
+    lifecycle_state = .stopped;
+    statsd_addr = null;
+    lifecycle_mutex.unlock();
+}
+
+fn finishStop() void {
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    if (lifecycle_state == .stopping) {
+        lifecycle_state = .stopped;
+        statsd_addr = null;
+    }
+}
+
+/// Stop accepting telemetry and wait for admitted supervisors/UDP sends. The
+/// wait is bounded; blocked Sentry network workers retain their own data and
+/// remain counted against the fixed worker cap until they actually return.
 pub fn deinit() void {
     if (comptime builtin.os.tag == .freestanding) return;
 
-    lock(&sentry_mutex);
-    sentry_accepting = false;
-    while (sentry_in_flight != 0) {
-        sentry_mutex.unlock();
-        std.Thread.yield() catch {};
-        lock(&sentry_mutex);
-    }
-    sentry_mutex.unlock();
-
-    lock(&statsd_mutex);
-    defer statsd_mutex.unlock();
-    statsd_accepting = false;
-    closeStatsdLocked();
+    var timer = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer timer.deinit();
+    stopTelemetry(timer.io(), sentry_send_timeout);
 }
 
-fn getStatsdSocketLocked() ?*const std.Io.net.Socket {
-    if (statsd_sock != null) return &statsd_sock.?;
+fn getStatsdAddressLocked() ?std.Io.net.IpAddress {
+    if (statsd_addr) |address| return address;
     const host = env("DD_AGENT_HOST") orelse return null;
     const port_str = env("DD_DOGSTATSD_PORT") orelse "8125";
     const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
     statsd_addr = std.Io.net.IpAddress.parse(host, port) catch return null;
-    const local: std.Io.net.IpAddress = switch (statsd_addr.?) {
-        .ip4 => .{ .ip4 = std.Io.net.Ip4Address.unspecified(0) },
-        .ip6 => .{ .ip6 = std.Io.net.Ip6Address.unspecified(0) },
-    };
-    statsd_sock = local.bind(runtime.io, .{ .mode = .dgram }) catch {
-        statsd_addr = null;
-        return null;
-    };
-    return &statsd_sock.?;
+    return statsd_addr.?;
+}
+
+fn acquireStatsdAddress() ?std.Io.net.IpAddress {
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    if (lifecycle_state != .running) return null;
+    const address = getStatsdAddressLocked() orelse return null;
+    statsd_in_flight += 1;
+    return address;
+}
+
+fn releaseStatsd() void {
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    std.debug.assert(statsd_in_flight > 0);
+    statsd_in_flight -= 1;
 }
 
 fn statsdSend(message: []const u8) bool {
     if (comptime builtin.os.tag == .freestanding) return false;
-    lock(&statsd_mutex);
-    defer statsd_mutex.unlock();
-    if (!statsd_accepting) return false;
-    const socket = getStatsdSocketLocked() orelse return false;
-    socket.send(runtime.io, &statsd_addr.?, message) catch {
-        closeStatsdLocked();
-        return false;
+    const address = acquireStatsdAddress() orelse return false;
+    defer releaseStatsd();
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local: std.Io.net.IpAddress = switch (address) {
+        .ip4 => .{ .ip4 = std.Io.net.Ip4Address.unspecified(0) },
+        .ip6 => .{ .ip6 = std.Io.net.Ip6Address.unspecified(0) },
     };
+    const socket = local.bind(io, .{ .mode = .dgram }) catch return false;
+    defer socket.close(io);
+    socket.send(io, &address, message) catch return false;
     return true;
 }
 
@@ -387,12 +483,20 @@ test "Sentry envelope escapes JSON and owns its input" {
     try std.testing.expect(payload[payload.len - 1] == '\n');
 }
 
-test "Sentry envelope rejects invalid and oversized fields" {
+test "Sentry envelope enforces generated message boundary" {
     const allocator = std.testing.allocator;
     const cfg = parseSentryDsn("https://key@host.test/42").?;
     var invalid = [_]u8{0xff};
     try std.testing.expectError(error.InvalidEventField, buildSentryEnvelope(allocator, cfg, &invalid, "/", "1"));
-    const oversized = try allocator.alloc(u8, max_sentry_field_len + 1);
+
+    const max_path_len = max_sentry_field_len - sentry_message_prefix.len;
+    const boundary = try allocator.alloc(u8, max_path_len);
+    defer allocator.free(boundary);
+    @memset(boundary, 'a');
+    const payload = try buildSentryEnvelope(allocator, cfg, "Error", boundary, "1");
+    defer allocator.free(payload);
+
+    const oversized = try allocator.alloc(u8, max_path_len + 1);
     defer allocator.free(oversized);
     @memset(oversized, 'a');
     try std.testing.expectError(error.InvalidEventField, buildSentryEnvelope(allocator, cfg, "Error", oversized, "1"));
@@ -407,47 +511,83 @@ test "Sentry envelope reports allocation failure without leaking" {
     );
 }
 
-test "Sentry shutdown rejects new work and waits for active sends" {
+test "Sentry timeout leaves blocked work owned and capped" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     init();
     try std.testing.expect(acquireSentrySlot());
 
+    const cfg = parseSentryDsn("https://key@host.test/42").?;
+    const ctx = try createSentryContext(std.testing.allocator, cfg, "Error", "/", "1");
     const TestState = struct {
         var release = std.atomic.Value(bool).init(false);
+        var accessed_after_timeout = std.atomic.Value(bool).init(false);
 
-        fn finishSend() void {
+        fn blockedWork(send_ctx: *const SentrySendContext) void {
             while (!release.load(.acquire)) std.atomic.spinLoopHint();
-            releaseSentrySlot();
-        }
-
-        fn shutDown() void {
-            deinit();
+            accessed_after_timeout.store(send_ctx.payload.len != 0, .release);
         }
     };
     TestState.release.store(false, .release);
-    const sender = try std.Thread.spawn(.{}, TestState.finishSend, .{});
-    const shutdown = try std.Thread.spawn(.{}, TestState.shutDown, .{});
+    TestState.accessed_after_timeout.store(false, .release);
+    const worker = superviseSentry(ctx, io, std.Io.Duration.fromMilliseconds(1), TestState.blockedWork, spawnSentryNetwork).?;
+    releaseSentrySupervisor();
+    ctx.release();
 
-    while (true) {
-        lock(&sentry_mutex);
-        const accepting = sentry_accepting;
-        sentry_mutex.unlock();
-        if (!accepting) break;
-        std.atomic.spinLoopHint();
-    }
+    stopTelemetry(io, std.Io.Duration.fromMilliseconds(1));
     try std.testing.expect(!acquireSentrySlot());
-
     TestState.release.store(true, .release);
-    sender.join();
-    shutdown.join();
-    lock(&statsd_mutex);
-    const statsd_stopped = !statsd_accepting;
-    statsd_mutex.unlock();
-    try std.testing.expect(statsd_stopped);
+    worker.join();
 
+    try std.testing.expect(TestState.accessed_after_timeout.load(.acquire));
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), sentry_network_in_flight);
+}
+
+test "Sentry inner spawn failure releases ownership and capacity" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
     init();
     try std.testing.expect(acquireSentrySlot());
-    releaseSentrySlot();
-    deinit();
+    const cfg = parseSentryDsn("https://key@host.test/42").?;
+    const ctx = try createSentryContext(std.testing.allocator, cfg, "Error", "/", "1");
+    const TestState = struct {
+        fn work(_: *const SentrySendContext) void {}
+        fn failSpawn(_: *SentrySendContext, _: SentryWork) std.Thread.SpawnError!std.Thread {
+            return error.OutOfMemory;
+        }
+    };
+    try std.testing.expect(superviseSentry(ctx, threaded.io(), sentry_send_timeout, TestState.work, TestState.failSpawn) == null);
+    releaseSentrySupervisor();
+    ctx.release();
+
+    lock(&lifecycle_mutex);
+    defer lifecycle_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), sentry_in_flight);
+    try std.testing.expectEqual(@as(usize, 0), sentry_network_in_flight);
+}
+
+test "Sentry worker cap rejects deterministic exhaustion" {
+    init();
+    for (0..max_sentry_sends) |_| try std.testing.expect(acquireSentrySlot());
+    try std.testing.expect(!acquireSentrySlot());
+    for (0..max_sentry_sends) |_| releaseSentrySlot();
+}
+
+test "shutdown rejects StatsD admission and has a bounded fallback" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    init();
+    lock(&lifecycle_mutex);
+    statsd_addr = .{ .ip4 = std.Io.net.Ip4Address.loopback(8125) };
+    lifecycle_mutex.unlock();
+    _ = acquireStatsdAddress().?;
+
+    stopTelemetry(threaded.io(), std.Io.Duration.zero);
+    try std.testing.expect(acquireStatsdAddress() == null);
+    releaseStatsd();
 }
 
 test "DogStatsD tags cannot inject metrics and enforce bounds" {

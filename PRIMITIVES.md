@@ -40,8 +40,17 @@ Run `zig build codegen` after adding/removing routes.
 ## HTML node storage (`mer.h.RenderStorage`)
 
 Request handlers do not need to manage HTML node storage: merjs constructs runtime
-children in the request arena. Standalone code that builds runtime `h.Node` trees
-must bound the borrowed child slices explicitly:
+children in the request arena. Standalone runtime strings and tuples also work
+without ambient setup. They use a bounded thread-local pool of
+`h.standalone_fallback_capacity` child values. Existing child slices are never
+overwritten; construction fails loudly if that pool is exhausted rather than
+silently invalidating an older tree. After all fallback-backed nodes are dead,
+`h.resetStandaloneFallback()` reclaims the pool. That call invalidates every
+outstanding fallback-backed node on the current thread.
+
+For retained, freely copied, or repeatedly assembled trees, `RenderStorage` is the
+recommended way to avoid the fallback bound and give all child slices an explicit
+lifetime:
 
 ```zig
 var storage = mer.h.RenderStorage.init(allocator);
@@ -54,11 +63,13 @@ const response = mer.render(allocator, mer.h.div(.{}, .{ child, copy }));
 defer response.deinit();
 ```
 
-`mer.render` owns only its serialized response body; it does not consume the node
-or invalidate copies. A node may be rendered repeatedly until its active
-`RenderStorage` is deinitialized. Storage activations may be nested and must be
-deinitialized in reverse order. Explicit `[]const h.Node` children remain borrowed
-from the caller and must live at least as long as the parent node.
+`mer.render` owns only its serialized response body; it does not consume the node.
+Nodes have no unique ownership and are freely copyable. `Node.deinit()` remains a
+harmless no-op for source compatibility, including when called on multiple copies.
+With active `RenderStorage`, nodes remain renderable until the storage is
+deinitialized. Storage activations may be nested and must be deinitialized in
+reverse order. Explicit `[]const h.Node` children remain borrowed from the caller
+and must live at least as long as the parent node.
 
 ---
 

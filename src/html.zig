@@ -20,11 +20,11 @@
 //   h.document(.{ h.charset("UTF-8"), h.title("Hi") },
 //              .{ h.h1(.{}, "Hello!") })
 //
-// Standalone runtime construction needs bounded child storage:
+// RenderStorage is recommended when standalone nodes are retained or copied:
 //   var storage = h.RenderStorage.init(allocator);
 //   storage.activate();
 //   defer storage.deinit();
-// Node copies remain valid until that explicit deinit.
+// Without active storage, runtime child slices use a bounded thread-local pool.
 
 const std = @import("std");
 
@@ -93,8 +93,8 @@ pub const Node = union(enum) {
     text: []const u8,
     raw: []const u8,
 
-    /// Retained for source compatibility. Nodes only borrow render storage;
-    /// deinitialize the active RenderStorage (or request arena) instead.
+    /// Retained for source compatibility. Nodes do not have unique ownership;
+    /// release an active RenderStorage instead.
     pub fn deinit(self: Node) void {
         _ = self;
     }
@@ -241,17 +241,42 @@ const Children = struct {
     items: []const Node,
 };
 
+/// The thread-local standalone pool holds this many child values. Existing
+/// slices are never overwritten; use RenderStorage for sustained construction
+/// or when an explicit lifetime is required.
+pub const standalone_fallback_capacity = 1024;
+threadlocal var _standalone_fallback: [standalone_fallback_capacity]Node = undefined;
+threadlocal var _standalone_fallback_cursor: usize = 0;
+
+/// Reclaim standalone fallback storage after every node built without an active
+/// RenderStorage is no longer used. Existing fallback-backed nodes become
+/// invalid, so retained/repeated construction should prefer RenderStorage.
+pub fn resetStandaloneFallback() void {
+    std.debug.assert(_render_alloc == null);
+    _standalone_fallback_cursor = 0;
+}
+
 fn ownRuntimeChildren(nodes: []const Node) Children {
-    const allocator = _render_alloc orelse @panic("h.*: runtime children require h.RenderStorage or h.setRenderAllocator");
-    const owned = allocator.dupe(Node, nodes) catch @panic("h.*: out of memory");
-    return .{ .items = owned };
+    if (nodes.len == 0) return .{ .items = &.{} };
+
+    if (_render_alloc) |allocator| {
+        return .{ .items = allocator.dupe(Node, nodes) catch @panic("h.*: out of memory") };
+    }
+    if (nodes.len > standalone_fallback_capacity -| _standalone_fallback_cursor) {
+        @panic("h.*: standalone fallback exhausted; use h.RenderStorage");
+    }
+    const start = _standalone_fallback_cursor;
+    _standalone_fallback_cursor += nodes.len;
+    @memcpy(_standalone_fallback[start.._standalone_fallback_cursor], nodes);
+    return .{ .items = _standalone_fallback[start.._standalone_fallback_cursor] };
 }
 
 fn coerceChildren(children: anytype) Children {
     const T = @TypeOf(children);
 
-    // Runtime wrappers must outlive this function. Server requests use their
-    // arena; standalone callers use an explicitly bounded RenderStorage.
+    // Runtime wrappers must outlive this function. Server requests and an
+    // active RenderStorage use their arena; standalone nodes use the bounded
+    // thread-local fallback.
     if (T == []const u8) {
         if (@inComptime()) return .{ .items = &.{Node{ .text = children }} };
         const singleton = [1]Node{Node{ .text = children }};

@@ -120,6 +120,81 @@ fn runtimeNestedNode(title: []const u8) mer.h.Node {
     });
 }
 
+test "core API: standalone runtime strings and tuples own their children" {
+    try std.testing.expect(!mer.h.hasRenderAllocator());
+    mer.h.resetStandaloneFallback();
+    defer mer.h.resetStandaloneFallback();
+
+    var runtime_text = [_]u8{ 'r', 'u', 'n', 't', 'i', 'm', 'e' };
+    const string_node = mer.h.p(.{}, runtime_text[0..]);
+    defer string_node.deinit();
+    const string_body = try mer.h.render(std.testing.allocator, string_node);
+    defer std.testing.allocator.free(string_body);
+    try std.testing.expectEqualStrings("<p>runtime</p>", string_body);
+
+    const tuple_node = mer.h.div(.{}, .{
+        mer.h.span(.{}, runtime_text[0..]),
+        mer.h.strong(.{}, " tuple"),
+    });
+    defer tuple_node.deinit();
+    const tuple_body = try mer.h.render(std.testing.allocator, tuple_node);
+    defer std.testing.allocator.free(tuple_body);
+    try std.testing.expectEqualStrings(
+        "<div><span>runtime</span><strong> tuple</strong></div>",
+        tuple_body,
+    );
+}
+
+test "core API: standalone Node copies can both be deinitialized harmlessly" {
+    try std.testing.expect(!mer.h.hasRenderAllocator());
+    mer.h.resetStandaloneFallback();
+    defer mer.h.resetStandaloneFallback();
+
+    const node = mer.h.div(.{}, .{mer.h.span(.{}, "copy")});
+    const copy = node;
+    node.deinit();
+    copy.deinit();
+
+    const body = try mer.h.render(std.testing.allocator, copy);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("<div><span>copy</span></div>", body);
+}
+
+test "core API: later standalone nodes do not invalidate earlier trees" {
+    try std.testing.expect(!mer.h.hasRenderAllocator());
+    mer.h.resetStandaloneFallback();
+    defer mer.h.resetStandaloneFallback();
+
+    const first = mer.h.p(.{}, "first");
+    for (0..64) |_| {
+        const node = mer.h.p(.{}, "later");
+        node.deinit();
+    }
+    const body = try mer.h.render(std.testing.allocator, first);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("<p>first</p>", body);
+}
+
+test "core API: standalone nested runtime children survive constructor frames" {
+    try std.testing.expect(!mer.h.hasRenderAllocator());
+    mer.h.resetStandaloneFallback();
+    defer mer.h.resetStandaloneFallback();
+
+    const node = runtimeNestedNode("standalone");
+    defer node.deinit();
+
+    var clobber: [4096]u8 = undefined;
+    @memset(&clobber, 0xaa);
+    std.mem.doNotOptimizeAway(&clobber);
+
+    const body = try mer.h.render(std.testing.allocator, node);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "<div><h1>standalone</h1><div><span>nested</span></div></div>",
+        body,
+    );
+}
+
 test "core API: copied runtime nodes render through separate roots" {
     var storage = mer.h.RenderStorage.init(std.testing.allocator);
     storage.activate();

@@ -38,7 +38,7 @@ Paste the printed snippet into `build.zig` (inside `pub fn build`), then:
 
 ```bash
 mer native         # dev: launch a native window against the hot-reloading server
-mer native build   # prod: build the native shell binary (ReleaseSmall)
+mer native build   # production-gated binary (ReleaseSmall; accepts -D build options)
 mer package        # unsigned local .app (macOS): zig-out/<Display>.app with default prefix
 mer package --sign # package + codesign (Developer ID; requires signing config)
 mer package --sign -Dmacos-signing-identity="Developer ID Application: Example, Inc. (TEAMID)"
@@ -50,7 +50,10 @@ mer package --release # validate + sign + notarize + staple
 `mer native` reuses the `mer dev` pipeline (codegen → serve) and attaches a
 WebView window once the server reports its bound port. UI edits hot-reload
 inside the window via the existing `/_mer/events` SSE channel — the shell does
-not rebuild on UI edits.
+not rebuild on UI edits. `mer native build` is intentionally fail-closed: it
+runs the same embedded-mode production manifest and credential gate as
+`mer native doctor` before producing a binary. Use `zig build native-dev-build`
+for an explicit build-only development compile without that production gate.
 
 ---
 

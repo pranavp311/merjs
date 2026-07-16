@@ -49,7 +49,7 @@ export fn collect_fetch_urls(req_ptr: [*]const u8, req_len: u32) [*]const u8 {
     mer.wasmBeginCollect();
     const response = dispatch_mod.dispatchBuffered(r, req);
     response.deinit();
-    const collected = mer.wasmEndCollect();
+    const collected = mer.wasmEndCollectV2();
     last_requests = collected.bytes;
     last_fetch_error = collected.error_code;
     return last_requests.ptr;
@@ -60,7 +60,7 @@ export fn collect_urls_len() u32 {
 }
 
 export fn provide_fetch_result(id: u32, status: u32, body_ptr: [*]const u8, body_len: u32) u32 {
-    return mer.wasmProvideResult(id, status, body_ptr[0..body_len]);
+    return mer.wasmProvideResultV2(id, status, body_ptr[0..body_len]);
 }
 
 export fn fetch_protocol_error() u32 {
@@ -70,7 +70,7 @@ export fn fetch_protocol_error() u32 {
 export fn handle(req_ptr: [*]const u8, req_len: u32) ?[*]const u8 {
     if (last_response) |prev| allocator.free(prev);
     last_response = null;
-    defer last_fetch_error = mer.wasmClearCache();
+    defer last_fetch_error = mer.wasmClearCacheV2();
 
     const input = req_ptr[0..req_len];
     const space_idx = std.mem.indexOfScalar(u8, input, ' ') orelse return null;

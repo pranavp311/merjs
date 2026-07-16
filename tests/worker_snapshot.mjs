@@ -34,6 +34,8 @@ const expected = new Uint8Array(
   wasm.expected_state_ptr(),
   wasm.expected_state_len(),
 ).slice();
+assert.ok(expected.length >= 8, "expected-state protocol header missing");
+assert.equal(new DataView(expected.buffer).getUint32(0, true), 0x3246534d, "expected-state protocol version changed");
 
 new Uint8Array(wasm.memory.buffer, 0, applicationState.length).set(applicationState);
 const expectedPtr = expected.length === 0 ? 0 : wasm.alloc(expected.length);

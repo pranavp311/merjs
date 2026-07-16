@@ -119,9 +119,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (std.mem.eql(u8, cmd, "native")) {
         // mer native          → dev: hot reload + WebView
-        // mer native build    → prod binary (no run)
+        // mer native build    → production-gated binary (no run)
         if (args.len >= 3 and std.mem.eql(u8, args[2], "build")) {
-            try cmdNativeBuild(alloc);
+            try cmdNativeBuild(alloc, args[3..]);
         } else if (args.len >= 3 and std.mem.eql(u8, args[2], "doctor")) {
             try cmdNativeDoctor(alloc, args[3..]);
         } else {
@@ -753,6 +753,7 @@ test "build_zig_template uses local codegen entrypoint" {
 
 test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-dev-build\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-build\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"package-sign\",") != null);
@@ -762,6 +763,10 @@ test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "Contents/Resources") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "static_dir must resolve inside the project") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "static_dir must not contain nested symlinks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "fn zonServerMode(comptime zon: anytype) []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "std.mem.eql(u8, zonServerMode(zon), \"embedded\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_prod_install.step.dependOn(native_prod_check_step)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "native_build_step.dependOn(&native_prod_install.step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_clean.step.dependOn(native_prod_check_step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_pkg_bin.step.dependOn(&release_clean.step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "release_codesign.step.dependOn(release_package_step)") != null);
@@ -802,6 +807,26 @@ test "package mode selection is order independent and monotonic" {
     };
     try std.testing.expectEqual(expected.len, argv.items.len);
     for (expected, argv.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "native build uses the production-gated step and forwards build options" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+    try appendNativeBuildArgv(std.testing.allocator, &argv, "/fake/zig", &.{
+        "-Dmacos-signing-identity=test",
+        "-Dmacos-notarization-profile=profile",
+    });
+    const expected = [_][]const u8{
+        "/fake/zig",
+        "build",
+        "native-build",
+        "-Doptimize=ReleaseSmall",
+        "-Dmacos-signing-identity=test",
+        "-Dmacos-notarization-profile=profile",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, got| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectError(error.UnknownNativeBuildOption, appendNativeBuildArgv(std.testing.allocator, &argv, "/fake/zig", &.{"--dev"}));
 }
 
 test "native doctor forwards credential build options" {
@@ -1011,7 +1036,8 @@ const native_build_snippet =
     \\        run_native.step.dependOn(&native_install.step);
     \\        if (b.args) |args| run_native.addArgs(args);
     \\        b.step("native", "Run native shell (dev)").dependOn(&run_native.step);
-    \\        b.step("native-build", "Build native shell binary").dependOn(&native_install.step);
+    \\        b.step("native-dev-build", "Build native shell binary without production checks").dependOn(&native_install.step);
+    \\        const native_build_step = b.step("native-build", "Build production-gated native shell binary");
     \\
     \\        const app_zon = @import("mer.app.zon");
     \\        const NativePackage = struct {
@@ -1070,6 +1096,13 @@ const native_build_snippet =
     \\                const UpdateT = @TypeOf(zon.update);
     \\                if (!@hasField(UpdateT, field)) return null;
     \\                return @field(zon.update, field);
+    \\            }
+    \\            fn zonServerMode(comptime zon: anytype) []const u8 {
+    \\                const T = @TypeOf(zon);
+    \\                if (!@hasField(T, "server")) return "";
+    \\                const ServerT = @TypeOf(zon.server);
+    \\                if (!@hasField(ServerT, "mode")) return "";
+    \\                return zon.server.mode;
     \\            }
     \\            fn zonServerHost(comptime zon: anytype) []const u8 {
     \\                const T = @TypeOf(zon);
@@ -1239,6 +1272,7 @@ const native_build_snippet =
     \\            }
     \\            fn macProdCheckMessage(comptime zon: anytype) []const u8 {
     \\                comptime var msg: []const u8 = "";
+    \\                if (!std.mem.eql(u8, zonServerMode(zon), "embedded")) msg = msg ++ "native production server.mode must be embedded\\n";
     \\                if (!isLoopbackHostLiteral(zonServerHost(zon))) msg = msg ++ "native production server.host must be loopback (use 127.0.0.1)\\n";
     \\                if (zonNavigationHasForbiddenLoopback(zon)) msg = msg ++ "production extra navigation origins must not include loopback/localhost; rely on the exact runtime origin injected by the shell\\n";
     \\                if (!zonHasBridgeArray(zon, "allowed_commands")) msg = msg ++ "missing non-empty .security.bridge.allowed_commands\\n";
@@ -1306,6 +1340,9 @@ const native_build_snippet =
     \\        );
     \\        const prod_check_message = comptime NativePackage.macProdCheckMessage(app_zon);
     \\        const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
+    \\        const native_prod_install = b.addInstallArtifact(native_exe, .{});
+    \\        native_prod_install.step.dependOn(native_prod_check_step);
+    \\        native_build_step.dependOn(&native_prod_install.step);
     \\        if (prod_check_message.len == 0 and signing_identity != null and notarization_profile != null) {
     \\            const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
     \\            native_prod_check_step.dependOn(&ok.step);
@@ -1495,7 +1532,20 @@ fn cmdNative(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     }
 }
 
-fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
+fn appendNativeBuildArgv(
+    alloc: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    zig_exe: []const u8,
+    extra_args: []const []const u8,
+) error{ UnknownNativeBuildOption, OutOfMemory }!void {
+    try argv.appendSlice(alloc, &.{ zig_exe, "build", "native-build", "-Doptimize=ReleaseSmall" });
+    for (extra_args) |arg| {
+        if (!std.mem.startsWith(u8, arg, "-D")) return error.UnknownNativeBuildOption;
+        try argv.append(alloc, arg);
+    }
+}
+
+fn cmdNativeBuild(alloc: std.mem.Allocator, extra_args: []const []const u8) !void {
     std.Io.Dir.cwd().access(runtime.io, "build.zig", .{}) catch {
         print("mer: no build.zig found — are you in a merjs project?\n", .{});
         std.process.exit(1);
@@ -1507,9 +1557,19 @@ fn cmdNativeBuild(alloc: std.mem.Allocator) !void {
     const zig_exe = try resolveInPath(alloc, "zig");
     defer alloc.free(zig_exe);
 
-    print("mer: building native shell (prod)...\n", .{});
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    appendNativeBuildArgv(alloc, &argv, zig_exe, extra_args) catch |err| switch (err) {
+        error.UnknownNativeBuildOption => {
+            print("mer: native build accepts only -D build options\n", .{});
+            std.process.exit(1);
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    print("mer: building production-gated native shell...\n", .{});
     const term = try spawnWaitInheritEnv(alloc, .{
-        .argv = &.{ zig_exe, "build", "native-build", "-Doptimize=ReleaseSmall" },
+        .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     });
@@ -1705,7 +1765,7 @@ fn cmdAddNative(_: std.mem.Allocator) !void {
 
     print("\n  Next: add this to build.zig (inside pub fn build):\n\n{s}\n", .{native_build_snippet});
     print("  Then: mer native          # launch the native window\n", .{});
-    print("        mer native build    # prod binary\n", .{});
+    print("        mer native build    # production-gated binary\n", .{});
     print("        mer package         # .app bundle\n\n", .{});
 }
 

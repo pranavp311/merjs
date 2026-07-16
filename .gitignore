@@ -13,6 +13,8 @@ examples/site/app/_mercss.css
 public/styles.css
 public/counter.wasm
 public/synth.wasm
+examples/site/public/counter.wasm
+examples/site/public/synth.wasm
 dist/
 
 # Cloudflare Workers — compiled WASM output
@@ -41,6 +43,8 @@ Thumbs.db
 examples/**/worker/.wrangler/
 examples/**/worker/.dev.vars
 node_modules/
+__pycache__/
+*.py[cod]
 
 # Environment variables and secrets — never commit real values
 .env

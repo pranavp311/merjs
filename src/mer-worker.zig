@@ -43,10 +43,13 @@ pub const fetch = shared.fetch;
 pub const fetchAll = shared.fetchAll;
 pub const wasmBeginCollect = shared.wasmBeginCollect;
 pub const wasmEndCollect = shared.wasmEndCollect;
+pub const wasmEndCollectV2 = shared.wasmEndCollectV2;
 pub const wasmExpectedState = shared.wasmExpectedState;
 pub const wasmRestoreExpectedState = shared.wasmRestoreExpectedState;
 pub const wasmProvideResult = shared.wasmProvideResult;
+pub const wasmProvideResultV2 = shared.wasmProvideResultV2;
 pub const wasmClearCache = shared.wasmClearCache;
+pub const wasmClearCacheV2 = shared.wasmClearCacheV2;
 pub const Meta = shared.Meta;
 pub const h = shared.h;
 pub const lint = shared.lint;
@@ -70,6 +73,12 @@ test "worker public API aliases preserve shared parity and type identity" {
         "resetEnv",
         "fetch",
         "fetchAll",
+        "wasmEndCollect",
+        "wasmEndCollectV2",
+        "wasmProvideResult",
+        "wasmProvideResultV2",
+        "wasmClearCache",
+        "wasmClearCacheV2",
         "render",
     }) |name| {
         try std.testing.expect(@hasDecl(WorkerApi, name));

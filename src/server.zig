@@ -699,11 +699,22 @@ fn serveRequest(
 
     // SSE hot-reload endpoint.
     if (dev and std.mem.eql(u8, path, "/_mer/events")) {
-        if (watcher) |w| {
-            watcher_mod.handleSse(w, alloc, std_req, csp) catch |err| {
-                log.err("SSE handler: {}", .{err});
-            };
+        if (has_framed_body) _ = try readRequestBody(alloc, std_req, csp);
+        if (eventsEndpointStatus(std_method, has_framed_body, watcher != null)) |status| {
+            if (status == .method_not_allowed) {
+                try sendEventsMethodNotAllowed(std_req, std_method == .HEAD, csp);
+            } else {
+                try sendResponse(std_req, mer.text(status, switch (status) {
+                    .bad_request => "request body not allowed",
+                    .service_unavailable => "hot reload unavailable",
+                    else => unreachable,
+                }), std_method == .HEAD, csp);
+            }
+            return;
         }
+        watcher_mod.handleSse(watcher.?, alloc, std_req, csp) catch |err| {
+            log.err("SSE handler: {}", .{err});
+        };
         return;
     }
 
@@ -895,16 +906,21 @@ fn serveRequest(
     }
 
     // ── Non-streaming path ─────────────────────────────────────────────────
-    var owned_body: ?[]u8 = null;
-    if (dev and response.content_type == .html) {
-        if (dev_mod.injectHotReload(alloc, response.body)) |injected| {
-            owned_body = injected;
-            response.body = injected;
-        } else |_| {}
-    }
-    defer if (owned_body) |b| alloc.free(b);
+    if (dev and response.content_type == .html) injectHotReloadResponse(alloc, &response);
 
     try sendResponse(std_req, response, std_method == .HEAD, csp);
+}
+
+fn injectHotReloadResponse(alloc: std.mem.Allocator, response: *mer.Response) void {
+    const injected = dev_mod.injectHotReload(alloc, response.body) catch return;
+    response.replaceBodyOwned(alloc, injected);
+}
+
+fn eventsEndpointStatus(method: std.http.Method, has_framed_body: bool, has_watcher: bool) ?std.http.Status {
+    if (method != .GET) return .method_not_allowed;
+    if (has_framed_body) return .bad_request;
+    if (!has_watcher) return .service_unavailable;
+    return null;
 }
 
 fn requestHasFramedBody(std_req: *const std.http.Server.Request) bool {
@@ -984,6 +1000,32 @@ fn streamFailedImpl(ctx: *anyopaque) bool {
 /// Maximum number of Set-Cookie headers we emit per response.
 const MAX_COOKIES = 8;
 
+fn eventsMethodNotAllowedHeaders(csp: []const u8) [2 + security.header_count]std.http.Header {
+    var headers: [2 + security.header_count]std.http.Header = undefined;
+    headers[0] = .{ .name = "content-type", .value = mer.ContentType.text.mime() };
+    headers[1] = .{ .name = "allow", .value = "GET" };
+    const security_headers = security.headers(csp);
+    @memcpy(headers[2..], &security_headers);
+    return headers;
+}
+
+fn sendEventsMethodNotAllowed(std_req: *std.http.Server.Request, is_head: bool, csp: []const u8) !void {
+    const body = "GET required";
+    const headers = eventsMethodNotAllowedHeaders(csp);
+    var header_buf: [4096]u8 = undefined;
+    var bw = try std_req.respondStreaming(&header_buf, .{
+        .content_length = body.len,
+        .respond_options = .{
+            .status = .method_not_allowed,
+            .extra_headers = &headers,
+        },
+    });
+    markCommitted(.method_not_allowed);
+    markTtfb();
+    if (!is_head) try bw.writer.writeAll(body);
+    try bw.end();
+}
+
 fn sendResponse(std_req: *std.http.Server.Request, response: mer.Response, is_head: bool, csp: []const u8) !void {
     // Format Set-Cookie header values on the stack.
     var cookie_val_bufs: [MAX_COOKIES][512]u8 = undefined;
@@ -1057,10 +1099,14 @@ fn tryServePrerendered(
     };
     defer alloc.free(file_name);
 
-    const body = static.readContainedFile(alloc, io, "dist", file_name) orelse return .not_found;
-    defer alloc.free(body);
-    if (!static.reserveInFlight(body.len)) return .send_error;
-    defer static.releaseInFlight(body.len);
+    const file = switch (static.readContainedFileInFlight(alloc, io, "dist", file_name)) {
+        .file => |file| file,
+        .not_found => return .not_found,
+        .send_error => return .send_error,
+    };
+    defer file.release();
+    defer alloc.free(file.body);
+    const body = file.body;
 
     var fixed: [2 + security.header_count]std.http.Header = undefined;
     fixed[0] = .{ .name = "content-type", .value = "text/html; charset=utf-8" };
@@ -1081,6 +1127,30 @@ fn tryServePrerendered(
     bw.end() catch return .send_error;
 
     return .served;
+}
+
+test "dev hot reload replacement transfers response body ownership" {
+    const alloc = std.testing.allocator;
+    var response = mer.Response.init(.ok, .html, "");
+    response.replaceBodyOwned(alloc, try alloc.dupe(u8, "<body>hello</body>"));
+    defer response.deinit();
+
+    injectHotReloadResponse(alloc, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, dev_mod.hot_reload_script) != null);
+}
+
+test "dev events only streams bodyless GET requests with a watcher" {
+    try std.testing.expectEqual(@as(?std.http.Status, null), eventsEndpointStatus(.GET, false, true));
+    try std.testing.expectEqual(std.http.Status.method_not_allowed, eventsEndpointStatus(.POST, false, true).?);
+    try std.testing.expectEqual(std.http.Status.method_not_allowed, eventsEndpointStatus(.HEAD, false, true).?);
+    try std.testing.expectEqual(std.http.Status.bad_request, eventsEndpointStatus(.GET, true, true).?);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, eventsEndpointStatus(.GET, false, false).?);
+}
+
+test "dev events 405 advertises GET" {
+    const headers = eventsMethodNotAllowedHeaders(development_csp);
+    try std.testing.expectEqualStrings("allow", headers[1].name);
+    try std.testing.expectEqualStrings("GET", headers[1].value);
 }
 
 test "absolute deadlines do not renew with activity" {

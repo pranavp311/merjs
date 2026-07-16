@@ -89,9 +89,9 @@ fn zonUpdateString(comptime zon: anytype, comptime field: []const u8) ?[]const u
 
 fn zonServerMode(comptime zon: anytype) []const u8 {
     const T = @TypeOf(zon);
-    if (!@hasField(T, "server")) return "embedded";
+    if (!@hasField(T, "server")) return "";
     const ServerT = @TypeOf(zon.server);
-    if (!@hasField(ServerT, "mode")) return "embedded";
+    if (!@hasField(ServerT, "mode")) return "";
     return zon.server.mode;
 }
 
@@ -446,6 +446,11 @@ pub fn build(b: *std.Build) void {
     const install_synth = b.addInstallFile(synth_wasm.getEmittedBin(), "../examples/site/public/synth.wasm");
     wasm_step.dependOn(&install_synth.step);
 
+    // Production prerender consumes these site assets, so a clean archive must
+    // generate and install them before the prerender process starts.
+    run_prerender.step.dependOn(&install_counter.step);
+    run_prerender.step.dependOn(&install_synth.step);
+
     const grep_wasm = helpers.addWasmExe(b, "grep", "examples/site/wasm/grep.zig", wasm_target);
     const install_grep = b.addInstallFile(grep_wasm.getEmittedBin(), "../examples/site/worker/worker/grep.wasm");
     b.step("grep", "Compile grep WASM").dependOn(&install_grep.step);
@@ -513,14 +518,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     // Run inline tests in individual framework source files.
-    for ([_][]const u8{ "src/css.zig", "src/env.zig", "src/fetch.zig", "src/session.zig", "src/telemetry.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
+    for ([_][]const u8{ "src/css.zig", "src/env.zig", "src/fetch.zig", "src/session.zig", "src/telemetry.zig", "src/mer-worker.zig", "src/native/bridge.zig", "src/native/manifest.zig", "src/native/platform_commands.zig", "src/native/update.zig" }) |src_path| {
         const file_test_mod = b.createModule(.{
             .root_source_file = b.path(src_path),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        if (std.mem.eql(u8, src_path, "src/fetch.zig") or std.mem.eql(u8, src_path, "src/telemetry.zig")) {
+        if (std.mem.eql(u8, src_path, "src/fetch.zig") or std.mem.eql(u8, src_path, "src/telemetry.zig") or std.mem.eql(u8, src_path, "src/mer-worker.zig")) {
             file_test_mod.addImport("runtime", runtime_mod);
         }
         if (std.mem.eql(u8, src_path, "src/native/bridge.zig") and target.result.os.tag == .macos) {
@@ -720,7 +725,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── `zig build native` — native shell (dev: builds + runs) ─────────────
-    //     `zig build native-build` — install only (prod)
+    //     `zig build native-dev-build` — install only (dev, no run)
+    //     `zig build native-build` — production-gated install only
     //     `zig build package` — install + .app bundle with manifest Info.plist
     // Native runtime steps are macOS-only today. Linux WebKitGTK and Windows
     // WebView2 backends will split shared native executable setup from
@@ -756,9 +762,12 @@ pub fn build(b: *std.Build) void {
         const native_step = b.step("native", "Run the native shell (dev: hot reload + WebView)");
         native_step.dependOn(&run_native.step);
 
-        // `native-build` — install only (prod).
-        const native_build_step = b.step("native-build", "Build the native shell binary (prod, no run)");
-        native_build_step.dependOn(&native_install.step);
+        // Keep an explicit build-only development path for compile smoke tests.
+        const native_dev_build_step = b.step("native-dev-build", "Build the native shell binary without production checks");
+        native_dev_build_step.dependOn(&native_install.step);
+
+        // `native-build` is fail-closed: its production gate is attached below.
+        const native_build_step = b.step("native-build", "Build the production-gated native shell binary (no run)");
 
         // `package` — install + .app bundle with manifest-driven Info.plist.
         // Read identity/version from mer.app.zon at build time.
@@ -832,6 +841,9 @@ pub fn build(b: *std.Build) void {
         // gate so release credentials can stay out of the checked-in manifest.
         const prod_check_message = comptime macProdCheckMessage(app_zon);
         const native_prod_check_step = b.step("native-prod-check", "Validate macOS native production-release manifest hardening");
+        const native_prod_install = b.addInstallArtifact(native_exe, .{});
+        native_prod_install.step.dependOn(native_prod_check_step);
+        native_build_step.dependOn(&native_prod_install.step);
         if (prod_check_message.len == 0 and signing_identity != null and notarization_profile != null) {
             const ok = b.addSystemCommand(&.{ "sh", "-c", "echo 'mer native: macOS production manifest checks passed'" });
             native_prod_check_step.dependOn(&ok.step);
@@ -959,6 +971,14 @@ test "native production manifest gate accepts a complete embedded graph" {
         },
     };
     try std.testing.expectEqualStrings("", comptime macProdCheckMessage(zon));
+}
+
+test "native production manifest gate requires server mode embedded exactly" {
+    const missing = .{};
+    try std.testing.expect(std.mem.indexOf(u8, comptime macProdCheckMessage(missing), "server.mode must be embedded") != null);
+
+    const wrong_case = .{ .server = .{ .mode = "Embedded" } };
+    try std.testing.expect(std.mem.indexOf(u8, comptime macProdCheckMessage(wrong_case), "server.mode must be embedded") != null);
 }
 
 test "native production manifest gate rejects every unsafe graph branch" {

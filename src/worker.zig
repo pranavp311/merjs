@@ -143,7 +143,7 @@ export fn collect_fetch_urls(req_ptr: [*]const u8, req_len: u32) [*]const u8 {
     request_dispatch_count +%= 1;
     const response = dispatch_mod.dispatchBuffered(r, req);
     response.deinit();
-    const collected = mer.wasmEndCollect();
+    const collected = mer.wasmEndCollectV2();
     last_requests = collected.bytes;
     last_fetch_error = collected.error_code;
     return last_requests.ptr;
@@ -171,7 +171,7 @@ export fn dispatch_count() u32 {
 
 /// Phase 2 (per request ID): JS provides status and a bounded response body.
 export fn provide_fetch_result(id: u32, status: u32, body_ptr: [*]const u8, body_len: u32) u32 {
-    return mer.wasmProvideResult(id, status, body_ptr[0..body_len]);
+    return mer.wasmProvideResultV2(id, status, body_ptr[0..body_len]);
 }
 
 export fn fetch_protocol_error() u32 {
@@ -275,7 +275,7 @@ export fn handle(req_ptr: [*]const u8, req_len: u32) ?[*]const u8 {
     // Free previous response.
     if (last_response) |prev| allocator.free(prev);
     last_response = null;
-    defer last_fetch_error = mer.wasmClearCache();
+    defer last_fetch_error = mer.wasmClearCacheV2();
 
     const req = makeRequest(req_ptr[0..req_len]) orelse return null;
     const r = router orelse return null;

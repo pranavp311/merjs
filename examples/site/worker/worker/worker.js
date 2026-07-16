@@ -3,6 +3,7 @@
 import merWasm from "./merjs.wasm";
 import grepWasm from "./grep.wasm";
 import { AiAdmissionError, authorizePaidOperation, createAiAdmission } from "./ai-budget.js";
+import { collectFetchRounds, readBoundedBody, runBounded } from "./fetch-bridge.js";
 
 const merModule = Promise.resolve(merWasm).then(source =>
   source instanceof WebAssembly.Module ? source : WebAssembly.compile(source));
@@ -448,8 +449,10 @@ const MAX_FETCH_REQUEST_BYTES = 1024 * 1024;
 const MAX_RESPONSE_SIZE = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_FETCH_CONCURRENCY = 2;
+const MAX_FETCH_ROUNDS = MAX_FETCH_REQUESTS + 1;
+const FETCH_PROTOCOL_TIMEOUT_MS = 30000;
 
-function decodeFetchRequests(bytes, decoder) {
+function decodeFetchRequests(bytes, decoder, firstId = 0) {
   if (bytes.byteLength > MAX_FETCH_REQUEST_BYTES)
     throw new Error("fetch request bytes exceeded");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -469,9 +472,9 @@ function decodeFetchRequests(bytes, decoder) {
 
   const requests = [];
   while (offset < bytes.byteLength) {
-    if (requests.length >= MAX_FETCH_REQUESTS) throw new Error("too many fetch requests");
+    if (firstId + requests.length >= MAX_FETCH_REQUESTS) throw new Error("too many fetch requests");
     const id = readU32();
-    if (id !== requests.length) throw new Error("invalid fetch request ID");
+    if (id !== firstId + requests.length) throw new Error("invalid fetch request ID");
     const maxResponseSize = readU32();
     const methodLen = readU32();
     const urlLen = readU32();
@@ -493,80 +496,58 @@ function decodeFetchRequests(bytes, decoder) {
   return requests;
 }
 
-async function readBoundedBody(response, limit) {
-  const contentLength = response.headers.get("content-length");
-  if (contentLength !== null && Number(contentLength) > limit)
-    throw new Error("fetch response too large");
-  if (!response.body) return new Uint8Array();
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let length = 0;
+function provideOneFetchResult(wasm, result) {
+  const bodyPtr = result.body.byteLength === 0 ? 0 : wasm.alloc(result.body.byteLength);
+  if (!bodyPtr && result.body.byteLength !== 0) throw new Error("WASM fetch result allocation failed");
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value.byteLength > limit - length) {
-        await reader.cancel("fetch response too large");
-        throw new Error("fetch response too large");
-      }
-      chunks.push(value);
-      length += value.byteLength;
-    }
+    if (result.body.byteLength !== 0) new Uint8Array(wasm.memory.buffer).set(result.body, bodyPtr);
+    const errorCode = wasm.provide_fetch_result(result.id, result.status, bodyPtr || 0, result.body.byteLength);
+    if (errorCode !== 0) throw new Error(`WASM fetch result error ${errorCode}`);
   } finally {
-    reader.releaseLock();
+    if (result.body.byteLength !== 0) wasm.dealloc(bodyPtr, result.body.byteLength);
   }
-  const body = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body;
 }
 
-async function runBounded(items, worker) {
-  let next = 0;
-  let firstError;
-  const runners = Array.from(
-    { length: Math.min(MAX_FETCH_CONCURRENCY, items.length) },
-    async () => {
-      while (next < items.length && !firstError) {
-        const item = items[next++];
-        try {
-          await worker(item);
-        } catch (error) {
-          firstError ||= error;
-        }
-      }
-    },
-  );
-  await Promise.all(runners);
-  if (firstError) throw firstError;
+async function fetchRound(wasm, requests, results, responseBudget, signal) {
+  const roundController = new AbortController();
+  const abortRound = () => roundController.abort(signal.reason);
+  if (signal.aborted) abortRound();
+  else signal.addEventListener("abort", abortRound, { once: true });
+  try {
+    await runBounded(requests, MAX_FETCH_CONCURRENCY, async (request) => {
+      const response = await fetch(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        signal: roundController.signal,
+      });
+      const body = await readBoundedBody(response, request.maxResponseSize, roundController.signal);
+      if (body.byteLength > MAX_RESPONSE_BYTES - responseBudget.bytes)
+        throw new Error("total fetch response bytes exceeded");
+      responseBudget.bytes += body.byteLength;
+      const result = { id: request.id, status: response.status, body };
+      provideOneFetchResult(wasm, result);
+      results[request.id] = result;
+    }, error => roundController.abort(error));
+  } finally {
+    signal.removeEventListener("abort", abortRound);
+  }
 }
 
-async function provideFetchResults(wasm, requests) {
-  let providedBytes = 0;
-  await runBounded(requests, async (request) => {
-    const response = await fetch(request.url, {
-      method: request.method,
-      headers: request.headers,
-      body: request.body,
-    });
-    const body = await readBoundedBody(response, request.maxResponseSize);
-    if (body.byteLength > MAX_RESPONSE_BYTES - providedBytes)
-      throw new Error("total fetch response bytes exceeded");
-    providedBytes += body.byteLength;
-    const bodyPtr = wasm.alloc(body.byteLength);
-    if (!bodyPtr && body.byteLength !== 0) throw new Error("WASM fetch result allocation failed");
-    try {
-      if (body.byteLength !== 0) new Uint8Array(wasm.memory.buffer).set(body, bodyPtr);
-      const errorCode = wasm.provide_fetch_result(request.id, response.status, bodyPtr || 0, body.byteLength);
-      if (errorCode !== 0) throw new Error(`WASM fetch result error ${errorCode}`);
-    } finally {
-      if (body.byteLength !== 0) wasm.dealloc(bodyPtr, body.byteLength);
-    }
-  });
+function restoreFetchState(wasm, applicationState, expectedState, results) {
+  new Uint8Array(wasm.memory.buffer, 0, applicationState.length).set(applicationState);
+  const expectedCopyPtr = expectedState.length === 0 ? 0 : wasm.alloc(expectedState.length);
+  if (expectedState.length !== 0 && !expectedCopyPtr)
+    throw new Error("WASM expected-state allocation failed");
+  try {
+    if (expectedState.length !== 0)
+      new Uint8Array(wasm.memory.buffer).set(expectedState, expectedCopyPtr);
+    const restoreError = wasm.restore_expected_state(expectedCopyPtr || 0, expectedState.length);
+    if (restoreError !== 0) throw new Error(`WASM expected-state restore error ${restoreError}`);
+  } finally {
+    if (expectedState.length !== 0) wasm.dealloc(expectedCopyPtr, expectedState.length);
+  }
+  for (const result of results) provideOneFetchResult(wasm, result);
 }
 
 // ── Main fetch handler ────────────────────────────────────────────────────────
@@ -607,40 +588,38 @@ async function handleRequest(request, env) {
     if (!ptr) return workerResponse("WASM alloc failed", { status: 500 });
     new Uint8Array(wasm.memory.buffer).set(encoded, ptr);
 
-    // Phase 1: collect complete requests during a dry render. Snapshot all
-    // application memory first so route side effects are not observed twice.
+    // Iteratively dry-render from the same snapshot. Cached prefix responses
+    // reveal response-dependent requests without retaining dry-run side effects.
     const applicationState = new Uint8Array(wasm.memory.buffer).slice();
+    const responseBudget = { bytes: 0 };
     try {
-      const requestsPtr = wasm.collect_fetch_urls(ptr, encoded.length);
-      const requestsLen = wasm.collect_urls_len();
-      const requestBytes = new Uint8Array(wasm.memory.buffer, requestsPtr, requestsLen).slice();
-      const expectedPtr = wasm.expected_state_ptr();
-      const expectedLen = wasm.expected_state_len();
-      const expectedState = new Uint8Array(wasm.memory.buffer, expectedPtr, expectedLen).slice();
-      const collectError = wasm.fetch_protocol_error();
-      if (collectError !== 0) throw new Error(`WASM fetch collection error ${collectError}`);
-
-      new Uint8Array(wasm.memory.buffer, 0, applicationState.length).set(applicationState);
-      const expectedCopyPtr = expectedState.length === 0 ? 0 : wasm.alloc(expectedState.length);
-      if (expectedState.length !== 0 && !expectedCopyPtr)
-        throw new Error("WASM expected-state allocation failed");
-      try {
-        if (expectedState.length !== 0)
-          new Uint8Array(wasm.memory.buffer).set(expectedState, expectedCopyPtr);
-        const restoreError = wasm.restore_expected_state(expectedCopyPtr || 0, expectedState.length);
-        if (restoreError !== 0) throw new Error(`WASM expected-state restore error ${restoreError}`);
-      } finally {
-        if (expectedState.length !== 0) wasm.dealloc(expectedCopyPtr, expectedState.length);
-      }
-
-      // Phase 2: run bounded Worker fetches and provide results by unique ID.
-      await provideFetchResults(wasm, decodeFetchRequests(requestBytes, decoder));
+      await collectFetchRounds({
+        maxRounds: MAX_FETCH_ROUNDS,
+        maxRequests: MAX_FETCH_REQUESTS,
+        maxRequestBytes: MAX_FETCH_REQUEST_BYTES,
+        maxDurationMs: FETCH_PROTOCOL_TIMEOUT_MS,
+        restore: (expectedState, results) => restoreFetchState(wasm, applicationState, expectedState, results),
+        collect: firstId => {
+          const requestsPtr = wasm.collect_fetch_urls(ptr, encoded.length);
+          const requestsLen = wasm.collect_urls_len();
+          const bytes = new Uint8Array(wasm.memory.buffer, requestsPtr, requestsLen).slice();
+          const expectedPtr = wasm.expected_state_ptr();
+          const expectedLen = wasm.expected_state_len();
+          return {
+            errorCode: wasm.fetch_protocol_error(),
+            requestBytes: requestsLen,
+            expectedState: new Uint8Array(wasm.memory.buffer, expectedPtr, expectedLen).slice(),
+            requests: decodeFetchRequests(bytes, decoder, firstId),
+          };
+        },
+        fetchRound: (requests, results, signal) => fetchRound(wasm, requests, results, responseBudget, signal),
+      });
     } catch (_) {
       wasm.dealloc(ptr, encoded.length);
       return workerResponse("Fetch Bridge Error", { status: 502 });
     }
 
-    // Phase 3: render once from the restored state with pre-fetched data in cache
+    // Render once from the restored state with all discovered data in cache.
     let resPtr;
     try {
       resPtr = wasm.handle(ptr, encoded.length);

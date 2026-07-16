@@ -140,7 +140,7 @@ const CacheLookup = union(enum) {
     hit: CacheLease,
 };
 
-const LoadResult = enum { found, not_found };
+const LoadResult = enum { found, not_found, send_error };
 
 const CacheLoad = struct {
     key: []u8,
@@ -345,14 +345,38 @@ fn openedDirIsInsideProject(dir: std.Io.Dir, io: std.Io) bool {
 /// Read a static file by walking one component at a time below an already-open
 /// root directory. No component may be a symlink, so path validation and file
 /// opening are tied to directory handles rather than a race-prone path check.
-const MaterializedFile = struct {
+pub const MaterializedFile = struct {
     body: []u8,
     reserved: usize,
 
-    fn release(self: MaterializedFile) void {
+    pub fn release(self: MaterializedFile) void {
         if (self.reserved != 0) releaseInFlight(self.reserved);
     }
 };
+
+fn readAdmittedFileBody(reader: *std.Io.Reader, alloc: std.mem.Allocator, admitted_size: usize) ![]u8 {
+    return reader.allocRemaining(alloc, .limited(admitted_size));
+}
+
+pub const MaterializeResult = union(enum) {
+    file: MaterializedFile,
+    not_found,
+    send_error,
+};
+
+fn openFailure(err: anyerror) MaterializeResult {
+    return switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.IsDir,
+        error.SymLinkLoop,
+        error.NetworkNotFound,
+        error.BadPathName,
+        error.NameTooLong,
+        => .not_found,
+        else => .send_error,
+    };
+}
 
 fn materializeContainedFile(
     alloc: std.mem.Allocator,
@@ -360,19 +384,19 @@ fn materializeContainedFile(
     dir: []const u8,
     rel: []const u8,
     admission_copies: usize,
-) ?MaterializedFile {
-    if (!isSafeRelativePath(rel)) return null;
+) MaterializeResult {
+    if (!isSafeRelativePath(rel)) return .not_found;
 
-    var current = std.Io.Dir.cwd().openDir(io, dir, .{}) catch return null;
+    var current = std.Io.Dir.cwd().openDir(io, dir, .{}) catch |err| return openFailure(err);
     defer current.close(io);
     // A top-level symlink is allowed only when it resolves within the project
     // (the merjs repo intentionally maps public -> examples/site/public).
-    if (!openedDirIsInsideProject(current, io)) return null;
+    if (!openedDirIsInsideProject(current, io)) return .not_found;
 
     var parts = std.mem.splitScalar(u8, rel, '/');
-    var component = parts.next() orelse return null;
+    var component = parts.next() orelse return .not_found;
     while (parts.next()) |next| {
-        const child = current.openDir(io, component, .{ .follow_symlinks = false }) catch return null;
+        const child = current.openDir(io, component, .{ .follow_symlinks = false }) catch |err| return openFailure(err);
         current.close(io);
         current = child;
         component = next;
@@ -382,19 +406,23 @@ fn materializeContainedFile(
         .allow_directory = false,
         .follow_symlinks = false,
         .resolve_beneath = true,
-    }) catch return null;
+    }) catch |err| return openFailure(err);
     defer file.close(io);
-    const stat = file.stat(io) catch return null;
-    const size = std.math.cast(usize, stat.size) orelse return null;
-    if (size > 10 * 1024 * 1024) return null;
-    const reserved = std.math.mul(usize, size, admission_copies) catch return null;
-    if (reserved != 0 and !reserveInFlight(reserved)) return null;
-    errdefer if (reserved != 0) releaseInFlight(reserved);
+    const stat = file.stat(io) catch return .send_error;
+    const size = std.math.cast(usize, stat.size) orelse return .send_error;
+    if (size > 10 * 1024 * 1024) return .send_error;
+    const reserved = std.math.mul(usize, size, admission_copies) catch return .send_error;
+    if (reserved != 0 and !reserveInFlight(reserved)) return .send_error;
 
     var read_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &read_buf);
-    const body = reader.interface.allocRemaining(alloc, .limited(10 * 1024 * 1024)) catch return null;
-    return .{ .body = body, .reserved = reserved };
+    // The stat size is the admission decision. A file that grows afterward
+    // must not cause a larger allocation or escape the in-flight reservation.
+    const body = readAdmittedFileBody(&reader.interface, alloc, size) catch {
+        if (reserved != 0) releaseInFlight(reserved);
+        return .send_error;
+    };
+    return .{ .file = .{ .body = body, .reserved = reserved } };
 }
 
 pub fn readContainedFile(
@@ -403,7 +431,20 @@ pub fn readContainedFile(
     dir: []const u8,
     rel: []const u8,
 ) ?[]u8 {
-    return (materializeContainedFile(alloc, io, dir, rel, 0) orelse return null).body;
+    return switch (materializeContainedFile(alloc, io, dir, rel, 0)) {
+        .file => |file| file.body,
+        .not_found, .send_error => null,
+    };
+}
+
+/// Reserve response bytes from the file's stat size before allocating or reading.
+pub fn readContainedFileInFlight(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    rel: []const u8,
+) MaterializeResult {
+    return materializeContainedFile(alloc, io, dir, rel, 1);
 }
 
 pub fn tryServe(
@@ -444,9 +485,13 @@ pub fn tryServe(
                     return sendStatic(std_req, lease.entry.body, lease.entry.ct, rel, opts);
                 },
                 .overloaded => return .send_error,
-                .miss => if (owner_result == .not_found) {
-                    if (opts.spa) return serveIndex(alloc, std_req, opts.dir, io, opts);
-                    return .not_found;
+                .miss => switch (owner_result) {
+                    .not_found => {
+                        if (opts.spa) return serveIndex(alloc, std_req, opts.dir, io, opts);
+                        return .not_found;
+                    },
+                    .send_error => return .send_error,
+                    .found => {},
                 },
             }
             load = null;
@@ -455,10 +500,17 @@ pub fn tryServe(
     var load_result: LoadResult = .found;
     defer if (load) |lease| lease.finish(load_result);
 
-    const file = materializeContainedFile(alloc, io, opts.dir, rel, if (opts.dev) 1 else 2) orelse {
-        load_result = .not_found;
-        if (opts.spa) return serveIndex(alloc, std_req, opts.dir, io, opts);
-        return .not_found;
+    const file = switch (materializeContainedFile(alloc, io, opts.dir, rel, if (opts.dev) 1 else 2)) {
+        .file => |file| file,
+        .not_found => {
+            load_result = .not_found;
+            if (opts.spa) return serveIndex(alloc, std_req, opts.dir, io, opts);
+            return .not_found;
+        },
+        .send_error => {
+            load_result = .send_error;
+            return .send_error;
+        },
     };
     defer file.release();
     defer alloc.free(file.body);
@@ -467,6 +519,12 @@ pub fn tryServe(
 
     // Development reads from disk on every request so edits are immediately visible.
     if (!opts.dev) putCache(cache_key, file.body, ct);
+    // Wake duplicate loaders after the disk/cache decision, never after a
+    // potentially slow client socket write.
+    if (load) |lease| {
+        lease.finish(.found);
+        load = null;
+    }
     return sendStatic(std_req, file.body, ct, rel, opts);
 }
 
@@ -500,20 +558,35 @@ fn serveIndex(
                     return sendStatic(std_req, lease.entry.body, lease.entry.ct, "index.html", opts);
                 },
                 .overloaded => return .send_error,
-                .miss => if (owner_result == .not_found) return .not_found,
+                .miss => switch (owner_result) {
+                    .not_found => return .not_found,
+                    .send_error => return .send_error,
+                    .found => {},
+                },
             }
             load = null;
         }
     }
     var load_result: LoadResult = .found;
     defer if (load) |lease| lease.finish(load_result);
-    const file = materializeContainedFile(alloc, io, dir, "index.html", if (opts.dev) 1 else 2) orelse {
-        load_result = .not_found;
-        return .not_found;
+    const file = switch (materializeContainedFile(alloc, io, dir, "index.html", if (opts.dev) 1 else 2)) {
+        .file => |file| file,
+        .not_found => {
+            load_result = .not_found;
+            return .not_found;
+        },
+        .send_error => {
+            load_result = .send_error;
+            return .send_error;
+        },
     };
     defer file.release();
     defer alloc.free(file.body);
     if (!opts.dev) putCache(cache_key, file.body, .html);
+    if (load) |lease| {
+        lease.finish(.found);
+        load = null;
+    }
     return sendStatic(std_req, file.body, .html, "index.html", opts);
 }
 
@@ -657,6 +730,30 @@ test "duplicate missing-path follower observes the owner miss" {
     try std.testing.expectEqual(@as(usize, 0), cache_loads.count());
 }
 
+test "duplicate failed-load follower observes the owner send error" {
+    initCache(std.testing.allocator, .{});
+    defer deinitCache();
+
+    const owner = beginLoad("public/overloaded") orelse return error.TestUnexpectedResult;
+    const follower = beginLoad("public/overloaded") orelse return error.TestUnexpectedResult;
+    const Context = struct {
+        lease: LoadLease,
+        result: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            ctx.result.store(ctx.lease.wait() == .send_error, .release);
+            ctx.lease.release();
+        }
+    };
+    var ctx: Context = .{ .lease = follower };
+    const thread = try std.Thread.spawn(.{}, Context.run, .{&ctx});
+    owner.finish(.send_error);
+    thread.join();
+
+    try std.testing.expect(ctx.result.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache_loads.count());
+}
+
 test "cold materialization admission accounts for body and cache copy" {
     initCache(std.testing.allocator, .{ .max_in_flight_bytes = 7 });
     defer deinitCache();
@@ -664,6 +761,22 @@ test "cold materialization admission accounts for body and cache copy" {
     try std.testing.expect(reserveInFlight(3 * 2));
     try std.testing.expect(!reserveInFlight(2));
     releaseInFlight(3 * 2);
+    try std.testing.expectEqual(@as(usize, 0), cache_in_flight_bytes);
+}
+
+test "file growth beyond the stat admission is rejected" {
+    var reader = std.Io.Reader.fixed("grew");
+    try std.testing.expectError(error.StreamTooLong, readAdmittedFileBody(&reader, std.testing.allocator, 3));
+}
+
+test "in-flight contained reads are admitted before body allocation" {
+    const alloc = std.testing.allocator;
+    initCache(alloc, .{ .max_in_flight_bytes = 1 });
+    defer deinitCache();
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expect(readContainedFileInFlight(failing.allocator(), std.testing.io, "src", "static.zig") == .send_error);
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), cache_in_flight_bytes);
 }
 
@@ -748,6 +861,12 @@ test "immutable assets require a delimited mixed all-hex content hash of at leas
     try std.testing.expect(!isFingerprinted("report-2024-01-31.pdf"));
     try std.testing.expect(!isFingerprinted("library-v1.2.3.js"));
     try std.testing.expect(!isFingerprinted("report-2024202420242024.pdf"));
+}
+
+test "directory final components are treated as route misses" {
+    try std.testing.expect(openFailure(error.IsDir) == .not_found);
+    try std.testing.expect(openFailure(error.AccessDenied) == .send_error);
+    try std.testing.expect(openFailure(error.SystemResources) == .send_error);
 }
 
 test "static relative paths reject traversal and ambiguous separators" {
