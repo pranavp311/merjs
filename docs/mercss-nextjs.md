@@ -122,7 +122,7 @@ But at that point... just use Tailwind.
 
 **Different ecosystems, different tools.**
 
-- Next.js → Tailwind CSS  
+- Next.js → Tailwind CSS
 - merjs → mercss
 
 Don't cross the streams. Use the right tool for the job.
