@@ -564,6 +564,8 @@ pub fn build(b: *std.Build) void {
     worker_step.dependOn(&install_worker.step);
     worker_step.dependOn(&install_vercel_worker.step);
     worker_step.dependOn(&install_grep.step);
+    worker_step.dependOn(&install_counter.step);
+    worker_step.dependOn(&install_synth.step);
 
     // ── Examples (sgdata, kanban) ────────────────────────────────────────────
     examples.addExamples(b, mer_worker_mod, wasm_target);

@@ -91,7 +91,10 @@ jobs:
             "$stage/examples/vercel-edge/merjs.wasm" \
             "$stage/examples/singapore-data-dashboard/worker/merjs.wasm" \
             "$stage/examples/kanban/worker/merjs.wasm"
-          (cd "$stage" && zig build worker && zig build sgdata-worker && zig build worker-example-kanban)
+          (cd "$stage" && zig build worker)
+          test -f "$stage/examples/site/public/counter.wasm"
+          test -f "$stage/examples/site/public/synth.wasm"
+          (cd "$stage" && zig build sgdata-worker && zig build worker-example-kanban)
           node "$stage/tests/worker_deployment.mjs" "$stage"
           npm ci --prefix "$stage/examples/site/worker/worker" --ignore-scripts
           wrangler="$stage/examples/site/worker/worker/node_modules/.bin/wrangler"
