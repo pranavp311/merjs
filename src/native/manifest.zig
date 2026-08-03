@@ -172,7 +172,7 @@ pub fn fromZon(comptime zon: anytype) Manifest {
 }
 
 fn parseIpv4Byte(part: []const u8) ?u8 {
-    if (part.len == 0 or part.len > 3) return null;
+    if (part.len == 0 or part.len > 3 or (part.len > 1 and part[0] == '0')) return null;
     for (part) |c| if (!std.ascii.isDigit(c)) return null;
     return std.fmt.parseInt(u8, part, 10) catch null;
 }
@@ -212,6 +212,17 @@ test "isLoopbackHost only accepts local native bind hosts" {
     try std.testing.expect(isLoopbackHost("::1"));
     try std.testing.expect(isLoopbackHost("[::1]"));
     try std.testing.expect(!isLoopbackHost("localhost"));
+    try std.testing.expect(!isLoopbackHost("127.000.000.001"));
+    try std.testing.expect(!isLoopbackHost("2130706433"));
+    try std.testing.expect(!isLoopbackHost("0177.0.0.1"));
+    try std.testing.expect(!isLoopbackHost("0x7f000001"));
+    try std.testing.expect(!isLoopbackHost("127.1"));
+    try std.testing.expect(!isLoopbackHost("0:0:0:0:0:0:0:1"));
+    try std.testing.expect(!isLoopbackHost("[0:0:0:0:0:0:0:1]"));
+    try std.testing.expect(!isLoopbackHost("::127.0.0.1"));
+    try std.testing.expect(!isLoopbackHost("::ffff:127.0.0.1"));
+    try std.testing.expect(!isLoopbackHost("::7f00:1"));
+    try std.testing.expect(!isLoopbackHost("::ffff:7f00:1"));
     try std.testing.expect(!isLoopbackHost("127.example.com"));
     try std.testing.expect(!isLoopbackHost("127.0.0.1.evil"));
     try std.testing.expect(!isLoopbackHost("0.0.0.0"));

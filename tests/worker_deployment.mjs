@@ -49,6 +49,13 @@ for (const deployment of deployments) {
 
 assert.ok(!existsSync(join(root, "examples/site/worker/worker/wrangler.toml")), "site has a duplicate nested Wrangler config");
 
+const kanbanConfigPath = join(root, "examples/kanban/worker/wrangler.toml");
+const kanbanConfig = readFileSync(kanbanConfigPath, "utf8");
+assert.match(kanbanConfig, /^main = "worker\.js"$/m);
+assert.ok(kanbanConfig.includes('command = "cd ../../../ && zig build worker-example-kanban"'), "Kanban deployment: wrong build command");
+resolveImports(join(dirname(kanbanConfigPath), "worker.js"));
+assert.ok(existsSync(join(dirname(kanbanConfigPath), "merjs.wasm")), "Kanban deployment is missing merjs.wasm");
+
 const vercelConfig = JSON.parse(readFileSync(join(root, "examples/vercel-edge/vercel.json"), "utf8"));
 assert.deepEqual(vercelConfig.rewrites, [{ source: "/(.*)", destination: "/api" }]);
 assert.ok(!("buildCommand" in vercelConfig), "Vercel deployment unexpectedly requires a remote Zig toolchain");

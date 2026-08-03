@@ -9,10 +9,17 @@ pub const max_response_size_limit: usize = 8 * 1024 * 1024;
 pub const max_wasm_requests: usize = 64;
 pub const max_wasm_request_bytes: usize = 1024 * 1024;
 pub const max_wasm_response_bytes: usize = 32 * 1024 * 1024;
+/// Maximum native transport workers. A worker whose transport does not cooperate with
+/// cancellation keeps one of these slots until it exits.
 pub const max_fetch_concurrency: usize = 8;
 pub const max_fetch_requests: usize = 64;
 pub const max_fetch_response_bytes: usize = 32 * 1024 * 1024;
-pub const fetch_total_timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(30), .clock = .awake };
+/// 30-second native caller and transport cancellation deadline. The caller returns at
+/// this deadline even if cancellation stalls; a non-cooperative transport remains within
+/// `max_fetch_concurrency` until it exits.
+pub const fetch_wait_timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(30), .clock = .awake };
+/// Backward-compatible name for `fetch_wait_timeout`.
+pub const fetch_total_timeout = fetch_wait_timeout;
 
 /// Options for a single HTTP request made during server-side rendering.
 pub const FetchRequest = struct {
@@ -450,9 +457,10 @@ const NativeFetchContext = struct {
     refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(2),
     complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     request: FetchRequest,
+    deadline: std.Io.Clock.Timestamp,
     result: ?(anyerror!FetchResponse) = null,
 
-    fn create(opts: FetchRequest) !*NativeFetchContext {
+    fn create(opts: FetchRequest, deadline: std.Io.Clock.Timestamp) !*NativeFetchContext {
         const context = try native_fetch_allocator.create(NativeFetchContext);
         errdefer native_fetch_allocator.destroy(context);
         const url = try native_fetch_allocator.dupe(u8, opts.url);
@@ -480,6 +488,7 @@ const NativeFetchContext = struct {
                 .headers = headers,
                 .max_response_size = opts.max_response_size,
             },
+            .deadline = deadline,
         };
         _ = native_fetch_contexts.fetchAdd(1, .monotonic);
         return context;
@@ -500,12 +509,45 @@ const NativeFetchContext = struct {
     }
 };
 
+fn invokeFetch(fetch_fn: NativeFetchFn, io: std.Io, allocator: std.mem.Allocator, opts: FetchRequest) anyerror!FetchResponse {
+    return fetch_fn(io, allocator, opts);
+}
+
+fn fetchWithWorkerTimeout(io: std.Io, allocator: std.mem.Allocator, opts: FetchRequest, timeout: std.Io.Clock.Duration, fetch_fn: NativeFetchFn) !FetchResponse {
+    const Completion = union(enum) {
+        response: anyerror!FetchResponse,
+        timeout: std.Io.Cancelable!void,
+    };
+    var completion_buf: [2]Completion = undefined;
+    var select = std.Io.Select(Completion).init(io, &completion_buf);
+    select.async(.response, invokeFetch, .{ fetch_fn, io, allocator, opts });
+    select.async(.timeout, std.Io.Clock.Duration.sleep, .{ timeout, io });
+
+    switch (try select.await()) {
+        .response => |result| {
+            select.cancelDiscard();
+            return result;
+        },
+        .timeout => |result| try result,
+    }
+
+    while (select.cancel()) |completion| switch (completion) {
+        .response => |result| if (result) |response| response.deinit(allocator) else |_| {},
+        .timeout => {},
+    };
+    return error.FetchTimeout;
+}
+
 fn nativeFetchWorker(context: *NativeFetchContext, fetch_fn: NativeFetchFn) void {
     defer releaseFetchSlot();
     defer context.release();
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
-    context.result = fetch_fn(threaded.io(), native_fetch_allocator, context.request);
+    const remaining = context.deadline.durationFromNow(threaded.io());
+    context.result = if (remaining.raw.toNanoseconds() <= 0)
+        error.FetchTimeout
+    else
+        fetchWithWorkerTimeout(threaded.io(), native_fetch_allocator, context.request, remaining, fetch_fn);
     context.complete.store(true, .release);
 }
 
@@ -518,14 +560,13 @@ fn spawnNativeFetchWorker(context: *NativeFetchContext, fetch_fn: NativeFetchFn)
 const NativeFetchJob = struct {
     context: *NativeFetchContext,
     wait_io: std.Io,
-    deadline: std.Io.Clock.Timestamp,
     poll_budget: usize,
 
     fn await(job: NativeFetchJob, allocator: std.mem.Allocator) !FetchResponse {
         defer job.context.release();
         var budget = job.poll_budget;
         while (!job.context.complete.load(.acquire)) {
-            if (budget == 0 or std.Io.Clock.Timestamp.now(job.wait_io, job.deadline.clock).compare(.gte, job.deadline))
+            if (budget == 0 or std.Io.Clock.Timestamp.now(job.wait_io, job.context.deadline.clock).compare(.gte, job.context.deadline))
                 return error.FetchTimeout;
             budget -= 1;
             std.Io.sleep(job.wait_io, std.Io.Duration.fromMilliseconds(1), .awake) catch return error.FetchTimeout;
@@ -537,7 +578,8 @@ const NativeFetchJob = struct {
 
 fn startNativeFetch(io: std.Io, opts: FetchRequest, timeout: std.Io.Clock.Duration, fetch_fn: NativeFetchFn, spawn_fn: NativeSpawnFn) !NativeFetchJob {
     if (!tryAcquireFetchSlot()) return error.FetchConcurrencyLimitExceeded;
-    const context = NativeFetchContext.create(opts) catch |err| {
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, timeout);
+    const context = NativeFetchContext.create(opts, deadline) catch |err| {
         releaseFetchSlot();
         return err;
     };
@@ -549,11 +591,10 @@ fn startNativeFetch(io: std.Io, opts: FetchRequest, timeout: std.Io.Clock.Durati
     };
     thread.detach();
     const milliseconds = @max(timeout.raw.toMilliseconds(), 0);
-    const poll_budget: usize = @intCast(@min(milliseconds + 1, 60_001));
+    const poll_budget: usize = @intCast(@min(milliseconds +| 1, 60_001));
     return .{
         .context = context,
         .wait_io = io,
-        .deadline = .fromNow(io, timeout),
         .poll_budget = poll_budget,
     };
 }
@@ -572,6 +613,11 @@ fn collectOrReplayRequest(allocator: std.mem.Allocator, opts: FetchRequest) ?Fet
 }
 
 /// Make an HTTP request from a server-side page handler.
+///
+/// On native targets, `error.FetchTimeout` means the caller wait deadline expired. Its
+/// worker also cancels a cancellable transport at that deadline; a non-cooperative transport
+/// remains within the bounded worker cap. `error.FetchConcurrencyLimitExceeded` instead means
+/// no worker slot was available when the request was admitted.
 pub fn fetch(allocator: std.mem.Allocator, opts: FetchRequest) !FetchResponse {
     if (opts.max_response_size > max_response_size_limit) return error.ResponseSizeLimitExceeded;
     if (comptime builtin.os.tag == .freestanding) {
@@ -579,7 +625,7 @@ pub fn fetch(allocator: std.mem.Allocator, opts: FetchRequest) !FetchResponse {
             return collectOrReplayRequest(allocator, opts) orelse error.WasmCollecting;
         return replayRequest(allocator, opts) orelse error.WasmProtocolMismatch;
     }
-    return fetchNative(runtime.io, allocator, opts, fetch_total_timeout, fetchUnpooled);
+    return fetchNative(runtime.io, allocator, opts, fetch_wait_timeout, fetchUnpooled);
 }
 
 fn replayRequest(allocator: std.mem.Allocator, opts: FetchRequest) ?FetchResponse {
@@ -647,7 +693,7 @@ pub fn fetchAll(allocator: std.mem.Allocator, requests: []const FetchRequest) []
         return results;
     }
 
-    fetchAllNative(allocator, runtime.io, results, requests, fetch_total_timeout, fetchUnpooled, spawnNativeFetchWorker);
+    fetchAllNative(allocator, runtime.io, results, requests, fetch_wait_timeout, fetchUnpooled, spawnNativeFetchWorker);
 
     var response_bytes: usize = 0;
     for (results) |*response| {
@@ -663,7 +709,7 @@ pub fn fetchAll(allocator: std.mem.Allocator, requests: []const FetchRequest) []
     return results;
 }
 
-test "detached native fetches keep owned requests and slots until workers exit" {
+test "native fetch wait deadline bounds workers and retains owned requests without UAF" {
     if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
     const Stall = struct {
         var entered = std.atomic.Value(usize).init(0);
@@ -695,7 +741,7 @@ test "detached native fetches keep owned requests and slots until workers exit" 
             .value = try allocator.dupe(u8, "yes"),
         }}),
     };
-    const timeout: std.Io.Clock.Duration = .{ .raw = .zero, .clock = .awake };
+    const timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(1), .clock = .awake };
     try std.testing.expectError(error.FetchTimeout, fetchNative(std.testing.io, allocator, request, timeout, Stall.fetch));
 
     var requests: [max_fetch_requests]FetchRequest = @splat(request);
@@ -706,11 +752,80 @@ test "detached native fetches keep owned requests and slots until workers exit" 
 
     while (Stall.entered.load(.acquire) < max_fetch_concurrency) std.Thread.yield() catch {};
     try std.testing.expectEqual(@as(usize, 0), native_fetch_slots.load(.acquire));
+    try std.testing.expectError(error.FetchConcurrencyLimitExceeded, startNativeFetch(
+        std.testing.io,
+        request,
+        timeout,
+        Stall.fetch,
+        spawnNativeFetchWorker,
+    ));
     try std.testing.expectEqual(initial_contexts + max_fetch_concurrency, native_fetch_contexts.load(.monotonic));
     Stall.release.store(true, .release);
     while (native_fetch_contexts.load(.monotonic) != initial_contexts or
         native_fetch_slots.load(.acquire) != max_fetch_concurrency) std.Thread.yield() catch {};
     try std.testing.expectEqual(max_fetch_concurrency, Stall.valid.load(.monotonic));
+}
+
+test "native fetch deadline is fixed before delayed worker spawn" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    const Delayed = struct {
+        var started = std.atomic.Value(usize).init(0);
+
+        fn fetch(io: std.Io, allocator: std.mem.Allocator, opts: FetchRequest) !FetchResponse {
+            _ = io;
+            _ = allocator;
+            _ = opts;
+            _ = started.fetchAdd(1, .monotonic);
+            return error.UnexpectedFetch;
+        }
+
+        fn spawn(context: *NativeFetchContext, fetch_fn: NativeFetchFn) !std.Thread {
+            try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
+            return spawnNativeFetchWorker(context, fetch_fn);
+        }
+    };
+
+    const initial_contexts = native_fetch_contexts.load(.monotonic);
+    const timeout: std.Io.Clock.Duration = .{ .raw = .zero, .clock = .awake };
+    const job = try startNativeFetch(
+        std.testing.io,
+        .{ .url = "http://delayed-spawn.invalid" },
+        timeout,
+        Delayed.fetch,
+        Delayed.spawn,
+    );
+    try std.testing.expectError(error.FetchTimeout, job.await(std.testing.allocator));
+    while (native_fetch_contexts.load(.monotonic) != initial_contexts or
+        native_fetch_slots.load(.acquire) != max_fetch_concurrency) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(usize, 0), Delayed.started.load(.monotonic));
+}
+
+test "cancellable stalled native fetch releases its worker slot" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    const Stall = struct {
+        var event: std.Io.Event = .unset;
+
+        fn fetch(io: std.Io, allocator: std.mem.Allocator, opts: FetchRequest) !FetchResponse {
+            _ = allocator;
+            _ = opts;
+            try event.wait(io);
+            return error.UnexpectedStallRelease;
+        }
+    };
+
+    const initial_contexts = native_fetch_contexts.load(.monotonic);
+    const timeout: std.Io.Clock.Duration = .{ .raw = .zero, .clock = .awake };
+    try std.testing.expectError(error.FetchTimeout, fetchNative(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .url = "http://cancellable-stall.invalid" },
+        timeout,
+        Stall.fetch,
+    ));
+    while (native_fetch_contexts.load(.monotonic) != initial_contexts or
+        native_fetch_slots.load(.acquire) != max_fetch_concurrency) std.Thread.yield() catch {};
+    for (0..max_fetch_concurrency) |_| try std.testing.expect(tryAcquireFetchSlot());
+    for (0..max_fetch_concurrency) |_| releaseFetchSlot();
 }
 
 test "native fetch spawn failure releases its slot and owned context once" {

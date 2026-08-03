@@ -18,6 +18,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Test release and package artifacts before publication
         run: |
           python3 -m unittest scripts/test_release_version.py
@@ -84,13 +89,18 @@ jobs:
             "$stage/examples/site/worker/worker/merjs.wasm" \
             "$stage/examples/site/worker/worker/grep.wasm" \
             "$stage/examples/vercel-edge/merjs.wasm" \
-            "$stage/examples/singapore-data-dashboard/worker/merjs.wasm"
-          (cd "$stage" && zig build worker && zig build sgdata-worker)
+            "$stage/examples/singapore-data-dashboard/worker/merjs.wasm" \
+            "$stage/examples/kanban/worker/merjs.wasm"
+          (cd "$stage" && zig build worker && zig build sgdata-worker && zig build worker-example-kanban)
           node "$stage/tests/worker_deployment.mjs" "$stage"
-          (cd "$stage/examples/site/worker" && npx --yes wrangler@4 deploy --dry-run \
+          npm ci --prefix "$stage/examples/site/worker/worker" --ignore-scripts
+          wrangler="$stage/examples/site/worker/worker/node_modules/.bin/wrangler"
+          (cd "$stage/examples/site/worker" && "$wrangler" deploy --dry-run \
             --config wrangler.toml --outdir "$stage/.wrangler-site")
-          (cd "$stage/examples/singapore-data-dashboard/worker" && npx --yes wrangler@4 deploy --dry-run \
+          (cd "$stage/examples/singapore-data-dashboard/worker" && "$wrangler" deploy --dry-run \
             --config wrangler.toml --outdir "$stage/.wrangler-sgdata")
+          (cd "$stage/examples/kanban/worker" && "$wrangler" deploy --dry-run \
+            --config wrangler.toml --outdir "$stage/.wrangler-kanban")
 
       - name: Verify Worker modules enforce a 64 MiB maximum memory
         run: |

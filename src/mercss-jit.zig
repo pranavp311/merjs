@@ -585,10 +585,19 @@ pub fn compile(
     var sink: Sink = .empty;
     errdefer sink.deinit(alloc);
 
-    try sink.appendSlice(alloc, ":root {\n");
+    var token_names: std.ArrayList([]const u8) = .empty;
+    defer token_names.deinit(alloc);
     var tok_it = ds.tokens.iterator();
-    while (tok_it.next()) |entry| {
-        try sink.print(alloc, "  {s}: {s};\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+    while (tok_it.next()) |entry| try token_names.append(alloc, entry.key_ptr.*);
+    std.mem.sort([]const u8, token_names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    try sink.appendSlice(alloc, ":root {\n");
+    for (token_names.items) |name| {
+        try sink.print(alloc, "  {s}: {s};\n", .{ name, ds.tokens.get(name).? });
     }
     try sink.appendSlice(alloc, "}\n\n");
 
@@ -680,13 +689,43 @@ pub fn compile(
 }
 
 fn writeEscapedSelector(raw: []const u8, sink: *Sink, alloc: std.mem.Allocator) !void {
-    // CSS class identifier: anything outside [a-zA-Z0-9_-] gets a `\` prefix.
-    // Matches Tailwind's escaping behavior for arbitrary values like `bg-[#abc]`.
-    for (raw) |c| {
-        const safe = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-            (c >= '0' and c <= '9') or c == '_' or c == '-';
-        if (!safe) try sink.append(alloc, '\\');
-        try sink.append(alloc, c);
+    // CSSOM's "serialize an identifier" algorithm.
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        if (c >= 128) {
+            const len = std.unicode.utf8ByteSequenceLength(c) catch {
+                try sink.appendSlice(alloc, "\xEF\xBF\xBD");
+                i += 1;
+                continue;
+            };
+            const end = i + len;
+            if (end > raw.len or std.unicode.utf8Decode(raw[i..end]) catch null == null) {
+                try sink.appendSlice(alloc, "\xEF\xBF\xBD");
+                i += 1;
+                continue;
+            }
+            try sink.appendSlice(alloc, raw[i..end]);
+            i = end;
+            continue;
+        }
+
+        if (c == 0) {
+            try sink.appendSlice(alloc, "\xEF\xBF\xBD");
+        } else if ((c >= 1 and c <= 31) or c == 127 or
+            (i == 0 and c >= '0' and c <= '9') or
+            (i == 1 and raw[0] == '-' and c >= '0' and c <= '9'))
+        {
+            try sink.print(alloc, "\\{x} ", .{c});
+        } else if (i == 0 and c == '-' and raw.len == 1) {
+            try sink.appendSlice(alloc, "\\-");
+        } else {
+            const safe = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '_' or c == '-';
+            if (!safe) try sink.append(alloc, '\\');
+            try sink.append(alloc, c);
+        }
+        i += 1;
     }
 }
 
@@ -960,4 +999,44 @@ test "compile: unknown variant silently dropped" {
 
     try std.testing.expect(std.mem.indexOf(u8, css, "nonsense") == null);
     try std.testing.expect(std.mem.indexOf(u8, css, ".flex {") != null);
+}
+
+test "compile: preserves caller candidate order and deterministic token order" {
+    const alloc = std.testing.allocator;
+    var ds = DesignSystem.init(alloc);
+    defer ds.deinit();
+    try ds.putToken("--z", "z");
+    try ds.putToken("--a", "a");
+    try ds.putUtility("flex", emitFlex);
+    try ds.putUtility("grid", emitGrid);
+
+    const css = try compile(alloc, &ds, &.{ "grid", "flex", "grid" });
+    defer alloc.free(css);
+
+    const grid = std.mem.indexOf(u8, css, ".grid {").?;
+    const flex = std.mem.indexOf(u8, css, ".flex {").?;
+    try std.testing.expect(grid < flex);
+    try std.testing.expect(std.mem.indexOf(u8, css, "  --a: a;\n  --z: z;") != null);
+}
+
+test "writeEscapedSelector: malformed UTF-8 uses replacements" {
+    const alloc = std.testing.allocator;
+    var selector: Sink = .empty;
+    defer selector.deinit(alloc);
+
+    try writeEscapedSelector("bg-\xff", &selector, alloc);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(selector.items));
+    try std.testing.expectEqualStrings("bg-�", selector.items);
+}
+
+test "compile: Unicode arbitrary class selector preserves code points" {
+    const alloc = std.testing.allocator;
+    var ds = DesignSystem.init(alloc);
+    defer ds.deinit();
+    try ds.loadDefaults();
+
+    const css = try compile(alloc, &ds, &.{"bg-[☃]"});
+    defer alloc.free(css);
+
+    try std.testing.expect(std.mem.indexOf(u8, css, ".bg-\\[☃\\] { background-color:☃ }") != null);
 }

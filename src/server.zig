@@ -520,6 +520,19 @@ fn handleConn(ctx: *ConnCtx) void {
             }
             return;
         };
+        _request_start_ns = monotonicTimestamp() orelse 0;
+        _ttfb_ns = 0;
+        _response_status = null;
+        if (rejectUnsupportedExpectation(&std_req, ctx.csp, &ctx.absolute_phase_deadline_ns) catch |err| {
+            log.debug("send expectation failed response: {}", .{err});
+            return;
+        }) {
+            _body_deadline = null;
+            const end = monotonicTimestamp() orelse _request_start_ns;
+            const elapsed_ns = if (end >= _request_start_ns) end - _request_start_ns else 0;
+            telemetry.ddTiming(std_req.head.target, @tagName(std_req.head.method), _response_status orelse 417, @intCast(@divFloor(elapsed_ns, 1000)));
+            return;
+        }
 
         // A fresh arena returns large body pages to the backing allocator after
         // every request instead of retaining them for the keep-alive lifetime.
@@ -528,9 +541,6 @@ fn handleConn(ctx: *ConnCtx) void {
         const alloc = arena.allocator();
         const error_target = alloc.dupe(u8, std_req.head.target) catch "<unknown>";
 
-        _request_start_ns = monotonicTimestamp() orelse 0;
-        _ttfb_ns = 0;
-        _response_status = null;
         const start = _request_start_ns;
         var terminal = false;
         setSocketDeadline(ctx.stream, true, ctx.body_deadline_ms);
@@ -1044,6 +1054,41 @@ fn sendEventsMethodNotAllowed(std_req: *std.http.Server.Request, is_head: bool, 
     try bw.end();
 }
 
+fn rejectUnsupportedExpectation(std_req: *std.http.Server.Request, csp: []const u8, absolute_phase_deadline_ns: *std.atomic.Value(u64)) !bool {
+    const expect = std_req.head.expect orelse return false;
+    if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
+        std_req.head.expect = "100-continue";
+        return false;
+    }
+    absolute_phase_deadline_ns.store(0, .release);
+    try sendExpectationFailed(std_req, csp);
+    return true;
+}
+
+fn sendExpectationFailed(std_req: *std.http.Server.Request, csp: []const u8) !void {
+    // Do not read the body: a client waiting for 100 Continue may not send it.
+    // Closing the connection makes the unconsumed body safe.
+    std_req.head.expect = null;
+    const body = "Expectation Failed";
+    var headers: [1 + security.header_count]std.http.Header = undefined;
+    headers[0] = .{ .name = "content-type", .value = "text/plain; charset=utf-8" };
+    const security_headers = security.headers(csp);
+    @memcpy(headers[1..], &security_headers);
+    var header_buf: [4096]u8 = undefined;
+    var bw = try std_req.respondStreaming(&header_buf, .{
+        .content_length = body.len,
+        .respond_options = .{
+            .status = .expectation_failed,
+            .keep_alive = false,
+            .extra_headers = &headers,
+        },
+    });
+    markCommitted(.expectation_failed);
+    markTtfb();
+    if (std_req.head.method != .HEAD) try bw.writer.writeAll(body);
+    try bw.end();
+}
+
 fn sendResponse(std_req: *std.http.Server.Request, response: mer.Response, is_head: bool, csp: []const u8) !void {
     // Format Set-Cookie header values on the stack.
     var cookie_val_bufs: [MAX_COOKIES][512]u8 = undefined;
@@ -1227,6 +1272,71 @@ test "native HTTP head extraction preserves auth headers before body reads" {
     try std.testing.expectEqualStrings("https://app.example.com", req.header("origin").?);
     try std.testing.expectEqualStrings("Bearer test", req.header("authorization").?);
     try std.testing.expectEqualStrings("abc", req.cookie("session").?);
+}
+
+test "unsupported Expect rejects a body route before reading its body" {
+    const wire =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: app.example.com\r\n" ++
+        "Expect: unsupported\r\n" ++
+        "Content-Length: 4\r\n\r\n";
+    var input = std.Io.Reader.fixed(wire);
+    var output_buffer: [1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var http_server = std.http.Server.init(&input, &output);
+    var std_req = try http_server.receiveHead();
+    try std.testing.expect(requestHasFramedBody(&std_req));
+
+    var absolute_phase_deadline_ns = std.atomic.Value(u64).init(1);
+    try std.testing.expect(try rejectUnsupportedExpectation(&std_req, production_csp, &absolute_phase_deadline_ns));
+    try std.testing.expectEqual(@as(u64, 0), absolute_phase_deadline_ns.load(.acquire));
+    const response = output_buffer[0..output.end];
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 417 Expectation Failed\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "100 Continue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "connection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "Expectation Failed"));
+}
+
+test "conventional Expect 100-Continue is accepted" {
+    const wire =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: app.example.com\r\n" ++
+        "Expect: 100-Continue\r\n" ++
+        "Content-Length: 4\r\n\r\n";
+    var input = std.Io.Reader.fixed(wire);
+    var output_buffer: [1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var http_server = std.http.Server.init(&input, &output);
+    var std_req = try http_server.receiveHead();
+    var absolute_phase_deadline_ns = std.atomic.Value(u64).init(1);
+
+    try std.testing.expect(!(try rejectUnsupportedExpectation(&std_req, production_csp, &absolute_phase_deadline_ns)));
+    try std.testing.expectEqualStrings("100-continue", std_req.head.expect.?);
+    try std_req.writeExpectContinue();
+    try std.testing.expectEqual(@as(u64, 1), absolute_phase_deadline_ns.load(.acquire));
+    try std.testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", output_buffer[0..output.end]);
+}
+
+test "unsupported Expect rejects a static GET with no framed body" {
+    const wire =
+        "GET /app.js HTTP/1.1\r\n" ++
+        "Host: app.example.com\r\n" ++
+        "Expect: unsupported\r\n\r\n";
+    var input = std.Io.Reader.fixed(wire);
+    var output_buffer: [1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var http_server = std.http.Server.init(&input, &output);
+    var std_req = try http_server.receiveHead();
+    try std.testing.expect(!requestHasFramedBody(&std_req));
+
+    var absolute_phase_deadline_ns = std.atomic.Value(u64).init(1);
+    try std.testing.expect(try rejectUnsupportedExpectation(&std_req, production_csp, &absolute_phase_deadline_ns));
+    try std.testing.expectEqual(@as(u64, 0), absolute_phase_deadline_ns.load(.acquire));
+    const response = output_buffer[0..output.end];
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 417 Expectation Failed\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "100 Continue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "connection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "Expectation Failed"));
 }
 
 test "native request headers are owned, bounded, and singleton auth headers stay unique" {

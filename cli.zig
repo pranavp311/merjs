@@ -755,6 +755,22 @@ test "build_zig_template uses local codegen entrypoint" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_template, "merjs_dep.path(\"tools/codegen.zig\")") == null);
 }
 
+test "build_zig_template matches production origin hardening" {
+    const source = @embedFile("build.zig");
+    inline for (.{
+        .{ "fn parseIpv4NumberLiteral", "fn isValidPortLiteral" },
+        .{ "fn isIpv4NumberForm", "fn zonHasBridgeArray" },
+    }) |range| {
+        const start = std.mem.indexOf(u8, source, range[0]) orelse unreachable;
+        const end = std.mem.indexOfPos(u8, source, start, range[1]) orelse unreachable;
+        var lines = std.mem.splitScalar(u8, source[start..end], '\n');
+        while (lines.next()) |line| {
+            const code = std.mem.trim(u8, line, " ");
+            if (code.len > 0) try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, code) != null);
+        }
+    }
+}
+
 test "native build snippet exposes all CLI-required steps" {
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_build_snippet, "b.step(\"native-dev-build\",") != null);
@@ -1142,26 +1158,78 @@ const native_build_snippet =
     \\                if (!isSafeRelativePathLiteral(value)) @compileError("mer.app.zon server.static_dir must be a safe relative path inside the app bundle");
     \\                return value;
     \\            }
-    \\            fn parseIpv4ByteLiteral(comptime part: []const u8) ?u8 {
-    \\                if (part.len == 0 or part.len > 3) return null;
-    \\                for (part) |c| if (!std.ascii.isDigit(c)) return null;
-    \\                return std.fmt.parseInt(u8, part, 10) catch null;
+    \\            fn parseIpv4NumberLiteral(comptime part: []const u8) ?u32 {
+    \\                if (part.len == 0) return null;
+    \\
+    \\                const base: u32 = if (part.len > 2 and part[0] == '0' and (part[1] == 'x' or part[1] == 'X')) 16 else if (part.len > 1 and part[0] == '0') 8 else 10;
+    \\                const start: usize = if (base == 16) 2 else 0;
+    \\                if (start == part.len) return null;
+    \\
+    \\                var value: u32 = 0;
+    \\                for (part[start..]) |c| {
+    \\                    const digit: u32 = switch (c) {
+    \\                        '0'...'9' => c - '0',
+    \\                        'a'...'f' => c - 'a' + 10,
+    \\                        'A'...'F' => c - 'A' + 10,
+    \\                        else => return null,
+    \\                    };
+    \\                    if (digit >= base or value > (std.math.maxInt(u32) - digit) / base) return null;
+    \\                    value = value * base + digit;
+    \\                }
+    \\                return value;
     \\            }
+    \\
     \\            fn isIpv4LoopbackLiteral(comptime host: []const u8) bool {
+    \\                var parts: [4]u32 = undefined;
+    \\                var count: usize = 0;
+    \\                var it = std.mem.splitScalar(u8, host, '.');
+    \\                while (it.next()) |part| {
+    \\                    if (count == parts.len) return false;
+    \\                    parts[count] = parseIpv4NumberLiteral(part) orelse return false;
+    \\                    count += 1;
+    \\                }
+    \\
+    \\                const address: u32 = switch (count) {
+    \\                    1 => parts[0],
+    \\                    2 => if (parts[0] <= 0xff and parts[1] <= 0x00ffffff) (parts[0] << 24) | parts[1] else return false,
+    \\                    3 => if (parts[0] <= 0xff and parts[1] <= 0xff and parts[2] <= 0xffff) (parts[0] << 24) | (parts[1] << 16) | parts[2] else return false,
+    \\                    4 => if (parts[0] <= 0xff and parts[1] <= 0xff and parts[2] <= 0xff and parts[3] <= 0xff) (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3] else return false,
+    \\                    else => return false,
+    \\                };
+    \\                return address >> 24 == 127;
+    \\            }
+    \\
+    \\            fn isCanonicalIpv4Literal(comptime host: []const u8) bool {
     \\                var it = std.mem.splitScalar(u8, host, '.');
     \\                var count: usize = 0;
-    \\                var first: u8 = 0;
     \\                while (it.next()) |part| {
-    \\                    const value = parseIpv4ByteLiteral(part) orelse return false;
-    \\                    if (count == 0) first = value;
+    \\                    if (count == 4 or part.len == 0 or (part.len > 1 and part[0] == '0')) return false;
+    \\                    var value: u16 = 0;
+    \\                    for (part) |c| {
+    \\                        if (!std.ascii.isDigit(c)) return false;
+    \\                        value = value * 10 + c - '0';
+    \\                        if (value > 255) return false;
+    \\                    }
     \\                    count += 1;
-    \\                    if (count > 4) return false;
     \\                }
-    \\                return count == 4 and first == 127;
+    \\                return count == 4;
     \\            }
+    \\
+    \\            fn isIpv6LoopbackLiteral(comptime host: []const u8) bool {
+    \\                const address = std.Io.net.Ip6Address.parse(host, 0) catch return false;
+    \\                if (std.mem.eql(u8, &address.bytes, &std.Io.net.Ip6Address.loopback(0).bytes)) return true;
+    \\
+    \\                const compatible = std.mem.allEqual(u8, address.bytes[0..12], 0);
+    \\                const mapped = std.mem.allEqual(u8, address.bytes[0..10], 0) and address.bytes[10] == 0xff and address.bytes[11] == 0xff;
+    \\                return (compatible or mapped) and address.bytes[12] == 127;
+    \\            }
+    \\
     \\            fn isLoopbackHostLiteral(comptime host: []const u8) bool {
-    \\                return isIpv4LoopbackLiteral(host) or std.ascii.eqlIgnoreCase(host, "::1") or std.ascii.eqlIgnoreCase(host, "[::1]");
+    \\                return isCanonicalIpv4Literal(host) and host[0] == '1' and host[1] == '2' and host[2] == '7' and host[3] == '.' or
+    \\                    std.mem.eql(u8, host, "::1") or
+    \\                    std.mem.eql(u8, host, "[::1]");
     \\            }
+    \\
     \\            fn isValidPortLiteral(comptime port: []const u8) bool {
     \\                if (port.len == 0 or port.len > 5) return false;
     \\                for (port) |c| if (!std.ascii.isDigit(c)) return false;
@@ -1228,13 +1296,17 @@ const native_build_snippet =
     \\                if (!@hasField(NavigationT, "allowed_origins")) return false;
     \\                return zon.security.navigation.allowed_origins.len > 0;
     \\            }
+    \\
     \\            fn originHost(comptime origin: []const u8) ?[]const u8 {
     \\                const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return null;
     \\                const authority_start = scheme_end + 3;
     \\                const authority_end = blk: {
     \\                    var i: usize = authority_start;
     \\                    while (i < origin.len) : (i += 1) {
-    \\                        switch (origin[i]) { '/', '?', '#' => break :blk i, else => {} }
+    \\                        switch (origin[i]) {
+    \\                            '/', '?', '#' => break :blk i,
+    \\                            else => {},
+    \\                        }
     \\                    }
     \\                    break :blk origin.len;
     \\                };
@@ -1248,18 +1320,48 @@ const native_build_snippet =
     \\                const colon = std.mem.indexOfScalar(u8, authority, ':');
     \\                return if (colon) |c| authority[0..c] else authority;
     \\            }
-    \\            fn isForbiddenProductionLoopbackHost(comptime host: []const u8) bool {
-    \\                return std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.eqlIgnoreCase(host, "[::1]") or std.mem.startsWith(u8, host, "127.");
+    \\
+    \\            fn isIpv4NumberForm(comptime host: []const u8) bool {
+    \\                var it = std.mem.splitScalar(u8, host, '.');
+    \\                var count: usize = 0;
+    \\                while (it.next()) |part| {
+    \\                    if (count == 4 or parseIpv4NumberLiteral(part) == null) return false;
+    \\                    count += 1;
+    \\                }
+    \\                return count > 0;
     \\            }
-    \\            fn zonNavigationHasForbiddenLoopback(comptime zon: anytype) bool {
+    \\n    \\            fn isCanonicalDnsHost(comptime host: []const u8) bool {
+    \\                var it = std.mem.splitScalar(u8, host, '.');
+    \\                while (it.next()) |label| {
+    \\                    if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return false;
+    \\                    for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    \\                }
+    \\                return host.len <= 253;
+    \\            }
+    \\n    \\            fn isCanonicalOriginHost(comptime host: []const u8) bool {
+    \\                if (isCanonicalIpv4Literal(host)) return true;
+    \\                if (isIpv4NumberForm(host)) return false;
+    \\                if (host.len >= 4 and host[0] == '[' and host[host.len - 1] == ']') {
+    \\                    _ = std.Io.net.Ip6Address.parse(host[1 .. host.len - 1], 0) catch return false;
+    \\                    return true;
+    \\                }
+    \\                return isCanonicalDnsHost(host);
+    \\            }
+    \\n    \\            fn isForbiddenProductionLoopbackHost(comptime host: []const u8) bool {
+    \\                const normalized = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host[1 .. host.len - 1] else host;
+    \\                return std.ascii.eqlIgnoreCase(host, "localhost") or
+    \\                    isIpv4LoopbackLiteral(host) or
+    \\                    isIpv6LoopbackLiteral(normalized);
+    \\            }
+    \\n    \\            fn zonNavigationHasForbiddenLoopback(comptime zon: anytype) bool {
     \\                if (!zonHasNavigationOrigins(zon)) return false;
     \\                for (zon.security.navigation.allowed_origins) |origin| {
-    \\                    const host = originHost(origin) orelse continue;
-    \\                    if (isForbiddenProductionLoopbackHost(host)) return true;
+    \\                    const host = originHost(origin) orelse return true;
+    \\                    if (!isCanonicalOriginHost(host) or isForbiddenProductionLoopbackHost(host)) return true;
     \\                }
     \\                return false;
     \\            }
-    \\            fn zonHasBridgeArray(comptime zon: anytype, comptime field: []const u8) bool {
+    \\n    \\            fn zonHasBridgeArray(comptime zon: anytype, comptime field: []const u8) bool {
     \\                const T = @TypeOf(zon);
     \\                if (!@hasField(T, "security")) return false;
     \\                const SecurityT = @TypeOf(zon.security);

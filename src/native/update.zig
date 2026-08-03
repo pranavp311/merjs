@@ -45,7 +45,7 @@ pub const Error = error{
 pub const Feed = struct {
     schema_version: u32,
     /// Monotonic signed feed metadata sequence. Callers must persist the highest
-    /// accepted value and pass it to checkForUpdate* to reject stale replays.
+    /// accepted value and pass it to checkForUpdate* to reject lower values.
     metadata_version: u64,
     app_id: []const u8,
     version: []const u8,
@@ -91,7 +91,7 @@ pub const VerifiedUpdate = struct {
 
 pub const CheckResult = union(enum) {
     /// Validated metadata version accepted by this check. Persist it and pass it
-    /// as highest_seen_metadata_version on the next check to reject stale replays.
+    /// as highest_seen_metadata_version on the next check to reject lower values.
     no_update: u64,
     update_available: VerifiedUpdate,
 
@@ -207,7 +207,7 @@ pub fn checkForUpdateJson(
     defer parsed.deinit();
     const feed = parsed.value;
     try validateFeed(feed);
-    if (feed.metadata_version <= highest_seen_metadata_version) return error.StaleUpdateMetadata;
+    if (feed.metadata_version < highest_seen_metadata_version) return error.StaleUpdateMetadata;
     if (!std.mem.eql(u8, feed.app_id, app_id)) return error.AppIdMismatch;
 
     const platform = findPlatform(feed, target_os, target_arch) orelse return error.PlatformNotFound;
@@ -534,7 +534,7 @@ test "checkForUpdateJson treats disabled updates as no_update without panic" {
     try std.testing.expectEqual(@as(u64, 0), result.no_update);
 }
 
-test "checkForUpdateJson verifies signature and returns update metadata" {
+test "checkForUpdateJson accepts repeated metadata_version for update_available" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");
     const unsigned_feed = signedTestFeed(unsigned_platform.signature, "1.2.3");
     const sig = try TestSigned.signToken(std.testing.allocator, unsigned_feed, unsigned_platform);
@@ -547,7 +547,7 @@ test "checkForUpdateJson verifies signature and returns update metadata" {
         .provider = "custom-http",
         .feed_url = "https://example.com/update.json",
         .public_key = public_key,
-    }, "com.example.app", "1.2.2", "macos", "aarch64", 0, json);
+    }, "com.example.app", "1.2.2", "macos", "aarch64", 1, json);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result == .update_available);
     try std.testing.expectEqualStrings("1.2.3", result.update_available.version);
@@ -572,7 +572,7 @@ test "checkForUpdate uses fetcher abstraction with size cap" {
     try std.testing.expect(result == .update_available);
 }
 
-test "checkForUpdateJson returns no_update for current or newer installed versions" {
+test "checkForUpdateJson accepts repeated metadata_version for no_update" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");
     const unsigned_feed = signedTestFeed(unsigned_platform.signature, "1.2.3");
     const sig = try TestSigned.signToken(std.testing.allocator, unsigned_feed, unsigned_platform);
@@ -585,7 +585,7 @@ test "checkForUpdateJson returns no_update for current or newer installed versio
         .provider = "custom-http",
         .feed_url = "https://example.com/update.json",
         .public_key = public_key,
-    }, "com.example.app", "1.2.3", "macos", "aarch64", 0, json);
+    }, "com.example.app", "1.2.3", "macos", "aarch64", 1, json);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 1), result.no_update);
 }
@@ -711,7 +711,7 @@ test "checkForUpdateJson treats empty-string config as disabled" {
     try std.testing.expectEqual(@as(u64, 0), result.no_update);
 }
 
-test "checkForUpdateJson rejects stale metadata_version" {
+test "checkForUpdateJson rejects lower metadata_version" {
     const unsigned_platform = signedTestPlatform("ed25519:placeholderplaceholderplaceholderplaceholderplaceholderplaceholder");
     const unsigned_feed = signedTestFeed(unsigned_platform.signature, "1.2.3");
     const sig = try TestSigned.signToken(std.testing.allocator, unsigned_feed, unsigned_platform);
@@ -724,7 +724,7 @@ test "checkForUpdateJson rejects stale metadata_version" {
         .provider = "custom-http",
         .feed_url = "https://example.com/update.json",
         .public_key = public_key,
-    }, "com.example.app", "1.2.2", "macos", "aarch64", 1, json));
+    }, "com.example.app", "1.2.2", "macos", "aarch64", 2, json));
 }
 
 test "verifyArtifactBytes enforces size and sha256" {

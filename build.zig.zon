@@ -21,7 +21,11 @@
         "tools",
         "cli.zig",
         "mer.app.zon",
+        "app",
+        "api",
         "public",
         "examples",
+        "packages",
+        "tests",
     },
 }

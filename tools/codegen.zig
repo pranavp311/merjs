@@ -5,6 +5,8 @@ const std = @import("std");
 const runtime = @import("runtime");
 const mercss_jit = @import("mercss_jit");
 
+const max_css_source_bytes = 4 * 1024 * 1024;
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -39,8 +41,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         entries.deinit(alloc);
     }
 
-    try scanDir(alloc, &entries, app_dir, "app");
-    try scanDir(alloc, &entries, api_dir, "api");
+    scanDir(alloc, &entries, app_dir, "app") catch |err| {
+        std.debug.print("codegen: cannot scan {s}: {s}\n", .{ app_dir, @errorName(err) });
+        return err;
+    };
+    scanDir(alloc, &entries, api_dir, "api") catch |err| {
+        if (!isOptionalApiDirError(err)) {
+            std.debug.print("codegen: cannot scan {s}: {s}\n", .{ api_dir, @errorName(err) });
+            return err;
+        }
+    };
 
     // Sort routes: static before dynamic, then alphabetically within each group.
     // This ensures /users/settings always matches before /users/:id.
@@ -140,6 +150,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         defer candidates.deinit(alloc);
 
         try scanCssCandidates(alloc, app_dir, &sources, &candidates);
+        sortAndDeduplicateCandidates(&candidates);
 
         const css = try mercss_jit.compile(alloc, &ds, candidates.items);
         defer alloc.free(css);
@@ -164,9 +175,13 @@ fn isComponentPath(path: []const u8) bool {
         std.mem.indexOf(u8, path, "\\components\\") != null;
 }
 
+fn isOptionalApiDirError(err: anyerror) bool {
+    return err == error.FileNotFound;
+}
+
 /// Scan source_dir/ for *.zig files, appending "logical_dir/file.zig" to entries.
 fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), source_dir: []const u8, logical_dir: []const u8) !void {
-    var d = std.Io.Dir.cwd().openDir(runtime.io, source_dir, .{ .iterate = true }) catch return;
+    var d = try std.Io.Dir.cwd().openDir(runtime.io, source_dir, .{ .iterate = true });
     defer d.close(runtime.io);
     var walker = try d.walk(alloc);
     defer walker.deinit();
@@ -180,6 +195,7 @@ fn scanDir(alloc: std.mem.Allocator, entries: *std.ArrayList([]u8), source_dir: 
         // app/components contains reusable modules, not file-based pages.
         if (std.mem.eql(u8, logical_dir, "app") and isComponentPath(entry.path)) continue;
         const full = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ logical_dir, entry.path });
+        errdefer alloc.free(full);
         try entries.append(alloc, full);
     }
 }
@@ -333,6 +349,35 @@ fn hasDynamicSegment(path: []const u8) bool {
     return false;
 }
 
+fn cssSourcePath(alloc: std.mem.Allocator, dir_path: []const u8, entry_path: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ dir_path, entry_path });
+}
+
+fn cssSourceTooLarge(path: []const u8) !void {
+    std.debug.print(
+        "mercss: cannot scan {s}: source exceeds the 4 MiB limit; split it into smaller source files\n",
+        .{path},
+    );
+    return error.SourceTooLarge;
+}
+
+fn sortAndDeduplicateCandidates(candidates: *std.ArrayList([]const u8)) void {
+    std.mem.sort([]const u8, candidates.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    var len: usize = 0;
+    for (candidates.items) |candidate| {
+        if (len == 0 or !std.mem.eql(u8, candidate, candidates.items[len - 1])) {
+            candidates.items[len] = candidate;
+            len += 1;
+        }
+    }
+    candidates.shrinkRetainingCapacity(len);
+}
+
 /// Recursively walk `dir` looking for .zig and .html files. For each one,
 /// load its bytes (stored in `sources` so they outlive borrowed slices) and
 /// run mercss_jit.scan to append candidate strings to `candidates`.
@@ -342,7 +387,10 @@ fn scanCssCandidates(
     sources: *std.ArrayList([]u8),
     candidates: *std.ArrayList([]const u8),
 ) !void {
-    var d = std.Io.Dir.cwd().openDir(runtime.io, dir_path, .{ .iterate = true }) catch return;
+    var d = std.Io.Dir.cwd().openDir(runtime.io, dir_path, .{ .iterate = true }) catch |err| {
+        std.debug.print("mercss: cannot scan {s}: {s}\n", .{ dir_path, @errorName(err) });
+        return err;
+    };
     defer d.close(runtime.io);
     var walker = try d.walk(alloc);
     defer walker.deinit();
@@ -354,15 +402,52 @@ fn scanCssCandidates(
         // Skip our own generated output.
         if (std.mem.eql(u8, entry.basename, "_mercss.css")) continue;
 
-        const f = entry.dir.openFile(runtime.io, entry.basename, .{}) catch continue;
+        const path = try cssSourcePath(alloc, dir_path, entry.path);
+        defer alloc.free(path);
+        const f = entry.dir.openFile(runtime.io, entry.basename, .{}) catch |err| {
+            std.debug.print("mercss: cannot scan {s}: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
         defer f.close(runtime.io);
-        // 4 MiB is plenty for any source/template file we'd reasonably scan.
         var reader_buf: [4096]u8 = undefined;
         var fr = f.reader(runtime.io, &reader_buf);
-        const content = fr.interface.allocRemaining(alloc, .limited(4 * 1024 * 1024)) catch continue;
-        try sources.append(alloc, content);
-        try mercss_jit.scan(content, alloc, candidates);
+        {
+            const content = fr.interface.allocRemaining(alloc, .limited(max_css_source_bytes)) catch |err| switch (err) {
+                error.StreamTooLong => return cssSourceTooLarge(path),
+                else => {
+                    std.debug.print("mercss: cannot scan {s}: {s}\n", .{ path, @errorName(err) });
+                    return err;
+                },
+            };
+            errdefer alloc.free(content);
+            try sources.append(alloc, content);
+        }
+        try mercss_jit.scan(sources.items[sources.items.len - 1], alloc, candidates);
     }
+}
+
+test "scan CSS candidates: >4 MiB source reports its full path" {
+    const path = try cssSourcePath(std.testing.allocator, "test-app", "nested/oversized.zig");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("test-app/nested/oversized.zig", path);
+    try std.testing.expectError(error.SourceTooLarge, cssSourceTooLarge(path));
+}
+
+test "only a missing API directory is optional" {
+    try std.testing.expect(isOptionalApiDirError(error.FileNotFound));
+    try std.testing.expect(!isOptionalApiDirError(error.AccessDenied));
+}
+
+test "CSS candidates are sorted and deduplicated at the codegen boundary" {
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer candidates.deinit(std.testing.allocator);
+    try candidates.appendSlice(std.testing.allocator, &.{ "p-4", "flex", "p-4", "bg-red-500" });
+
+    sortAndDeduplicateCandidates(&candidates);
+    try std.testing.expectEqualStrings("bg-red-500", candidates.items[0]);
+    try std.testing.expectEqualStrings("flex", candidates.items[1]);
+    try std.testing.expectEqualStrings("p-4", candidates.items[2]);
+    try std.testing.expectEqual(@as(usize, 3), candidates.items.len);
 }
 
 test "component directories are excluded from app routes" {
